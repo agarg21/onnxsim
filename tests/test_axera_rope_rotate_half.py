@@ -37,7 +37,9 @@ def _ref_rot(x, cos, sin):
 
 
 def _run(model: onnx.ModelProto, x, cos, sin_s):
-    (y,) = ReferenceEvaluator(model).run(None, {"x": x, "cos": cos, "sin_signed": sin_s})
+    (y,) = ReferenceEvaluator(model).run(
+        None, {"x": x, "cos": cos, "sin_signed": sin_s}
+    )
     return y
 
 
