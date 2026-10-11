@@ -2,14 +2,33 @@
 
 ``emit_linear(template_model, w, scales, zero_points)`` returns the compiled
 model of ``MatMul(x, w)`` for a weight matrix Pulsar2 never saw, from one
-native build of the same shape (any weights, any calibration). Two shapes are
-served, ``[1,64] @ [64,64]`` and ``[1,576] @ [576,576]``; the weight-table
-layout differs between them and no other shape was built.
+native build of the same shape (any weights, any calibration). The weight-table
+layout depends on the shape; the families are listed under "Families" below,
+and ``linear_params`` does the ``npu_params`` of any of them (a template build
+of the shape is still needed for the main-engine records and the IO tail).
 ``emit_linear_from_samples`` also derives the calibration, with
 ``pulsar_free_calibration`` (``docs/axera-width-and-linear-emit.md``).
 
 What a weight set changes
 -------------------------
+
+Families (``family(k, n)``)
+---------------------------
+
+* ``square64`` / ``square576`` (``[1, n] @ [n, n]``, the two layouts above);
+* ``tall576`` (``k = 576``, ``n`` a multiple of 64): the square-576 tile
+  layout, one tile per 64 outputs (36864 weight bytes + 512 requantization
+  bytes each), 40 IO bytes;
+* ``plain128`` (``128 x 128``): plain code bytes, two 64-output tiles of 9216
+  bytes, then ONE requantization block for all 128 channels;
+* ``wide`` (``k`` in 768, 1024, 1536, 2048, 3072; ``n`` a multiple of 32): input
+  pairs in segments of at most 560 pairs (see ``wide_layout``); per 32-output
+  group, each segment's 16 weight rows are followed by a 256-byte
+  requantization block. The 1024 x 151936 build also has a 100-byte IO tail.
+
+The non-square families are built from scratch (weights, pads, requantization
+blocks) with the template's IO tail; ``emit_linear`` of the 151936-wide layer
+is refused (its output is four DEQUANT jobs, not two).
 
 Between native builds of one shape only these differ (six weight sets per
 shape, and the 576 layer at a second calibration):
@@ -73,7 +92,10 @@ Refused (``ValueError``)
 Limits: one native build of the shape is still needed as the template; the
 template fixes everything a weight set does not change (job order, addresses,
 the slot table order); only weights drawn from one distribution
-(uniform +-0.1) and inputs calibrated to about +-1 and +-4 were built.
+(uniform +-0.1) and inputs calibrated to about +-1 and +-4 were built. The
+non-square families were fitted and checked on the held-out builds listed in
+``tests/test_axera_linear_emit_families.py``; the 1024 x 151936 layer has
+``npu_params`` only (its output is four DEQUANT jobs, see ``emit_linear``).
 """
 
 from __future__ import annotations
@@ -112,6 +134,77 @@ def tile_bytes(n: int) -> int:
 def params_bytes(n: int) -> int:
     """``npu_params`` size of the ``n x n`` layer."""
     return n // TILE * tile_bytes(n) + 2 * IO_BYTES
+
+
+#: input widths of the ``wide`` family that were built (any multiple-of-32 ``n``)
+WIDE_K = (768, 1024, 1536, 2048, 3072)
+WIDE_SEGMENT = 560  # input pairs per segment, except the first
+SHAPE_TAIL = {(1024, 151936): 100}  # other shapes: 40 zero bytes
+
+
+def family(k: int, n: int) -> str:
+    """The layout family of the ``[1, k] @ [k, n]`` linear layer."""
+    if (k, n) == (64, 64):
+        return "square64"
+    if (k, n) == (128, 128):
+        return "plain128"
+    if k == 576 and n % TILE == 0 and n > 0:
+        return "square576" if n == 576 else "tall576"
+    if k in WIDE_K and n % 32 == 0:
+        return "wide"
+    raise ValueError(
+        f"linear layer {k}x{n}: no layout built (64x64, 128x128, 576 x 64m, and "
+        f"k in {list(WIDE_K)} with n a multiple of 32)"
+    )
+
+
+def wide_segments(k: int) -> list[int]:
+    """Input pairs per segment of a ``wide`` layer: the first holds
+    ``(k/2) mod 560`` pairs (560 if that is 0), the rest 560 each."""
+    pairs = k // 2
+    if pairs <= WIDE_SEGMENT:
+        return [pairs]
+    first = pairs % WIDE_SEGMENT or WIDE_SEGMENT
+    return [first] + [WIDE_SEGMENT] * ((pairs - first) // WIDE_SEGMENT)
+
+
+def _row_bytes(pairs: int) -> int:
+    """``S1``: one weight row of a segment, ``144`` bytes per 36 pairs."""
+    return 144 * -(-pairs // 36)
+
+
+def wide_layout(k: int) -> tuple[list[int], list[int], int]:
+    """``(segment pairs, segment offsets in a group, group bytes G)``, with
+    ``G = sum over segments of (16 * S1 + 256)``."""
+    segs = wide_segments(k)
+    offs, off = [], 0
+    for pairs in segs:
+        offs.append(off)
+        off += (
+            16 * _row_bytes(pairs) + 256
+        )  # weight rows, then the requantization block
+    return segs, offs, off
+
+
+def _table_bytes(k: int, n: int) -> int:
+    """Bytes of the weight-and-requantization table (the IO tail excluded)."""
+    fam = family(k, n)
+    if fam in ("square64", "square576"):
+        return params_bytes(n) - IO_BYTES * 2
+    if fam == "plain128":
+        return 18432 + 1024
+    if fam == "tall576":
+        return n // TILE * tile_bytes(576)
+    return n // 32 * wide_layout(k)[2]
+
+
+def _tail_bytes(k: int, n: int) -> int:
+    return SHAPE_TAIL.get((k, n), 2 * IO_BYTES)
+
+
+def layer_params_bytes(k: int, n: int) -> int:
+    """``npu_params`` size of the ``[1, k] @ [k, n]`` linear layer."""
+    return _table_bytes(k, n) + _tail_bytes(k, n)
 
 
 def _check_shape(n: int) -> None:
@@ -169,6 +262,108 @@ def weight_codes(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return emitter.codes_of(w.T, axis=0), emitter.weight_scales(w.T, axis=0)
 
 
+def _requant_f64(codes, s_w, s_x, zp_x, s_y, zp_y):
+    """``(bias, M)`` float32 per output channel, computed in float64 and cast
+    once (float32 arithmetic is an ulp off on about a third of the channels)."""
+    m = (np.float64(s_x) * np.asarray(s_w, np.float64) / np.float64(s_y)).astype(
+        np.float32
+    )
+    qsum = (codes.astype(np.int64) - 128).sum(axis=1).astype(np.float64)
+    bias = (np.float64(zp_y) - np.float64(zp_x) * qsum * m.astype(np.float64)).astype(
+        np.float32
+    )
+    return bias, m
+
+
+def _plain128_table(codes, bias, m):
+    """128 x 128: plain code bytes, two 64-output tiles, one requantization block."""
+    n, k = codes.shape
+    t = np.full(2 * 9216, 128, np.uint8)  # unused bytes hold code 128
+    o, i = np.arange(n), np.arange(k)
+    row = 9216 * (o >> 6) + 576 * ((o >> 1) & 15) + 36 * (o & 1) + 72 * ((o >> 5) & 1)
+    col = 144 * (i // 36) + i % 36
+    t[(row[:, None] + col[None, :]).ravel()] = codes.ravel()
+    return np.concatenate([t, bias.view(np.uint8), m.view(np.uint8)])
+
+
+def _tall576_table(codes, bias, m):
+    """576 x 64m: the square-576 tile per 64 outputs (36864 weight bytes, then
+    the 512-byte requantization block)."""
+    n, k = codes.shape
+    tile = tile_bytes(576)
+    t = np.zeros(n // TILE * tile, np.uint8)
+    o = np.arange(n) % TILE
+    tb = (np.arange(n) // TILE) * tile
+    j = np.arange(k // 2)
+    row = 1152 * (o & 15) + 72 * ((o >> 4) & 1) + 18432 * (o >> 5)
+    col = 144 * (j // 36) + j % 36
+    c = codes.reshape(n, k // 2, 2)
+    addr = (tb + row)[:, None, None] + col[None, :, None] + 36 * np.arange(2)
+    planes = [
+        ((c[..., 0] >> (4 * p)) & 15) | (((c[..., 1] >> (4 * p)) & 15) << 4)
+        for p in (0, 1)
+    ]
+    t[addr.ravel()] = np.stack(planes, -1).astype(np.uint8).ravel()
+    for tt in range(n // TILE):
+        at = tt * tile + WEIGHT_BYTES[576]
+        ch = slice(TILE * tt, TILE * (tt + 1))
+        t[at : at + BLOCK] = np.concatenate(
+            [bias[ch].view(np.uint8), m[ch].view(np.uint8)]
+        )
+    return t
+
+
+def _wide_table(codes, bias, m):
+    """``wide``: per 32-output group, each segment's 16 weight rows (its pairs
+    in 36-pair blocks of 144 bytes; low and high nibble planes at +0 and +36),
+    then the group's 256-byte requantization block."""
+    n, k = codes.shape
+    segs, offs, g_bytes = wide_layout(k)
+    ng = n // 32
+    t = np.zeros(ng * g_bytes, np.uint8)
+    o = np.arange(n)
+    g, op = o >> 5, o & 31
+    u = codes.astype(np.int64)
+    rq = np.concatenate(
+        [bias.reshape(ng, 32).view(np.uint8), m.reshape(ng, 32).view(np.uint8)], axis=1
+    )  # [group, 256]
+    start = 0
+    for pairs, off in zip(segs, offs):
+        s1 = _row_bytes(pairs)
+        nslot = -(-pairs // 36) * 36
+        jp = np.arange(nslot)
+        slot = 144 * (jp // 36) + jp % 36
+        ue = np.full((n, nslot), 128, np.int64)
+        uo = np.full((n, nslot), 128, np.int64)
+        ue[:, :pairs] = u[:, 2 * start : 2 * (start + pairs) : 2]
+        uo[:, :pairs] = u[:, 2 * start + 1 : 2 * (start + pairs) : 2]
+        row = s1 * (op & 15) + 72 * ((op >> 4) & 1)
+        for p in (0, 1):
+            byte = (((ue >> (4 * p)) & 15) | (((uo >> (4 * p)) & 15) << 4)).astype(
+                np.uint8
+            )
+            t[(g * g_bytes + off)[:, None] + row[:, None] + slot[None, :] + 36 * p] = (
+                byte
+            )
+        at = np.arange(ng) * g_bytes + off + 16 * s1
+        t[at[:, None] + np.arange(256)[None, :]] = rq
+        start += pairs
+    return t
+
+
+def _family_table(codes, s_w, s_x, zp_x, s_y, zp_y) -> np.ndarray:
+    """The weight-and-requantization table of a non-square layer (the IO tail
+    is the template's)."""
+    n, k = codes.shape
+    fam = family(k, n)
+    bias, m = _requant_f64(codes, s_w, s_x, zp_x, s_y, zp_y)
+    if fam == "plain128":
+        return _plain128_table(codes, bias, m)
+    if fam == "tall576":
+        return _tall576_table(codes, bias, m)
+    return _wide_table(codes, bias, m)
+
+
 def linear_params(
     template_params: bytes,
     w: np.ndarray,
@@ -178,27 +373,31 @@ def linear_params(
     zp_y: int,
 ) -> bytes:
     """``npu_params`` of the layer for weights ``w [in, out]``: the weight
-    codes at their addresses and each tile's requantization block; every other
-    byte is the template's."""
+    codes at their addresses and the requantization blocks; the IO tail is the
+    template's, and for the square layers every other byte is the template's."""
     w = np.asarray(w, np.float32)
-    if w.ndim != 2 or w.shape[0] != w.shape[1]:
-        raise ValueError(f"expected square weights [n, n], got {w.shape}")
-    n = w.shape[0]
-    _check_shape(n)
-    if len(template_params) != params_bytes(n):
+    if w.ndim != 2:
+        raise ValueError(f"expected weights [in, out], got {w.shape}")
+    k, n = w.shape
+    fam = family(k, n)
+    if len(template_params) != layer_params_bytes(k, n):
         raise ValueError(
             f"the template's npu_params hold {len(template_params)} bytes, a "
-            f"{n}x{n} linear layer {params_bytes(n)}"
+            f"{k}x{n} linear layer {layer_params_bytes(k, n)}"
         )
     codes, s_w = weight_codes(w)
     table = np.frombuffer(template_params, np.uint8).copy()
-    table[weight_addresses(n).ravel()] = weight_bytes(codes).ravel()
-    for t in range(n // TILE):
-        ch = slice(TILE * t, TILE * (t + 1))
-        at = t * tile_bytes(n) + WEIGHT_BYTES[n]
-        table[at : at + BLOCK] = emitter.requant_block(
-            codes[ch], float(s_x), int(zp_x), float(s_y), int(zp_y), s_w[ch]
-        )
+    if fam in ("square64", "square576"):
+        table[weight_addresses(n).ravel()] = weight_bytes(codes).ravel()
+        for t in range(n // TILE):
+            ch = slice(TILE * t, TILE * (t + 1))
+            at = t * tile_bytes(n) + WEIGHT_BYTES[n]
+            table[at : at + BLOCK] = emitter.requant_block(
+                codes[ch], float(s_x), int(zp_x), float(s_y), int(zp_y), s_w[ch]
+            )
+        return table.tobytes()
+    head = _table_bytes(k, n)
+    table[:head] = _family_table(codes, s_w, s_x, zp_x, s_y, zp_y)
     return table.tobytes()
 
 
@@ -248,27 +447,31 @@ def _set_job(main, start, end, before, lanes: int, zp_reg: int, zp: int, what: s
     main[zps[0]] = gs._rec(gs.A1, zp_reg, int(zp))
 
 
-def template_width(model: onnx.ModelProto) -> int:
-    """``n`` of a native ``[1, n] @ [n, n]`` linear build, after checking its
-    IO shapes, ``npu_params`` size and main-engine jobs."""
+def template_shape(model: onnx.ModelProto) -> tuple[int, int]:
+    """``(k, n)`` of a native ``[1, k] @ [k, n]`` linear build, after checking
+    its IO shapes and ``npu_params`` size."""
     g = model.graph
+    if len(g.input) != 1 or len(g.output) != 1:
+        raise ValueError(
+            f"expected one input and one output, found {len(g.input)} and {len(g.output)}"
+        )
     shapes = [
         tuple(d.dim_value for d in v.type.tensor_type.shape.dim)
         for v in [*g.input, *g.output]
     ]
-    if len(g.input) != 1 or len(g.output) != 1 or len(set(shapes)) != 1:
-        raise ValueError(f"expected one input and one output of one shape: {shapes}")
-    if len(shapes[0]) != 2 or shapes[0][0] != 1:
-        raise ValueError(f"expected IO shape [1, n], found {list(shapes[0])}")
-    n = shapes[0][1]
-    _check_shape(n)
+    if any(len(sh) != 2 or sh[0] != 1 for sh in shapes):
+        raise ValueError(
+            f"expected IO shapes [1, n], found {[list(sh) for sh in shapes]}"
+        )
+    (_, k), (_, n) = shapes
+    family(k, n)  # refuses a layout that was never built
     params = next(i for i in g.initializer if i.name == "npu_params")
-    if len(params.raw_data) != params_bytes(n):
+    if len(params.raw_data) != layer_params_bytes(k, n):
         raise ValueError(
             f"the template's npu_params hold {len(params.raw_data)} bytes, a "
-            f"{n}x{n} linear layer {params_bytes(n)}"
+            f"{k}x{n} linear layer {layer_params_bytes(k, n)}"
         )
-    return n
+    return k, n
 
 
 def emit_linear(
@@ -284,10 +487,10 @@ def emit_linear(
     output tensor names (``x`` and ``y`` in the committed builds). The
     per-channel weight scales follow from ``w``."""
     model = gs.load_model(template_model)
-    n = template_width(model)
+    k, n = template_shape(model)
     w = np.asarray(w, np.float32)
-    if w.shape != (n, n):
-        raise ValueError(f"the template is {n}x{n}; the weights are {w.shape}")
+    if w.shape != (k, n):
+        raise ValueError(f"the template is {k}x{n}; the weights are {w.shape}")
     x, y = model.graph.node[0].input[0], model.graph.node[0].output[0]
     missing = sorted({x, y} - (set(scales) & set(zero_points)))
     if missing:

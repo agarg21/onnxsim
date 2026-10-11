@@ -217,12 +217,13 @@ def test_other_shapes_are_refused():
     for n in (128, 512, 1024):
         with pytest.raises(ValueError, match="only 64x64 and 576x576 were built"):
             le.weight_addresses(n)
+    # 128x128 has a layout now (test_axera_linear_emit_families.py); 512 has none
     wide = onnx.ModelProto()
     wide.CopyFrom(model)
     for v in [*wide.graph.input, *wide.graph.output]:
-        v.type.tensor_type.shape.dim[1].dim_value = 128
-    with pytest.raises(ValueError, match="only 64x64 and 576x576 were built"):
-        le.emit_linear(wide, np.ones((128, 128), np.float32), scales, zps)
+        v.type.tensor_type.shape.dim[1].dim_value = 512
+    with pytest.raises(ValueError, match="no layout built"):
+        le.emit_linear(wide, np.ones((512, 512), np.float32), scales, zps)
 
 
 def test_a_template_that_is_not_a_linear_layer_is_refused():
