@@ -164,6 +164,13 @@ struct LoadedModel {
   // Identity of the file the model was loaded from; a changed file is reloaded.
   int64_t mtime_ns = 0;
   uint64_t file_size = 0;
+  // Inputs of at most kSmallInputBytes live in one arena (input_arena), so a
+  // request uploads all of them with one copy (see the upload below).
+  void* input_arena = nullptr;
+  uint64_t input_arena_bytes = 0;
+  std::vector<bool> in_arena;
+  std::vector<uint64_t> arena_offset;
+  std::vector<uint8_t> stage;               // host copy of the arena for one upload
   // Resident state (`run_resident` / `reset_state`): non-zero while the input
   // device buffers hold contents a client may keep using, and then the id that
   // client has to quote. It lives and dies with this entry: a freshly loaded
@@ -176,6 +183,11 @@ struct LoadedModel {
 };
 
 static bool g_use_cache = true;
+// Inputs at most this large share one device arena; each starts on a
+// kArenaAlign boundary.
+static constexpr uint64_t kSmallInputBytes = 64 * 1024;
+static constexpr uint64_t kArenaAlign = 256;
+
 // How `run_resident` writes an output row into a resident input: on the card
 // (device-to-device copy to an offset inside the input buffer), or through the
 // worker's memory (--row-copy host: download the row, patch the shadow copy,
@@ -201,7 +213,13 @@ static bool file_identity(const std::string& path, int64_t& mtime_ns, uint64_t& 
 }
 
 static void free_model(LoadedModel& m) {
-  for (void* p : m.inputs) if (p) axclrtFree(p);
+  for (size_t i = 0; i < m.inputs.size(); ++i) {
+    const bool arena = i < m.in_arena.size() && m.in_arena[i];
+    if (m.inputs[i] && !arena) axclrtFree(m.inputs[i]);
+  }
+  if (m.input_arena) axclrtFree(m.input_arena);
+  m.input_arena = nullptr; m.input_arena_bytes = 0;
+  m.in_arena.clear(); m.arena_offset.clear(); m.stage.clear();
   for (void* p : m.outputs) if (p) axclrtFree(p);
   m.inputs.clear(); m.outputs.clear();
   m.state_id = 0; m.shadow.clear();
@@ -233,6 +251,22 @@ static bool load_model(const std::string& path, LoadedModel& m, std::string& err
   const uint32_t n_out = axclrtEngineGetNumOutputs(m.info);
   m.inputs.assign(n_in, nullptr); m.in.resize(n_in);
   m.outputs.assign(n_out, nullptr); m.out.resize(n_out);
+  // Small inputs share one arena (see kSmallInputBytes).
+  m.in_arena.assign(n_in, false); m.arena_offset.assign(n_in, 0);
+  uint64_t arena_bytes = 0;
+  for (uint32_t i = 0; i < n_in; ++i) {
+    const uint64_t bytes = axclrtEngineGetInputSizeByIndex(m.info, 0, i);
+    if (bytes > kSmallInputBytes) continue;
+    m.in_arena[i] = true;
+    m.arena_offset[i] = arena_bytes;
+    arena_bytes += (bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
+  }
+  if (arena_bytes && axclrtMalloc(&m.input_arena, arena_bytes, AXCL_MEM_MALLOC_NORMAL_ONLY)) {
+    free_model(m);
+    error = "AXCL input arena setup failed";
+    return false;
+  }
+  m.input_arena_bytes = arena_bytes;
   for (uint32_t i = 0; i < n_in; ++i) {
     IoSpec& s = m.in[i];
     axclrtEngineDataType type{}; axclrtEngineIODims dims{};
@@ -244,8 +278,9 @@ static bool load_model(const std::string& path, LoadedModel& m, std::string& err
     if (!onnx_dtype_of_axcl(s.axcl_dtype, s.onnx_dtype)) s.onnx_dtype = 0;
     fill_shape(dims, s.shape);
     s.bytes = axclrtEngineGetInputSizeByIndex(m.info, 0, i);
-    if (axclrtMalloc(&m.inputs[i], s.bytes, AXCL_MEM_MALLOC_NORMAL_ONLY) ||
-        axclrtEngineSetInputBufferByIndex(m.io, i, m.inputs[i], s.bytes)) {
+    if (m.in_arena[i]) m.inputs[i] = static_cast<uint8_t*>(m.input_arena) + m.arena_offset[i];
+    else if (axclrtMalloc(&m.inputs[i], s.bytes, AXCL_MEM_MALLOC_NORMAL_ONLY)) m.inputs[i] = nullptr;
+    if (!m.inputs[i] || axclrtEngineSetInputBufferByIndex(m.io, i, m.inputs[i], s.bytes)) {
       free_model(m);
       error = "AXCL input buffer setup failed";
       return false;
@@ -501,9 +536,22 @@ static bool run_loaded(LoadedModel& m, const Request& request, Response& respons
   const bool shadowed = resident && !g_row_copy_on_device;
   if (shadowed && !continues) m.shadow.assign(n_in, std::vector<uint8_t>());
   const uint64_t upload_begin = elapsed_us(started);
+  // The arena goes up in one copy, unless one of its inputs is resident: then
+  // the request does not carry its contents, so the arena cannot be sent whole.
+  bool packed = m.input_arena_bytes > 0;
+  for (uint32_t i = 0; i < n_in && packed; ++i)
+    if (m.in_arena[i] && keep[i]) packed = false;
+  if (packed) {
+    m.stage.assign(static_cast<size_t>(m.input_arena_bytes), 0);
+    for (uint32_t i = 0; i < n_in; ++i)
+      if (m.in_arena[i]) std::memcpy(m.stage.data() + m.arena_offset[i], sources[i], m.in[i].bytes);
+    if (axclrtMemcpy(m.input_arena, m.stage.data(), m.input_arena_bytes, AXCL_MEMCPY_HOST_TO_DEVICE))
+      return fail("AXCL input upload failed", true);
+  }
   for (uint32_t i = 0; i < n_in; ++i) {
     if (keep[i]) continue;
-    if (axclrtMemcpy(m.inputs[i], sources[i], m.in[i].bytes, AXCL_MEMCPY_HOST_TO_DEVICE))
+    if (!(packed && m.in_arena[i]) &&
+        axclrtMemcpy(m.inputs[i], sources[i], m.in[i].bytes, AXCL_MEMCPY_HOST_TO_DEVICE))
       return fail("AXCL input upload failed", true);
     if (shadowed) {
       const uint8_t* bytes = static_cast<const uint8_t*>(sources[i]);
