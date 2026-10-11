@@ -180,7 +180,9 @@ def wide_layout(k: int) -> tuple[list[int], list[int], int]:
     offs, off = [], 0
     for pairs in segs:
         offs.append(off)
-        off += 16 * _row_bytes(pairs) + 256  # weight rows, then the requantization block
+        off += (
+            16 * _row_bytes(pairs) + 256
+        )  # weight rows, then the requantization block
     return segs, offs, off
 
 
@@ -263,9 +265,13 @@ def weight_codes(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _requant_f64(codes, s_w, s_x, zp_x, s_y, zp_y):
     """``(bias, M)`` float32 per output channel, computed in float64 and cast
     once (float32 arithmetic is an ulp off on about a third of the channels)."""
-    m = (np.float64(s_x) * np.asarray(s_w, np.float64) / np.float64(s_y)).astype(np.float32)
+    m = (np.float64(s_x) * np.asarray(s_w, np.float64) / np.float64(s_y)).astype(
+        np.float32
+    )
     qsum = (codes.astype(np.int64) - 128).sum(axis=1).astype(np.float64)
-    bias = (np.float64(zp_y) - np.float64(zp_x) * qsum * m.astype(np.float64)).astype(np.float32)
+    bias = (np.float64(zp_y) - np.float64(zp_x) * qsum * m.astype(np.float64)).astype(
+        np.float32
+    )
     return bias, m
 
 
@@ -293,12 +299,17 @@ def _tall576_table(codes, bias, m):
     col = 144 * (j // 36) + j % 36
     c = codes.reshape(n, k // 2, 2)
     addr = (tb + row)[:, None, None] + col[None, :, None] + 36 * np.arange(2)
-    planes = [((c[..., 0] >> (4 * p)) & 15) | (((c[..., 1] >> (4 * p)) & 15) << 4) for p in (0, 1)]
+    planes = [
+        ((c[..., 0] >> (4 * p)) & 15) | (((c[..., 1] >> (4 * p)) & 15) << 4)
+        for p in (0, 1)
+    ]
     t[addr.ravel()] = np.stack(planes, -1).astype(np.uint8).ravel()
     for tt in range(n // TILE):
         at = tt * tile + WEIGHT_BYTES[576]
         ch = slice(TILE * tt, TILE * (tt + 1))
-        t[at : at + BLOCK] = np.concatenate([bias[ch].view(np.uint8), m[ch].view(np.uint8)])
+        t[at : at + BLOCK] = np.concatenate(
+            [bias[ch].view(np.uint8), m[ch].view(np.uint8)]
+        )
     return t
 
 
@@ -328,8 +339,12 @@ def _wide_table(codes, bias, m):
         uo[:, :pairs] = u[:, 2 * start + 1 : 2 * (start + pairs) : 2]
         row = s1 * (op & 15) + 72 * ((op >> 4) & 1)
         for p in (0, 1):
-            byte = (((ue >> (4 * p)) & 15) | (((uo >> (4 * p)) & 15) << 4)).astype(np.uint8)
-            t[(g * g_bytes + off)[:, None] + row[:, None] + slot[None, :] + 36 * p] = byte
+            byte = (((ue >> (4 * p)) & 15) | (((uo >> (4 * p)) & 15) << 4)).astype(
+                np.uint8
+            )
+            t[(g * g_bytes + off)[:, None] + row[:, None] + slot[None, :] + 36 * p] = (
+                byte
+            )
         at = np.arange(ng) * g_bytes + off + 16 * s1
         t[at[:, None] + np.arange(256)[None, :]] = rq
         start += pairs
@@ -437,13 +452,17 @@ def template_shape(model: onnx.ModelProto) -> tuple[int, int]:
     its IO shapes and ``npu_params`` size."""
     g = model.graph
     if len(g.input) != 1 or len(g.output) != 1:
-        raise ValueError(f"expected one input and one output, found {len(g.input)} and {len(g.output)}")
+        raise ValueError(
+            f"expected one input and one output, found {len(g.input)} and {len(g.output)}"
+        )
     shapes = [
         tuple(d.dim_value for d in v.type.tensor_type.shape.dim)
         for v in [*g.input, *g.output]
     ]
     if any(len(sh) != 2 or sh[0] != 1 for sh in shapes):
-        raise ValueError(f"expected IO shapes [1, n], found {[list(sh) for sh in shapes]}")
+        raise ValueError(
+            f"expected IO shapes [1, n], found {[list(sh) for sh in shapes]}"
+        )
     (_, k), (_, n) = shapes
     family(k, n)  # refuses a layout that was never built
     params = next(i for i in g.initializer if i.name == "npu_params")
