@@ -1,0 +1,7 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// Runs a whole tinygrad-lowered graph on the cDSP in one call. `arena` holds the constants and
+// the input at the offsets in layout.json; `out_arena` returns the arena after the kernels ran.
+interface graph_rpc : remote_handle64 {
+  AEEResult run_graph(in sequence<octet> arena, rout sequence<octet> out_arena);
+};

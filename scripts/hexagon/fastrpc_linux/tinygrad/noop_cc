@@ -1,0 +1,4 @@
+#!/bin/bash
+# tinygrad's DSP capture: the compile step only needs to exist; the rendered source is what we keep.
+for a in "$@"; do [ "$prev" = "-o" ] && touch "$a"; prev=$a; done
+exit 0
