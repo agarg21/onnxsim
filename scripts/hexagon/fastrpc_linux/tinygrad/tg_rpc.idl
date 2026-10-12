@@ -1,0 +1,7 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// Runs the tinygrad-rendered float32 matmul (8x16 @ 16x4) on the cDSP.
+// a: 128 floats, b: 64 floats, c: 32 floats (row-major).
+interface tg_rpc : remote_handle64 {
+  AEEResult matmul_8x16x4(in sequence<octet> a, in sequence<octet> b, rout sequence<octet> c);
+};
