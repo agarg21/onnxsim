@@ -1,0 +1,17 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// Float32 kernels over byte buffers (little-endian float32 payloads).
+// Elementwise op codes match tools/onnx-remote: 0 relu, 1 add, 2 sub, 3 mul, 4 max, 5 min,
+// 6 abs, 7 neg. Unary ops ignore `b`; binary ops require len(b) == len(a).
+// matmul/conv/maxpool follow ONNX semantics for 2-D MatMul, NCHW Conv with dilation 1 and
+// group 1, and NCHW MaxPool (padding is ignored by the max, as in ONNX).
+interface ew_rpc : remote_handle64 {
+  AEEResult run_add(in int32 a, in int32 b, rout int32 result);
+  AEEResult elementwise(in int32 op, in sequence<octet> a, in sequence<octet> b, rout sequence<octet> c);
+  // c[m,n] = sum_k a[m,k] * b[k,n]
+  AEEResult matmul_f32(in int32 m, in int32 k, in int32 n, in sequence<octet> a, in sequence<octet> b, rout sequence<octet> c);
+  // p = [N, C, H, W, M, kH, kW, sH, sW, padTop, padLeft, padBottom, padRight]
+  AEEResult conv2d_f32(in sequence<int32> p, in sequence<octet> x, in sequence<octet> w, in sequence<octet> bias, rout sequence<octet> y);
+  // p = [N, C, H, W, kH, kW, sH, sW, padTop, padLeft, padBottom, padRight]
+  AEEResult maxpool2d_f32(in sequence<int32> p, in sequence<octet> x, rout sequence<octet> y);
+};
