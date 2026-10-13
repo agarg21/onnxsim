@@ -266,8 +266,8 @@ cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
 cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
   tensor_pool_gguf_bridge_test tensor_pool_archive_test \
   precision_estimator_test contrib_schemas_moe_test xnnpack_codegen_test \
-  graph_grad_test qat_graph_builder_test qat_graph_parity_test \
-  qat_entry_test \
+  graph_grad_test graph_grad_model_test qat_graph_builder_test \
+  qat_graph_parity_test qat_entry_test \
   -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"

@@ -380,8 +380,6 @@ void RepeatedCallsDoNotCollide() {
 }  // namespace
 
 int main() {
-  // Printed first so a CI log shows whether the binary ran at all.
-  std::fprintf(stderr, "graph_grad_model_test: started\n");
   TheOutputsAreTheWrtGradientsWithTheirShapes();
   TheGradientIsBuildBackwardOfTheSlice();
   AnUnreachedTargetGetsZeros();
