@@ -334,9 +334,8 @@ std::optional<Shape> WindowedOutput(const Shape& x, SymExpr channels_out,
                                ? attrs.dilations[i]
                                : 1;
     // ONNX lays pads out as [begin_0, ..., begin_{n-1}, end_0, ..., end_{n-1}].
-    const std::int64_t pb = i < static_cast<std::int64_t>(attrs.pads.size())
-                                ? attrs.pads[i]
-                                : 0;
+    const std::int64_t pb =
+        i < static_cast<std::int64_t>(attrs.pads.size()) ? attrs.pads[i] : 0;
     const std::int64_t pe =
         spatial + i < static_cast<std::int64_t>(attrs.pads.size())
             ? attrs.pads[spatial + i]
