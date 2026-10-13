@@ -319,6 +319,16 @@ int main() {
                      f)) == "[1, 1, 6, 6]");
   }
   {
+    // Asymmetric pads in ONNX layout: begins [0, 0], ends [1, 1]. Kernel 3 on
+    // a 5x5 input gives (5 + 0 + 1 - 3) + 1 = 4 on each axis.
+    FreshDims f;
+    WindowAttrs a;
+    a.pads = {0, 0, 1, 1};
+    assert(Str(*Conv(Dims({SymExpr(1), SymExpr(1), SymExpr(5), SymExpr(5)}),
+                     Dims({SymExpr(1), SymExpr(1), SymExpr(3), SymExpr(3)}), a,
+                     f)) == "[1, 1, 4, 4]");
+  }
+  {
     // Symbolic spatial length: a strided window is not a polynomial -> fresh.
     FreshDims f;
     WindowAttrs a;

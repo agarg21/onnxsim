@@ -333,12 +333,13 @@ std::optional<Shape> WindowedOutput(const Shape& x, SymExpr channels_out,
     const std::int64_t d = i < static_cast<std::int64_t>(attrs.dilations.size())
                                ? attrs.dilations[i]
                                : 1;
-    const std::int64_t pb = 2 * i < static_cast<std::int64_t>(attrs.pads.size())
-                                ? attrs.pads[2 * i]
+    // ONNX lays pads out as [begin_0, ..., begin_{n-1}, end_0, ..., end_{n-1}].
+    const std::int64_t pb = i < static_cast<std::int64_t>(attrs.pads.size())
+                                ? attrs.pads[i]
                                 : 0;
     const std::int64_t pe =
-        2 * i + 1 < static_cast<std::int64_t>(attrs.pads.size())
-            ? attrs.pads[2 * i + 1]
+        spatial + i < static_cast<std::int64_t>(attrs.pads.size())
+            ? attrs.pads[spatial + i]
             : 0;
     // Exact only when the input spatial dim is a concrete int; a strided window
     // over a symbolic length is not a polynomial, so it gets a fresh symbol.
