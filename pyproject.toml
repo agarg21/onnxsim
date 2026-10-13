@@ -31,7 +31,7 @@ classifiers = [
 # rich is used only to pretty-print terminal reports (the original-vs-simplified
 # table, the memory plan, the graph diff, CLI warnings). Without it those fall
 # back to plain-text tables via onnxsim._rich_compat; nothing about the produced
-# model changes. The 12.1.0 exclusion matches requirements.txt's long-standing
+# model changes. The 12.1.0 exclusion matches scripts/requirements.txt's long-standing
 # pin of that known-bad release.
 rich = ["rich != 12.1.0"]
 # onnxruntime is preferred for constant folding and correctness checking.
