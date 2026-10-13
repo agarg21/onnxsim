@@ -222,7 +222,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/graph_grad_model.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/shaping_rules.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/graph_grad_model.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
 
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
   target_sources(onnxsim PRIVATE onnxsim/remote_executor.cpp)
@@ -619,6 +619,13 @@ if (ONNXSIM_TESTS)
   target_include_directories(sym_expr_test PRIVATE onnxsim)
   add_test(NAME sym_expr_test COMMAND sym_expr_test)
 
+  # The pure ONNX shape rules (shaping_rules.h) are dependency-free: only
+  # SymExpr and the standard library, so they build standalone like sym_expr.
+  add_executable(shaping_rules_test onnxsim/shaping_rules_test.cpp
+                                    onnxsim/shaping_rules.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(shaping_rules_test PRIVATE onnxsim)
+  add_test(NAME shaping_rules_test COMMAND shaping_rules_test)
+
   add_executable(model_metrics_test onnxsim/model_metrics_test.cpp
                                     onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
   target_include_directories(model_metrics_test PRIVATE onnxsim)
@@ -644,6 +651,7 @@ if (ONNXSIM_TESTS)
   # SymExpr + the SymNode/SymTensor structs), so it builds and runs standalone.
   add_executable(sym_shape_infer_test onnxsim/sym_shape_infer_test.cpp
                                       onnxsim/sym_shape_infer.cpp
+                                      onnxsim/shaping_rules.cpp
                                       onnxsim/sym_value_eval.cpp onnxsim/sym_expr.cpp)
   target_include_directories(sym_shape_infer_test PRIVATE onnxsim)
   add_test(NAME sym_shape_infer_test COMMAND sym_shape_infer_test)

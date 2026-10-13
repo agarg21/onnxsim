@@ -1,6 +1,6 @@
-// Standalone test (all four .cpp on one g++ line):
-//   g++ -std=c++17 sym_expr.cpp sym_value_eval.cpp sym_shape_infer.cpp
-//       sym_shape_infer_test.cpp -o t && ./t
+// Standalone test (all five .cpp on one g++ line):
+//   g++ -std=c++17 sym_expr.cpp sym_value_eval.cpp shaping_rules.cpp
+//       sym_shape_infer.cpp sym_shape_infer_test.cpp -o t && ./t
 // (Builds identically under Emscripten.)
 //
 // Exercises the M2 symbolic activation-shape inference (issue #532): compute

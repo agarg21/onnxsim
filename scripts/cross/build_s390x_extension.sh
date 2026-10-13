@@ -225,7 +225,7 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # liveness core (see its CMakeLists.txt comment) and is likewise
 # ONNX-free, so it belongs here too.
 cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
-  sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
+  sym_value_eval_test sym_shape_infer_test shaping_rules_test dlpack_dtype_test \
   tensor_pool_dtype_test tensor_pool_test tensor_pool_hash_test \
   gguf_dtype_test ggml_kquant_test ggml_mxfp4_test ggml_legacy_quant_test \
   tensor_pool_gguf_test read_gguf_metadata_test memory_planning_test \
