@@ -2212,6 +2212,14 @@ def _grad_squeeze_or_unsqueeze(
     `scripts/axera/legalize.py`'s `unroll_lstm`, which does not itself emit
     one) that `build_backward` refused to walk over at all before this.
     """
+    # The reshape is correct for any axes, but the axes must be known at build
+    # time all the same: a runtime axes tensor means the output rank is not a
+    # static fact, and this module refuses rather than reason about it. From
+    # opset 13 the axes are an input and are read through the constant lookup
+    # every other parameter tensor uses; before that they are an attribute,
+    # which is already a build-time value.
+    if len(node.input) > 1 and node.input[1]:
+        _constant_ints(ctx, node.input[1], node)
     shape = ctx.shape(node.input[0])
     grad = ctx.b.op("Reshape", [g, ctx.int64_const(shape, "shape")])
     return [grad] + [None] * (len(node.input) - 1)
@@ -2818,10 +2826,12 @@ _RULES: Dict[str, Rule] = {
     "AveragePool": _grad_averagepool,
     "BatchNormalization": _grad_batch_normalization_templated,
     "Clip": _grad_clip,
+    "Concat": _grad_concat,
     "Conv": _grad_conv,
     "Div": _grad_div_templated,
     "Erf": _grad_erf_templated,
     "Exp": _grad_exp_templated,
+    "Expand": _grad_expand,
     "Gather": _grad_gather,
     "Gemm": _grad_gemm,
     "Identity": _grad_identity,
@@ -2832,16 +2842,20 @@ _RULES: Dict[str, Rule] = {
     "MaxPool": _grad_maxpool,
     "Mul": _grad_mul_templated,
     "Neg": _grad_neg_templated,
+    "Pad": _grad_pad,
     "ReduceMean": _grad_reduce,
     "ReduceSum": _grad_reduce,
     "Relu": _grad_relu,
     "Reshape": _grad_reshape,
     "Sigmoid": _grad_sigmoid_templated,
+    "Slice": _grad_slice,
     "Softmax": _grad_softmax,
     "Sqrt": _grad_sqrt_templated,
+    "Squeeze": _grad_squeeze_or_unsqueeze,
     "Sub": _grad_sub,
     "Tanh": _grad_tanh_templated,
     "Transpose": _grad_transpose,
+    "Unsqueeze": _grad_squeeze_or_unsqueeze,
 }
 
 
@@ -2854,16 +2868,14 @@ _RULES: Dict[str, Rule] = {
 #: :data:`_MULTI_OUTPUT_RULES`, every rule here is an ordinary
 #: single-``g`` :data:`Rule` -- ``Where``/``IsNaN`` (numerical-stability
 #: masking in wav2vec2's own attention output, see
-#: ``docs/axera-audio-speech-op-coverage.md``), ``Concat`` (needed for
-#: `scripts/axera/legalize.py`'s `unroll_lstm`/`unroll_gru` to differentiate
-#: through their own stacked-timestep sequence output), ``Squeeze``/
-#: ``Unsqueeze`` (a real NVIDIA Parakeet decoder export has a bare
-#: ``Squeeze`` between its two LSTM layers, unrelated to `unroll_lstm`
-#: itself), and ``DepthToSpace`` (`nn.PixelShuffle`'s ONNX form -- the
-#: sub-pixel convolution upsampler every super-resolution architecture
-#: surveyed here uses) each have exactly one output -- so the *only*
-#: reason they are not simply in :data:`_RULES` is the missing C++ port,
-#: not a signature mismatch. :func:`build_backward` merges this table into
+#: ``docs/axera-audio-speech-op-coverage.md``), and ``DepthToSpace``
+#: (`nn.PixelShuffle`'s ONNX form -- the sub-pixel convolution upsampler
+#: every super-resolution architecture surveyed here uses) each have exactly
+#: one output -- so the *only* reason they are not simply in :data:`_RULES`
+#: is the missing C++ port, not a signature mismatch. (``Concat``,
+#: ``Slice``, ``Pad``, ``Expand``, ``Squeeze`` and ``Unsqueeze`` were in this
+#: table until their C++ mirrors landed in ``graph_grad.cpp``; they now live
+#: in :data:`_RULES`.) :func:`build_backward` merges this table into
 #: its default rule set right alongside :data:`_CUSTOM_RULES`, and
 #: :func:`supported_ops` includes it, so QAT/LoRA block discovery correctly
 #: treats a block containing any of them as differentiable.
@@ -2899,21 +2911,15 @@ def _grad_dequantize_linear(
 
 
 _PYTHON_ONLY_RULES: Dict[str, Rule] = {
-    "Concat": _grad_concat,
     "DequantizeLinear": _grad_dequantize_linear,
     "DepthToSpace": _grad_depth_to_space,
     "Elu": _grad_elu,
-    "Expand": _grad_expand,
     "GlobalAveragePool": _grad_global_averagepool,
     "IsNaN": _grad_is_nan,
     "LeakyRelu": _grad_leaky_relu,
-    "Pad": _grad_pad,
     "PRelu": _grad_prelu_scalar,
     "QuantizeLinear": _grad_quantize_linear,
-    "Slice": _grad_slice,
     "Softplus": _grad_softplus,
-    "Squeeze": _grad_squeeze_or_unsqueeze,
-    "Unsqueeze": _grad_squeeze_or_unsqueeze,
     "Where": _grad_where,
 }
 
