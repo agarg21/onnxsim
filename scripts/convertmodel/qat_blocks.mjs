@@ -55,6 +55,7 @@ import { fields, decode } from "./macs.mjs";
 // a gap), and a list that runs ahead of one costs a proposed block that is then
 // refused and skipped with its reason -- neither trains anything wrongly.
 export const DIFFERENTIABLE_OPS = new Set([
+  "Abs",
   "Add",
   "AveragePool",
   "BatchNormalization",
@@ -74,7 +75,9 @@ export const DIFFERENTIABLE_OPS = new Set([
   "Log",
   "LogSoftmax",
   "MatMul",
+  "Max",
   "MaxPool",
+  "Min",
   "Mul",
   "Neg",
   "Pad",
@@ -93,6 +96,7 @@ export const DIFFERENTIABLE_OPS = new Set([
   "Tanh",
   "Transpose",
   "Unsqueeze",
+  "Where",
 ]);
 
 // The ops onnxsim's quantizers turn into quantized layers -- see the header
