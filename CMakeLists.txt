@@ -619,6 +619,13 @@ if (ONNXSIM_TESTS)
   target_include_directories(sym_expr_test PRIVATE onnxsim)
   add_test(NAME sym_expr_test COMMAND sym_expr_test)
 
+  # The pure ONNX shape rules (shaping_rules.h) are dependency-free: only
+  # SymExpr and the standard library, so they build standalone like sym_expr.
+  add_executable(shaping_rules_test onnxsim/shaping_rules_test.cpp
+                                    onnxsim/shaping_rules.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(shaping_rules_test PRIVATE onnxsim)
+  add_test(NAME shaping_rules_test COMMAND shaping_rules_test)
+
   add_executable(model_metrics_test onnxsim/model_metrics_test.cpp
                                     onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
   target_include_directories(model_metrics_test PRIVATE onnxsim)
