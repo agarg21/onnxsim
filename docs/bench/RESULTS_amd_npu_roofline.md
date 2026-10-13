@@ -1,4 +1,4 @@
-# RESULTS: roofline benchmark on AMD Strix Halo NPU (`bench/amd_npu_roofline.py`)
+# RESULTS: roofline benchmark on AMD Strix Halo NPU (`docs/bench/amd_npu_roofline.py`)
 
 Machine: AMD Ryzen AI Max+ 395 (Strix Halo, XDNA2, 6x8 AIE array), 128 GB
 LPDDR5X. Software: XRT 2.25.37, NPU fw 1.1.2.65, Ryzen AI Software 1.8,
@@ -52,6 +52,6 @@ weight streaming, PDI swaps, Quantize/Dequantize boundary ops on CPU, and
 single-stream execution. The towers' value is comparative (conv vs GEMM,
 width vs depth, batch scaling), not the absolute number.
 
-Reproduce: `python bench/amd_npu_roofline.py prep [--quantizer ...]`
+Reproduce: `python docs/bench/amd_npu_roofline.py prep [--quantizer ...]`
 in this checkout, then `run <model> --provider vitisai` inside the Ryzen
 AI venv (see the script header).

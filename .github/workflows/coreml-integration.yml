@@ -56,14 +56,14 @@ name: Core ML Integration
 # faster here) and the few-billion-parameter tier -- the same rough weight
 # class as DeviceMark's own leaderboard (https://devicemark.github.io/,
 # roughly 0.8-5B; its own current roster is a different, non-overlapping
-# model list -- see bench/TODO_quality_retention_eval.md) -- SmolLM2-1.7B,
+# model list -- see docs/bench/TODO_quality_retention_eval.md) -- SmolLM2-1.7B,
 # Qwen2.5-3B, Llama-3.2-1B/3B, Phi-3.5-mini. This is the one place any of
 # this actually executes anywhere, since no environment developing this repo
 # has real Core ML to run it on. Also workflow_dispatch/schedule-only,
 # matching the other real-model jobs.
 #
 # A fifth job -- `quality-eval-macos` -- is the first slice of
-# bench/TODO_quality_retention_eval.md's quality/retention plan: it runs small IFEval
+# docs/bench/TODO_quality_retention_eval.md's quality/retention plan: it runs small IFEval
 # and MATH-500 subsets (scripts/apple/run_quality_eval.py, an lm-evaluation-harness
 # wrapper) against both the float Hugging Face model (CPU, no macOS needed for that
 # half) and the exported Core ML model (scripts/apple/lm_eval_coreml_adapter.py, real
@@ -558,7 +558,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       # hendrycks_math500 (MATH-500 -- same HuggingFaceH4/MATH-500 source DeviceMark's
-      # own battery draws from, see bench/TODO_quality_retention_eval.md) is the second
+      # own battery draws from, see docs/bench/TODO_quality_retention_eval.md) is the second
       # benchmark this suite runs in CI, not MMLU-Pro: prototyping found it far cheaper
       # per example at this suite's unbatched single-sequence decode (~7s/example on
       # CPU at --limit 3, vs. MMLU-Pro's ~2 minutes/example -- see that doc's "What's
@@ -590,7 +590,7 @@ jobs:
               --model-id "$MODEL_ID" --output retention_math500.json
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-      # Machine-readable trend data (bench/TODO_quality_retention_eval.md's
+      # Machine-readable trend data (docs/bench/TODO_quality_retention_eval.md's
       # "Reporting" section): each retention_*.json has a flat "records" list
       # ({model_id, benchmark, metric, subset_n, float_acc, quantized_acc,
       # retention}, see compute_retention.py's build_records) alongside the

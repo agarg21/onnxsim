@@ -2,7 +2,7 @@
 """Compare onnxsim against onnxslim on public models and print node-count deltas.
 
 Usage:
-    python bench/onnxslim_comparison.py swin_s_Opset18 FasterRCNN-10
+    python docs/bench/onnxslim_comparison.py swin_s_Opset18 FasterRCNN-10
 
 Each argument is a model name from the Hugging Face ``onnxmodelzoo`` org
 (``onnxmodelzoo/<name>`` containing ``<name>.onnx``) or a path to a local

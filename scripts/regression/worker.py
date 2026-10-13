@@ -85,7 +85,7 @@ def run_onnxsim(onnx_path):
     # SerializeToString/ParseFromString round trip a pre-loaded ModelProto
     # otherwise always pays -- for a large model that round trip alone can
     # rival the actual simplification time (see
-    # bench/RESULTS_profiling_survey.md).
+    # docs/bench/RESULTS_profiling_survey.md).
     #
     # Opt-in per-model profiling: set by run_regression.py's --profile-dir
     # (itself wired to the Model Regression workflow's "profile"

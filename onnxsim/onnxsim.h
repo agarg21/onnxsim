@@ -219,8 +219,8 @@ onnx::ModelProto Simplify(
 // internally for shape inference / constant folding's own resident Graph)
 // instead of deep-copied into the working copy the fixed point runs on. For
 // a model whose weights dominate its size, this roughly halves
-// ``Simplify``'s own peak memory (see bench/RESULTS_synthetic_decoder_oom.md
-// for measurements and bench/TODO_large_decoder_submodule_oom.md for the
+// ``Simplify``'s own peak memory (see docs/bench/RESULTS_synthetic_decoder_oom.md
+// for measurements and docs/bench/TODO_large_decoder_submodule_oom.md for the
 // original report this traces back to).
 //
 // Only call this when ``model`` is about to be discarded or overwritten by

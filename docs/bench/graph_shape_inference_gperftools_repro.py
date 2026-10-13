@@ -3,9 +3,9 @@
 ``InferShapesOnGraph`` (third_party/onnx/onnx/common/graph_shape_inference.cc),
 run through onnxsim's real Simplify() pipeline (real schema-registered
 inference functions, real fixed-point loop) -- see
-bench/RESULTS_graph_shape_inference_gperftools.md for what this found.
+docs/bench/RESULTS_graph_shape_inference_gperftools.md for what this found.
 
-Unlike bench/graph_shape_inference_teardown_bench.cpp (which builds the
+Unlike docs/bench/graph_shape_inference_teardown_bench.cpp (which builds the
 scratch message tree standalone, without the schema registry), this script
 drives the actual C++ extension end to end via onnxsim.simplify(), so a
 CPU-time sampling profiler (gperftools' libprofiler.so) attached to the
@@ -27,14 +27,14 @@ fixed-point rounds, and to exercise both open hypotheses from the
      attribute objects get re-encoded from scratch on every node visit,
      every round.
 
-See bench/RESULTS_graph_shape_inference_gperftools.md for what a profiling
+See docs/bench/RESULTS_graph_shape_inference_gperftools.md for what a profiling
 run against this model actually found -- spoiler: both hypotheses are real
 but tiny, dwarfed by an unrelated, much larger cost in graph Import itself.
 
 Usage:
-    python bench/graph_shape_inference_gperftools_repro.py gen out.onnx \\
+    python docs/bench/graph_shape_inference_gperftools_repro.py gen out.onnx \\
         [--blocks N]
-    python bench/graph_shape_inference_gperftools_repro.py run out.onnx \\
+    python docs/bench/graph_shape_inference_gperftools_repro.py run out.onnx \\
         [--loops N]
 
 `run` calls onnxsim.simplify(..., perform_optimization=False) in a loop (so
@@ -44,7 +44,7 @@ gperftools, e.g.:
 
     CPUPROFILE=/tmp/prof.out CPUPROFILE_FREQUENCY=1000 \\
     LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libprofiler.so \\
-    python bench/graph_shape_inference_gperftools_repro.py run out.onnx --loops 8
+    python docs/bench/graph_shape_inference_gperftools_repro.py run out.onnx --loops 8
 """
 
 import argparse

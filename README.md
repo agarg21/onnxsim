@@ -32,11 +32,11 @@ torch.onnx.export(net, dummy_input, model_name, input_names=['input'], output_na
 
 The input shape in this model is static, so what I expected is
 
-![simple_reshape](imgs/simple_reshape.png)
+![simple_reshape](docs/imgs/simple_reshape.png)
 
 However, I got the following complicated model instead:
 
-![complicated_reshape](imgs/complicated_reshape.png)
+![complicated_reshape](docs/imgs/complicated_reshape.png)
 
 ## Our solution
 
@@ -217,7 +217,7 @@ An overall comparison between
 [a complicated model](https://github.com/JDAI-CV/DNNLibrary/issues/17#issuecomment-455934190)
 and its simplified version:
 
-![Comparison between old model and new model](imgs/comparison.png)
+![Comparison between old model and new model](docs/imgs/comparison.png)
 
 ## In-script workflow
 

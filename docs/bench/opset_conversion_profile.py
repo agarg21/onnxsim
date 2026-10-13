@@ -20,7 +20,7 @@ cost highlighted in issue discussion to be visible, small enough to run
 quickly and stay within sandbox disk/memory limits.
 
 Usage:
-    python bench/opset_conversion_profile.py [--trials N] [--target latest]
+    python docs/bench/opset_conversion_profile.py [--trials N] [--target latest]
 """
 from __future__ import annotations
 

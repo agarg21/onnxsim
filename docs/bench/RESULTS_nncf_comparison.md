@@ -1,6 +1,6 @@
 # onnxsim vs. NNCF: INT4 weight-only compression
 
-Measured with `bench/nncf_comparison.py`. This answers candidate future-work
+Measured with `docs/bench/nncf_comparison.py`. This answers candidate future-work
 item 3 in `docs/nncf-comparison-future-work.md`, which noted that the
 onnxsim-vs-NNCF comparison recorded there was architectural and that "no
 benchmark in this repo actually runs the same model through both onnxsim and
@@ -9,7 +9,7 @@ NNCF."
 **Environment**: NNCF 3.3.0, onnxruntime 1.29.0 (CPUExecutionProvider), onnx
 1.20.0, numpy 2.3.5, x86_64, Python 3.11. onnxsim built from this checkout.
 
-**Model**: `bench/nncf_comparison.py`'s synthetic 4-layer MatMul stack,
+**Model**: `docs/bench/nncf_comparison.py`'s synthetic 4-layer MatMul stack,
 `in_dim = hidden = 256` (1024 KiB of float32 weights). See "Caveats" — the
 synthetic model is the main limitation of these numbers.
 
@@ -102,7 +102,7 @@ graphs will hit it.
   changed nothing at all (0.1698 → 0.1698) and its Scale Estimation was
   slightly worse (0.1765); onnxsim's AWQ moved 0.1953 → 0.1926. These numbers
   say nothing about how those methods behave on a real transformer, and should
-  not be read as ranking AWQ against GPTQ. `bench/nncf_comparison.py` accepts a
+  not be read as ranking AWQ against GPTQ. `docs/bench/nncf_comparison.py` accepts a
   path to a real `.onnx` model for exactly this reason.
 - **Accuracy is output relative L2, not a task metric.** No perplexity or
   downstream-accuracy evaluation is involved.
@@ -116,6 +116,6 @@ graphs will hit it.
 
 ```bash
 pip install nncf
-python bench/nncf_comparison.py --layers 4 --hidden 256 --in-dim 256
-python bench/nncf_comparison.py path/to/real_model.onnx   # far more meaningful
+python docs/bench/nncf_comparison.py --layers 4 --hidden 256 --in-dim 256
+python docs/bench/nncf_comparison.py path/to/real_model.onnx   # far more meaningful
 ```

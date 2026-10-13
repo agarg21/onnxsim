@@ -52,9 +52,9 @@ quantizer, and on a synthetic model at that.
 
 Usage::
 
-    python bench/nncf_comparison.py                 # synthetic MLP stack
-    python bench/nncf_comparison.py --layers 8 --hidden 512
-    python bench/nncf_comparison.py model.onnx      # a real model
+    python docs/bench/nncf_comparison.py                 # synthetic MLP stack
+    python docs/bench/nncf_comparison.py --layers 8 --hidden 512
+    python docs/bench/nncf_comparison.py model.onnx      # a real model
 
 Dependencies: ``onnxsim`` (built, i.e. with its compiled extension --
 ``quantize_weight_only_int4`` is a C++ pass), ``nncf``, ``onnx``,
@@ -299,7 +299,7 @@ def _feed(
     the batch. Reading ``dim_value`` blindly yields 0 for a symbolic dim and
     would build empty arrays; assuming float32 would feed the wrong dtype to
     an integer input. Both make the advertised
-    ``python bench/nncf_comparison.py model.onnx`` usage fail rather than
+    ``python docs/bench/nncf_comparison.py model.onnx`` usage fail rather than
     measure anything.
     """
     feeds: Dict[str, np.ndarray] = {}

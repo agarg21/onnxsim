@@ -1,7 +1,7 @@
 # Open: onnxsim OOMs simplifying a ~5GB decoder-only transformer submodule
 
 **Status:** root cause found and fixed for the default (`check_n=0`) path -- see
-`bench/RESULTS_synthetic_decoder_oom.md`. A synthetic ~8GB model that previously
+`docs/bench/RESULTS_synthetic_decoder_oom.md`. A synthetic ~8GB model that previously
 OOM-killed in this repo's own ~13.3GiB sandbox now completes at ~0.95x its own size
 (down from being killed above 1.65x and climbing). `check_n>0` is a separate, still-open
 issue the fix does not touch (see that doc's "What's still open"). The original
@@ -63,8 +63,8 @@ submodule, packed-sequence detection can be disabled for tracing with
 - The smaller submodules (<=1.7GB, single inline file) simplified without issue in the
   same ~15GB environment, so the failure is specific to this model, not universal to
   `simplify()` on any external-data model.
-- **Update -- see `bench/RESULTS_synthetic_decoder_oom.md` for the full writeup.** A
-  synthetic, torch/HF-free repro (`bench/decoder_oom_repro.py`) reproduced an
+- **Update -- see `docs/bench/RESULTS_synthetic_decoder_oom.md` for the full writeup.** A
+  synthetic, torch/HF-free repro (`docs/bench/decoder_oom_repro.py`) reproduced an
   equivalent OOM, found the real root cause (correcting an earlier, disproven theory
   in this same doc's history -- see that file's own note at the top), and fixed it:
   - **File count vs. total bytes is resolved: file count doesn't matter.** A
@@ -98,13 +98,13 @@ submodule, packed-sequence detection can be disabled for tracing with
 
 ## Next steps, if picking this up
 
-1. ~~Reduce to a runnable repro~~ -- done, see `bench/decoder_oom_repro.py` and
-   `bench/RESULTS_synthetic_decoder_oom.md`.
+1. ~~Reduce to a runnable repro~~ -- done, see `docs/bench/decoder_oom_repro.py` and
+   `docs/bench/RESULTS_synthetic_decoder_oom.md`.
 2. ~~Isolate file-count vs. total-bytes~~ -- done: file count does not affect peak
    memory, only total bytes do.
 3. ~~Find and fix the root cause of the `check_n=0` OOM~~ -- done: `Simplify()`'s
    const-preserving deep copy, fixed via `SimplifyConsumeInput`. See
-   `bench/RESULTS_synthetic_decoder_oom.md`'s "The fix" section for the exact change.
+   `docs/bench/RESULTS_synthetic_decoder_oom.md`'s "The fix" section for the exact change.
 4. Fix `check_n>0`, still open: reloading a full model per correctness-check trial
    through the pure-Python reference evaluator (`onnxsim/model_checking.py`
    ~line 328-329) is the next candidate to profile and fix the same way -- likely

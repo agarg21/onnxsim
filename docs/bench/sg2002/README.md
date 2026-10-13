@@ -12,7 +12,7 @@ environment variable.
 
 ```sh
 export TPU_MLIR_SSH_PASSWORD="$BOARD_PASSWORD"
-python bench/sg2002/profile_model.py \
+python docs/bench/sg2002/profile_model.py \
   resnet50.cvimodel resnet50-input.npz \
   --host kvm-9c35.local \
   --count 100 --repeat 3 --batch 1 \
@@ -31,6 +31,6 @@ The model and NPZ are uploaded to a unique directory under `--remote-dir` (defau
 `/tmp/onnxsim-tpu-profile`) and removed after measurement. Compilation is not included in timing.
 
 `onnxsim.rpc` can compile an ONNX model with TPU-MLIR, execute it on the SG2002, and return the
-same runtime PMU counters; see [the RPC guide](../../docs/rpc.md#tpu-mlir-compilation-and-sg2002-execution).
+same runtime PMU counters; see [the RPC guide](../../rpc.md#tpu-mlir-compilation-and-sg2002-execution).
 The CLI here is useful when a CVI model has already been compiled or when driver usage sampling
 is needed.

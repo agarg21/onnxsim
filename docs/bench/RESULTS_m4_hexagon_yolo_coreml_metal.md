@@ -53,6 +53,6 @@ overhead; model quality and transfer cost are now more limiting than Python
 per-op launch overhead.
 
 The M4 runs used the manifest-driven runner in
-[`scripts/apple/benchmark_onnx_pipeline.py`](../scripts/apple/benchmark_onnx_pipeline.py).
+[`scripts/apple/benchmark_onnx_pipeline.py`](../../scripts/apple/benchmark_onnx_pipeline.py).
 The Hexagon baselines are in
-[`scripts/android/deploy/README.md`](../scripts/android/deploy/README.md).
+[`scripts/android/deploy/README.md`](../../scripts/android/deploy/README.md).

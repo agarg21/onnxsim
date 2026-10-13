@@ -2,7 +2,7 @@
 accounting logic (`is_completed`, `aggregate_completed_only`) -- the
 lm_eval/transformers-dependent parts (tokenizer loading, `simple_evaluate`)
 aren't exercised here, see that module's docstring and
-bench/TODO_quality_retention_eval.md for how those are validated (an actual
+docs/bench/TODO_quality_retention_eval.md for how those are validated (an actual
 CI run, plus the manual token-count-vs-cap check that motivated this design).
 """
 

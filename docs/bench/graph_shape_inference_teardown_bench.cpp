@@ -9,7 +9,7 @@
 // every sub-message individually. The change allocates the whole per-visit tree
 // on a google::protobuf::Arena so it is released in one bulk free instead.
 //
-// This benchmark isolates exactly that cost, the same way bench/
+// This benchmark isolates exactly that cost, the same way docs/bench/
 // fold_teardown_bench.cpp isolates RunOp's arena change from ONNX Runtime
 // session-creation noise: an end-to-end Simplify measurement mixes in schema
 // lookup, symbol-table bookkeeping and the actual shape/type inference
@@ -31,7 +31,7 @@
 //   argv: [iters] [num_inputs] [num_outputs] [num_attrs] [rank] [num_const_inputs]
 //   defaults: 20000 3 1 2 4 1
 //
-// Build & run: see bench/graph_shape_inference_teardown_bench.sh (points
+// Build & run: see docs/bench/graph_shape_inference_teardown_bench.sh (points
 // -I/-L at your onnx + protobuf, which are already built when you build
 // onnxsim).
 

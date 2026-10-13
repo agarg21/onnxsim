@@ -5,7 +5,7 @@
 tree, and the per-input `TypeProto`/`TensorProto` adapters) in
 `onnx/common/graph_shape_inference.cc`, the same treatment `constant_folding.cpp`'s
 `RunOps` already got for its throwaway sub-model.
-**Reproduce:** `bench/graph_shape_inference_teardown_bench.sh` (isolated
+**Reproduce:** `docs/bench/graph_shape_inference_teardown_bench.sh` (isolated
 microbenchmark) and `ONNXSIM_PROFILE=trace.json onnxsim <model> <out>
 --skip-optimization` (end-to-end, via onnxsim's built-in profiler).
 
@@ -29,7 +29,7 @@ see a bigger share of the isolated win reflected end-to-end.
 
 ## Isolated microbenchmark
 
-`bench/graph_shape_inference_teardown_bench.cpp` builds the same
+`docs/bench/graph_shape_inference_teardown_bench.cpp` builds the same
 `NodeProto`/`TypeProto`/`TensorProto` tree `ProcessNode` builds for one node
 visit -- without going through the real schema registry / inference functions,
 for the same reason `fold_teardown_bench.cpp` isolates `RunOp`'s arena change

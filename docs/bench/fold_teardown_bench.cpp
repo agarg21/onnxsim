@@ -29,7 +29,7 @@
 //   argv: [iters] [inits_per_model] [nodes_per_model] [dim]
 //   defaults: 20000 8 1 16
 //
-// Build & run: see bench/fold_teardown_bench.sh (points -I/-L at your onnx +
+// Build & run: see docs/bench/fold_teardown_bench.sh (points -I/-L at your onnx +
 // protobuf, which are already built when you build onnxsim).
 
 #include <google/protobuf/arena.h>

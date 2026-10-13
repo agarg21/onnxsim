@@ -177,7 +177,7 @@ def _check(ret: int, operation: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--output-dir", default="bench/luckfox-rv1106")
+    ap.add_argument("--output-dir", default="docs/bench/luckfox-rv1106")
     ap.add_argument("--onnxsim-quantize", action="store_true",
                     help="emit QDQ INT8 ONNX with onnxsim before RKNN conversion")
     args = ap.parse_args()

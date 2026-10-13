@@ -3,7 +3,7 @@
 **Models:** [`onnxmodelzoo/swin_s_Opset18`](https://huggingface.co/onnxmodelzoo/swin_s_Opset18)
 and [`onnxmodelzoo/FasterRCNN-10`](https://huggingface.co/onnxmodelzoo/FasterRCNN-10)
 (Hugging Face).
-**Reproduce:** `python bench/onnxslim_comparison.py swin_s_Opset18 FasterRCNN-10`
+**Reproduce:** `python docs/bench/onnxslim_comparison.py swin_s_Opset18 FasterRCNN-10`
 **Tools:** onnxsim (this repo), onnxslim `0.1.94`, onnxruntime `1.28`, onnx `1.22`.
 
 ## TL;DR

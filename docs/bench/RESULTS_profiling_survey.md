@@ -7,7 +7,7 @@ to find the *next* bottleneck, following up on
 old repeated-round-trip issue and found the `Optimize` pass suite dominating the
 *profiled* portion of `simplify()`).
 
-**Tool:** [`scripts/regression/profile_sample.py`](../scripts/regression/profile_sample.py)
+**Tool:** [`scripts/regression/profile_sample.py`](../../scripts/regression/profile_sample.py)
 (new), which fetches named regression models via `model_zoo.py` and runs each
 through `simplify(path, profile=...)` in its own subprocess, capturing both the C++
 profiler's printed span summary and total Python-level wall time / peak RSS.

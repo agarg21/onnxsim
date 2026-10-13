@@ -27,9 +27,9 @@ For each we report:
 
 Usage::
 
-    python bench/peak_memory.py setup        # build old/new pkgs + gen model
-    python bench/peak_memory.py run  <api|cli> <old|new>   # one measurement
-    python bench/peak_memory.py report        # run all four and print a table
+    python docs/bench/peak_memory.py setup        # build old/new pkgs + gen model
+    python docs/bench/peak_memory.py run  <api|cli> <old|new>   # one measurement
+    python docs/bench/peak_memory.py report        # run all four and print a table
 
 Environment: needs ``onnx``, ``onnxruntime``, ``psutil`` and a compiled
 ``onnxsim_cpp2py_export*.so`` (e.g. from ``pip download onnxsim``). Set
@@ -45,7 +45,7 @@ import time
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 WORK = os.environ.get("ONNXSIM_BENCH_WORK", "/tmp/onnxsim_peak_bench")
-REPO = os.environ.get("ONNXSIM_REPO", os.path.dirname(BENCH))
+REPO = os.environ.get("ONNXSIM_REPO", os.path.dirname(os.path.dirname(BENCH)))
 SO = os.environ.get("ONNXSIM_SO", "")   # path to onnxsim_cpp2py_export*.so
 
 # Commit just before PR #482, and the PR merge commit.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build and run bench/fold_teardown_bench.cpp -- the microbenchmark for the arena
-# change in RunOp (onnxsim/onnxsim.cpp).
+# Build and run docs/bench/graph_shape_inference_teardown_bench.cpp -- the
+# microbenchmark for the arena change in ProcessNode
+# (third_party/onnx/onnx/common/graph_shape_inference.cc).
 #
 # It needs the onnx C++ proto headers/lib and protobuf. Both are already built
 # when you build onnxsim, so the easiest path is to point this at that build:
@@ -14,14 +15,15 @@
 # Example against a CMake build tree at build/:
 #   ONNX_INCLUDE="third_party/onnx:build" \
 #   ONNX_LIB="build:build/lib" \
-#   bench/fold_teardown_bench.sh 20000 8 1 16
+#   docs/bench/graph_shape_inference_teardown_bench.sh 20000 3 1 2 4 1
 #
-# Args are forwarded to the binary: [iters] [inits_per_model] [nodes] [dim].
+# Args are forwarded to the binary:
+#   [iters] [num_inputs] [num_outputs] [num_attrs] [rank] [num_const_inputs]
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-src="$here/fold_teardown_bench.cpp"
-bin="${BENCH_BIN:-/tmp/fold_teardown_bench}"
+src="$here/graph_shape_inference_teardown_bench.cpp"
+bin="${BENCH_BIN:-/tmp/graph_shape_inference_teardown_bench}"
 
 # protobuf flags (pkg-config unless overridden).
 if [[ -z "${PROTOBUF_CFLAGS:-}" || -z "${PROTOBUF_LIBS:-}" ]]; then

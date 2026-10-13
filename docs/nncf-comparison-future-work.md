@@ -60,8 +60,8 @@ iterate-until-target-met control loop and a formal target-metric API, not new
 math.
 
 ### 3. A real onnxsim-vs-NNCF benchmark -- **done**
-This is now `bench/nncf_comparison.py`, with measured results and their
-caveats in `bench/RESULTS_nncf_comparison.md`. It runs the same model through
+This is now `docs/bench/nncf_comparison.py`, with measured results and their
+caveats in `docs/bench/RESULTS_nncf_comparison.md`. It runs the same model through
 both tools on int4 weight-only compression (onnxsim's
 `quantize_weight_only_int4` + GPTQ/AWQ vs. NNCF's
 `compress_weights(mode=INT4_SYM, ...)`) and reports accuracy, size and

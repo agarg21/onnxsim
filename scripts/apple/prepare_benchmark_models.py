@@ -13,7 +13,7 @@ docstrings for what those numbers do and don't mean).
 on-device LLM leaderboard tests (https://devicemark.github.io/, roughly
 0.8-5B parameters; its own current roster -- Qwen3.5, LFM2.5, Granite-4.0-H,
 and others, none of them below -- runs on a private on-device engine, not
-Core ML; see `bench/TODO_quality_retention_eval.md`), spanning a few
+Core ML; see `docs/bench/TODO_quality_retention_eval.md`), spanning a few
 architecture families (Llama-style, Qwen2, Phi-3) rather than just one, since
 `onnxsim/coreml_export.py`'s translator is a hand-written ONNX-to-MIL mapping
 and different architectures exercise different op combinations.

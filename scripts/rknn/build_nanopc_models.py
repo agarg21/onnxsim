@@ -246,7 +246,7 @@ def _build(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--output-dir", default="bench/nanopc-rk3588")
+    ap.add_argument("--output-dir", default="docs/bench/nanopc-rk3588")
     ap.add_argument(
         "--onnxsim-quantize",
         action="store_true",

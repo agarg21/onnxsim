@@ -1,7 +1,7 @@
 # Investigating (and fixing) the ~5GB decoder-submodule OOM
 
-**Follow-up to:** `bench/TODO_large_decoder_submodule_oom.md`
-**Reproduce:** `bench/decoder_oom_repro.py` (`gen` / `measure` / `matrix` subcommands)
+**Follow-up to:** `docs/bench/TODO_large_decoder_submodule_oom.md`
+**Reproduce:** `docs/bench/decoder_oom_repro.py` (`gen` / `measure` / `matrix` subcommands)
 **Environment:** this repo's own sandbox -- a `memory` cgroup capped at
 **13.34 GiB** (`memory.limit_in_bytes` = 14327726080 bytes; read from
 `/sys/fs/cgroup/memory/.../memory.limit_in_bytes`), 4 vCPUs, Python 3.11,
@@ -77,7 +77,7 @@ untouched (see "What's still open" below).
 Reproduce the fixed numbers with:
 
 ```
-python bench/decoder_oom_repro.py matrix /tmp/work --sizes 5,8
+python docs/bench/decoder_oom_repro.py matrix /tmp/work --sizes 5,8
 ```
 
 (the "many vs single" file-count comparison in that script's output is
@@ -110,7 +110,7 @@ at O(one tensor) of Python memory.
 
 Sampling `/proc/<pid>/status`'s `VmHWM` from an external shell loop every
 100ms (Python-level sampling can't run *during* a C++ call: the GIL blocks it,
-as `bench/peak_memory.py`'s own methodology notes already point out) against
+as `docs/bench/peak_memory.py`'s own methodology notes already point out) against
 `onnxsim.simplify(path, check_n=0)` with `ONNXSIM_DEBUG_PATH_TIMING=1` shows
 RSS growing in two distinct, contiguous phases on the 4.93GB model:
 
@@ -251,7 +251,7 @@ cases the C++ fix doesn't reach:
 
 ## Methodology note: a bug this investigation ran into and fixed
 
-`bench/decoder_oom_repro.py`'s `matrix` command originally called `measure()`
+`docs/bench/decoder_oom_repro.py`'s `matrix` command originally called `measure()`
 as a plain Python function, in-process, once per (layout, check_n) row.
 `resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss` is a **monotonic
 high-water mark across every child a process has ever reaped**, not a

@@ -13,7 +13,7 @@ two not-yet-implemented optimization hypotheses discussed against
    could be cached by `Tensor*` address (safe since `cb6cdbd`'s stable-address
    initializer storage).
 
-**Reproduce:** `bench/graph_shape_inference_gperftools_repro.py` (new; builds the
+**Reproduce:** `docs/bench/graph_shape_inference_gperftools_repro.py` (new; builds the
 synthetic model and drives `onnxsim.simplify()` in a loop) plus gperftools'
 `libprofiler.so` + `pprof`. See "Methodology" below for exact commands.
 
@@ -79,7 +79,7 @@ practice. A single line inside it — `Value::uniqueName()`'s cached-name return
 
 ## Methodology
 
-Model: `bench/graph_shape_inference_gperftools_repro.py gen`, 2,000 repeated blocks
+Model: `docs/bench/graph_shape_inference_gperftools_repro.py gen`, 2,000 repeated blocks
 (10,503 nodes total) over a `[dim_param("N"), 64]` activation:
 
 - Every block: `Relu` then three elementwise ops (`Add`/`Mul`/`Sub`) against three
@@ -95,7 +95,7 @@ Model: `bench/graph_shape_inference_gperftools_repro.py gen`, 2,000 repeated blo
   hypothesis 1 (Sequence/Optional/Map are otherwise rare in ordinary ONNX graphs;
   this is the "cheaply construct one if you can" case the task allowed for).
 
-Run: `python bench/graph_shape_inference_gperftools_repro.py run <model> --loops 15`,
+Run: `python docs/bench/graph_shape_inference_gperftools_repro.py run <model> --loops 15`,
 calling `onnxsim.simplify(model, perform_optimization=False, check_n=0)` 15 times in
 one process (`perform_optimization=False` skips the Optimize pass suite, matching
 `RESULTS_graph_shape_inference_arena.md`'s end-to-end isolation method; constant
@@ -105,7 +105,7 @@ round at all). Under:
 ```
 CPUPROFILE=/tmp/prof2.out CPUPROFILE_FREQUENCY=1000 \
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libprofiler.so \
-python bench/graph_shape_inference_gperftools_repro.py run repro2.onnx --loops 15
+python docs/bench/graph_shape_inference_gperftools_repro.py run repro2.onnx --loops 15
 ```
 
 Total wall time 246.4s (15 loops, ~16.4s/loop), 61,746 samples recorded (`PROFILE:
