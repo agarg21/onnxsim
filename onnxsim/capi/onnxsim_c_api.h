@@ -374,6 +374,26 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_import_gguf(const char* in_path,
                                                 size_t* out_size,
                                                 char** out_error);
 
+/*
+ * The gradient of a whole model: the forward nodes `loss` needs followed by
+ * the nodes computing d loss / d wrt[k], as a serialized ONNX ModelProto. See
+ * onnxsim/graph_grad_model.h's BuildGradientModel for the contract: `loss` is
+ * a scalar float32/float64 value, each wrt[k] a value of the same element
+ * type, the outputs are named `<prefix>grad_<k>`, and every new name starts
+ * with `prefix` (NULL means "grad_"). Give distinct prefixes to calls whose
+ * models will be merged into one graph.
+ * On ONNXSIM_OK, *out_data/*out_size receive a newly allocated buffer holding
+ * the serialized ModelProto; release it with onnxsim_free_buffer. On
+ * ONNXSIM_ERROR (an operator without a gradient rule, a bad loss or wrt, a
+ * tensor without a static shape), *out_error receives a newly allocated
+ * message; release it with onnxsim_free_string. Either out_* pointer may be
+ * NULL if the caller does not want that value.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_gradient_model(
+    const void* model_data, size_t model_size, const char* loss,
+    const char* const* wrt, size_t num_wrt, const char* prefix, void** out_data,
+    size_t* out_size, char** out_error);
+
 /* Free a buffer returned via an out_data parameter. NULL is ignored. */
 ONNXSIM_C_API void onnxsim_free_buffer(void* data);
 

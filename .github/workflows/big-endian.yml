@@ -74,6 +74,11 @@ on:
       - "onnxsim/qat_graph_builder.h"
       - "onnxsim/qat_entry.cpp"
       - "onnxsim/qat_entry.h"
+      # BuildGradientModel reads and writes raw_data constants (Int64Values,
+      # FloatValues in its test). Its test is built by build_s390x_extension.sh.
+      - "onnxsim/graph_grad_model.cpp"
+      - "onnxsim/graph_grad_model.h"
+      - "onnxsim/graph_grad_model_test.cpp"
       # The sharpest check in the tree, and the reason its four files are
       # listed rather than just the C++: the fixture is generated on a
       # little-endian host and both emitters are compared against it, so it
