@@ -13,7 +13,7 @@
 # Written in ONNX's textual IR syntax (https://onnx.ai/onnx/repo-docs/Syntax.html
 # -- the same format onnx.parser.parse_model reads in Python, and the format
 # this repo's own tests prefer over onnx.helper.make_node/make_graph/make_model
-# chains, per the top-level CLAUDE.md) and parsed via onnxsim's own C API
+# chains, per the top-level AGENTS.md) and parsed via onnxsim's own C API
 # (onnxsim_parse_model_text) -- no hand-rolled protobuf encoding, no Ruby
 # protobuf gem, no Python.
 #

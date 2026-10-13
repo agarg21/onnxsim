@@ -4,7 +4,7 @@ image (see ../firmware/README.md for what happens to the header this emits).
 Two independent pieces, split because only the second is dependency-free:
 
 - ``convert_to_tflite()`` shells out to ``onnx2tf`` (a separate pip package;
-  not a dependency of onnxsim itself -- see the top-level CLAUDE.md's note
+  not a dependency of onnxsim itself -- see the top-level AGENTS.md's note
   that onnxsim's own pipeline never needs a TFLite/nncase toolchain). Run the
   onnxsim model converter (../../convertmodel or the Python API) first to
   simplify/quantize -- this script only does the ONNX -> TFLite step.

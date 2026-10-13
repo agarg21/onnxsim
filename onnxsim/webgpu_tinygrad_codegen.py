@@ -7,7 +7,7 @@ then attaching the result via :mod:`onnxsim.webgpu_kernel_metadata`.
 ``tinygrad`` is an **optional** dependency: nothing in this module runs (or
 is even imported) unless a caller actually calls one of the ``generate_*``
 functions below, matching the ``onnxruntime``-is-optional precedent
-elsewhere in onnxsim (see ``CLAUDE.md``). Install it with
+elsewhere in onnxsim (see ``AGENTS.md``). Install it with
 ``pip install tinygrad`` (pinned in ``tests/requirements-tinygrad.txt`` if
 this repo has one, else whatever ``pip install tinygrad`` resolves to --
 this was built and verified against tinygrad 0.14.0).

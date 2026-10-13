@@ -256,7 +256,7 @@ def export_llm_to_coreml(
         simplified_path = Path(tmpdir) / "model_simplified.onnx"
         # Passing a *path* (not a ModelProto) with check_n=0 engages onnxsim's
         # C++ path-to-path fast route, which needs only ~1x the model's size in
-        # peak memory (see bench/RESULTS_synthetic_decoder_oom.md) instead of the
+        # peak memory (see docs/bench/RESULTS_synthetic_decoder_oom.md) instead of the
         # 2+x an in-memory ModelProto round trip costs.
         _, ok = onnxsim.simplify(
             str(onnx_path), output_path=str(simplified_path), check_n=0

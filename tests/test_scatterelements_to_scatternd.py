@@ -1,6 +1,6 @@
 """Tests for the opt-in ``rewrite_scatterelements_to_scatternd`` pass.
 
-Models are built with the ONNX text format parser per CLAUDE.md. A scatter
+Models are built with the ONNX text format parser per AGENTS.md. A scatter
 is only well-defined for in-range, duplicate-free indices, so onnxsim's own
 random-input equivalence check (``check_n``) can't be used here -- random
 int64 indices are out of range. Instead each rewritten model is run through

@@ -6,7 +6,7 @@
 #
 # This is deliberately NOT how onnxsim gets llama.cpp: there is no
 # third_party/llama.cpp submodule and nothing here is a build dependency of
-# the CMake project or the Python wheel (see CLAUDE.md's ONNXSIM_BUILTIN_ORT
+# the CMake project or the Python wheel (see AGENTS.md's ONNXSIM_BUILTIN_ORT
 # note for the same philosophy re: ONNX Runtime -- optional tooling stays
 # out-of-tree and is fetched on demand, never compiled into onnxsim itself).
 # Test code that wants this oracle should invoke this script (or call

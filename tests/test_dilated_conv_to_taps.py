@@ -8,9 +8,9 @@ A widely dilated 1-D convolution becomes one 1x1 convolution per tap, summed
 Pulsar2 motivation). Usable from any binding via
 ``extra_optimizers=["dilated_conv_to_taps"]``.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention; the
+Models are built with ``onnx.parser`` per AGENTS.md's convention; the
 convolution weight/bias are numpy-built ``numpy_helper.from_array``
-initializers attached after parsing, per CLAUDE.md's guidance for
+initializers attached after parsing, per AGENTS.md's guidance for
 random/deterministic weight arrays.
 """
 

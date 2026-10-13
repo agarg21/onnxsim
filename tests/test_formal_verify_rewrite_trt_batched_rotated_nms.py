@@ -675,7 +675,7 @@ def test_my_iou_cross_checked_against_monte_carlo_on_partial_overlaps():
 
 
 # ===========================================================================
-# Model construction (onnx.parser, per CLAUDE.md) and pass-running helpers.
+# Model construction (onnx.parser, per AGENTS.md) and pass-running helpers.
 # ===========================================================================
 #
 # The custom domain-qualified op parses fine directly via the ONNX text

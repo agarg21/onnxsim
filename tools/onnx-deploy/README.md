@@ -1,7 +1,7 @@
 # onnx-deploy
 
 A standalone C++ tool (own `CMakeLists.txt`, no dependency on onnxsim's own
-build -- see the repo's `CLAUDE.md`) that glues together the multiple `.onnx`
+build -- see the repo's `AGENTS.md`) that glues together the multiple `.onnx`
 files `optimum-onnx` exports for one model into a single autoregressive
 generation pipeline, entirely in C++/Python -- no `optimum`, no `torch`, no
 Python required at all for the C++ side.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Synthetic repro + peak-memory harness for the OOM documented in
-bench/TODO_large_decoder_submodule_oom.md ("onnxsim OOMs simplifying a ~5GB
+docs/bench/TODO_large_decoder_submodule_oom.md ("onnxsim OOMs simplifying a ~5GB
 decoder-only transformer submodule").
 
 Builds a decoder-block-shaped ONNX model (repeated self-attention + SwiGLU-MLP
@@ -11,13 +11,13 @@ generating even a multi-GB model costs only O(one tensor) of Python memory
 onnxsim.simplify()'s peak RSS on it, in a subprocess so a real OOM-kill doesn't
 take down the harness.
 
-See bench/RESULTS_synthetic_decoder_oom.md for what this found.
+See docs/bench/RESULTS_synthetic_decoder_oom.md for what this found.
 
 Usage:
-    python bench/decoder_oom_repro.py gen <out_dir> [--layers N] [--hidden H]
+    python docs/bench/decoder_oom_repro.py gen <out_dir> [--layers N] [--hidden H]
         [--ffn F] [--layout many|single]
-    python bench/decoder_oom_repro.py measure <model.onnx> [--check-n N]
-    python bench/decoder_oom_repro.py matrix <work_dir> [--sizes 5,8] [--keep]
+    python docs/bench/decoder_oom_repro.py measure <model.onnx> [--check-n N]
+    python docs/bench/decoder_oom_repro.py matrix <work_dir> [--sizes 5,8] [--keep]
 """
 
 import argparse

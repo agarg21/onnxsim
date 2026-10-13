@@ -99,7 +99,7 @@ not by reproving any one scheme's own bound formula) with whatever error
 budget the original scheme already had.
 
 Differential tests build a standalone ``DequantizeLinear(Codes, Scale,
-ZeroPoint)`` via ``onnx.parser`` (per ``CLAUDE.md``) with an ASYMMETRIC,
+ZeroPoint)`` via ``onnx.parser`` (per ``AGENTS.md``) with an ASYMMETRIC,
 non-trivial per-element ``ZeroPoint`` on the OUTER node (genuinely
 different from the pass's own always-symmetric inner scheme) and a
 varied, non-constant ``Scale`` with >= 64 elements, run the real compiled

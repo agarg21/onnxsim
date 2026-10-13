@@ -55,7 +55,7 @@ def _kv_model(
     ``present_name`` is always double-quoted in the generated text: the
     ".value"-suffixed names this module's own Value-style matching cares
     about (e.g. ``present.0.value``) contain a ``.``, which onnx.parser's
-    own bare-identifier grammar rejects (``CLAUDE.md``'s documented
+    own bare-identifier grammar rejects (``AGENTS.md``'s documented
     exception for when the text format can't express what's needed) --
     quoting works uniformly for both dotted and plain names.
     """

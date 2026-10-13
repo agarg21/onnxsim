@@ -15,7 +15,7 @@
 // ../federated_lora/step_graph_runner.test.mjs's own convention -- `npm
 // install` in this directory to run it for real. generate_darts_supernet_
 // step_graph.py needs onnxsim's own C++ extension built (see the repo's
-// CLAUDE.md) -- this test does not attempt to build it, only to run it.
+// AGENTS.md) -- this test does not attempt to build it, only to run it.
 //
 // **The tuning this test's hyperparameters needed, found empirically, not
 // assumed.** The first version of this test trained against the same

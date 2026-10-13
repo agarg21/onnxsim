@@ -93,7 +93,7 @@ an arbitrary consumer need not be Lipschitz, so a numeric *bound* (not an
 equality) implies nothing about ``|consumer(a) - consumer(b)|`` in general.
 
 Differential tests build a plain float ``MatMul``/``Gemm`` via
-``onnx.parser`` (per ``CLAUDE.md``) at opset 21 (INT4 tensors and
+``onnx.parser`` (per ``AGENTS.md``) at opset 21 (INT4 tensors and
 ``DequantizeLinear``'s ``block_size`` attribute both need it) with ``K = 64``
 (exactly two 32-element blocks), run the real pass alone via
 ``simplify_isolated_extra``, and confirm: the exact ``MatMul(X,

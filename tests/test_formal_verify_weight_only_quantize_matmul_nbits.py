@@ -110,7 +110,7 @@ A bias-variant test (Gemm's bias, left untouched, cancels the same way as
 every prior pass in this family) rounds out the Z3 side.
 
 Differential tests build a plain float ``MatMul``/``Gemm`` via
-``onnx.parser`` (per ``CLAUDE.md``) with ``K = 40``, ``block_size = 32``
+``onnx.parser`` (per ``AGENTS.md``) with ``K = 40``, ``block_size = 32``
 (``kBlockSize``, a fixed compile-time constant, confirmed by reading the
 header struct) -- one full block (taps 0-31) and one genuinely RAGGED last
 block (taps 32-39 real, 40-63 dead) -- run the real pass via

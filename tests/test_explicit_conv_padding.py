@@ -9,7 +9,7 @@ entirely on one side, which a vendor backend's fused convolution kernel
 refuses). Usable from any binding via
 ``extra_optimizers=["explicit_conv_padding"]``.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention. Numeric
+Models are built with ``onnx.parser`` per AGENTS.md's convention. Numeric
 equivalence comes from ``onnxsim.simplify``'s own ``check_n``.
 """
 

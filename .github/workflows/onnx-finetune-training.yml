@@ -22,7 +22,7 @@ name: onnx-finetune training (incl. distillation)
 # --loss distillation path this repo no longer has) and was removed as not
 # worth the CI cost -- see wasm/README.md's Status section. Both still build
 # this repo's own onnxsim wheel (ONNXSIM_BUILTIN_ORT=OFF, see the top-level
-# CLAUDE.md note that this does NOT build ONNX Runtime), since
+# AGENTS.md note that this does NOT build ONNX Runtime), since
 # generate_distillation_step_graph.py needs onnxsim.graph_grad/qat_graph
 # importable.
 #
@@ -96,7 +96,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build
           pip install nanobind onnx numpy onnxruntime pytest
-      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- see CLAUDE.md)
+      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- see AGENTS.md)
         run: pip install -e . --no-build-isolation
       - name: pytest the Log VJP rule, its Python<->C++ parity, and the step-graph generator
         run: |
@@ -164,7 +164,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build
           pip install nanobind onnx numpy
-      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- see CLAUDE.md)
+      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- see AGENTS.md)
         run: pip install -e . --no-build-isolation
       - name: npm install (onnxruntime-web)
         working-directory: tools/onnx-finetune/wasm/distill_step_graph

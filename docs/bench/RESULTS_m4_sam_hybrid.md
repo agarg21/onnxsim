@@ -54,7 +54,7 @@ Default Core ML precision was faster on EdgeSAM (11.7 ms for both stages with
 precision is the setting used for all three models in the comparison table.
 
 Hexagon reference timings and the broader mask-quality protocol are in
-[`scripts/android/vision_models/sam/README.md`](../scripts/android/vision_models/sam/README.md).
+[`scripts/android/vision_models/sam/README.md`](../../scripts/android/vision_models/sam/README.md).
 The runner and reproduction command are documented in
-[`scripts/apple/README.md`](../scripts/apple/README.md). The machine-readable
+[`scripts/apple/README.md`](../../scripts/apple/README.md). The machine-readable
 summary is in [`m4_sam_hybrid_results.json`](m4_sam_hybrid_results.json).

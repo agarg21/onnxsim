@@ -40,7 +40,7 @@ python scripts/rknn/build_luckfox_models.py \\
 
 RV1106 rejects floating-point-only RKNN builds, so the builder supplies a
 small calibration set and uses `do_quantization=True`. The measured board
-results are recorded in [`bench/RESULTS_luckfox_rv1106.md`](../../bench/RESULTS_luckfox_rv1106.md).
+results are recorded in [`docs/bench/RESULTS_luckfox_rv1106.md`](../../docs/bench/RESULTS_luckfox_rv1106.md).
 
 To quantize with onnxsim first, use:
 
@@ -325,7 +325,7 @@ changes the harness's conclusions: the correctness result (bit-identical
 outputs) is unaffected, and the fixed cost still dwarfs what onnxsim's node
 reduction removes, which is why this harness claims correctness on real silicon
 and not throughput. Details in
-[`bench/RESULTS_nanopc_rk3588.md`](../../bench/RESULTS_nanopc_rk3588.md).
+[`docs/bench/RESULTS_nanopc_rk3588.md`](../../docs/bench/RESULTS_nanopc_rk3588.md).
 
 The in-tree smoke test is [`tests/test_rknn3588_compat.py`](../../tests/test_rknn3588_compat.py)
 (it skips unless `RKNN_3588_HOST` is set), and

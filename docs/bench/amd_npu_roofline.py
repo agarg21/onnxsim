@@ -14,9 +14,9 @@ so the achieved-vs-peak gap measures the stack, not the model.
 
 Subcommands::
 
-    python bench/amd_npu_roofline.py theory [--quantizer onnxsim|ort]
-    python bench/amd_npu_roofline.py prep [--quantizer onnxsim|ort] [--out DIR]
-    python bench/amd_npu_roofline.py run <model> [--provider cpu|vitisai]
+    python docs/bench/amd_npu_roofline.py theory [--quantizer onnxsim|ort]
+    python docs/bench/amd_npu_roofline.py prep [--quantizer onnxsim|ort] [--out DIR]
+    python docs/bench/amd_npu_roofline.py run <model> [--provider cpu|vitisai]
         [--runs N] [--cache-dir DIR] [--cache-key KEY]
 
 ``theory`` and ``prep`` need this repo's ``onnxsim`` (quantizer, ModelInfo,
@@ -24,7 +24,7 @@ VitisAI legalizer). ``run`` needs only ``onnx``/``onnxruntime``/``numpy`` --
 run it inside the Ryzen AI venv for ``--provider vitisai`` (source the venv's
 ``bin/activate`` and ``/opt/xilinx/xrt/setup.sh`` first; the provider needs
 both). Measured Strix Halo numbers live in
-``bench/RESULTS_amd_npu_roofline.md``.
+``docs/bench/RESULTS_amd_npu_roofline.md``.
 
 Environment: ``onnx``, ``onnxruntime``; ``onnxsim`` from this checkout for
 anything but ``run``.

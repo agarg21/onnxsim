@@ -7,11 +7,11 @@ counterpart of ``scripts/axera/legalize.py``'s ``rank0_to_rank1`` rule (see
 motivation). Usable from any binding via
 ``extra_optimizers=["rank0_to_rank1"]``.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention, except for
+Models are built with ``onnx.parser`` per AGENTS.md's convention, except for
 the rank-0 output's ``shape`` field, which the text format has no way to
 spell explicitly ("no shape" and "shape with zero dims" both parse the same
 way) -- ``ClearField``/an explicit empty ``dim`` list is set programmatically
-after parsing instead, per CLAUDE.md's documented exception for that case.
+after parsing instead, per AGENTS.md's documented exception for that case.
 """
 
 import numpy as np

@@ -82,7 +82,7 @@ comment, copied verbatim (module name aside) from the MatMul/Conv proof
 files.
 
 **Model construction: ``onnx.parser``, not ``onnx.helper``.** Tested
-empirically first (per this repo's own CLAUDE.md instructions): the ONNX
+empirically first (per this repo's own AGENTS.md instructions): the ONNX
 text format parser cleanly accepts a custom-domain node written as
 ``com.microsoft.Attention<attrs>(...)`` given an ``opset_import`` entry for
 ``"com.microsoft"`` -- this is exactly the pattern already used by

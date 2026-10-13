@@ -8,10 +8,10 @@ Retypes an all-float16 graph to float32 -- the onnxsim-core counterpart of
 cases mirror at the C++-pass level). Usable from any binding via
 ``extra_optimizers=["float16_to_float32"]``.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention, except for
+Models are built with ``onnx.parser`` per AGENTS.md's convention, except for
 the float16 tensor literals themselves -- the text format has no float16
 literal syntax, so those are built with ``numpy_helper.from_array`` and
-attached as initializers after parsing, also per CLAUDE.md.
+attached as initializers after parsing, also per AGENTS.md.
 
 ``onnxsim.simplify``'s own ``check_n`` correctness check compares the
 *converted* model against itself with the *same* feed dict -- no use here,

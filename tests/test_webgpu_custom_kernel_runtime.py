@@ -5,7 +5,7 @@ separately. See that module's own docstring for why the node must be
 physically removed rather than just left in place and expected to fail
 gracefully.
 
-Models are built via the ONNX text format parser (see CLAUDE.md's testing
+Models are built via the ONNX text format parser (see AGENTS.md's testing
 guidance); correctness is checked by recomposing ``pre`` -> the excised node
 (run standalone, standing in for a real WebGPU dispatch, which needs a
 browser -- see ``scripts/convertmodel/test/webgpu_custom_kernel_runtime.test.mjs``

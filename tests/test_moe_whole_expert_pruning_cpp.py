@@ -389,7 +389,7 @@ def _dropped_experts(router_w, kept_router_w):
 
 
 # --- QMoE model builders (onnx.helper -- packed uint8 weights can't be
-# expressed as onnx.parser text literals, see CLAUDE.md's own escape hatch
+# expressed as onnx.parser text literals, see AGENTS.md's own escape hatch
 # for this case) ---------------------------------------------------------
 
 

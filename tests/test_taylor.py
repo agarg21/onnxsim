@@ -6,7 +6,7 @@ against dense grids; (2) the Lagrange remainder of each function against the tru
 *every* intermediate tensor exposed (the property that matters); (5) tightness, fallbacks,
 unbounded inputs, the mean-value form and ``compare_methods``.
 
-Models are built with ``onnx.parser`` (CLAUDE.md) and numpy weights attached programmatically.
+Models are built with ``onnx.parser`` (AGENTS.md) and numpy weights attached programmatically.
 Nothing here calls ``onnxsim.simplify``.
 """
 

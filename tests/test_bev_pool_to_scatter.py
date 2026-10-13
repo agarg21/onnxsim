@@ -37,7 +37,7 @@ here registers a minimal one via ``onnx.defs.register_schema`` (mirroring
 graph passes onnxsim's/onnx's structural validation on the way in.
 
 Models are built with the ONNX text format parser (``onnx.parser``), per
-CLAUDE.md's convention for this repo's tests.
+AGENTS.md's convention for this repo's tests.
 """
 
 import collections

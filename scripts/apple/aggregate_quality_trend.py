@@ -6,7 +6,7 @@
 quantized_acc, retention, float_basis, quantized_basis}`, see that module's
 `build_records()`) alongside its nested summary -- `quality-eval-macos`
 uploads these as the `quality-retention-results` CI artifact on every run,
-see `bench/TODO_quality_retention_eval.md`'s "Reporting" section. This script
+see `docs/bench/TODO_quality_retention_eval.md`'s "Reporting" section. This script
 is the "next piece" that doc flagged: read several of those files (e.g.
 downloaded from a handful of past `quality-eval-macos` runs via `gh run
 download` or the Actions UI -- fetching that history automatically isn't

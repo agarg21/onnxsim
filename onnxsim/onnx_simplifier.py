@@ -9161,7 +9161,7 @@ def simplify(
             tensor values from it afterward. Note this is a secondary optimization: the
             dominant peak-memory cost for a large external-data model was traced to the C++
             core's own working copy of the model, not to this reload -- see
-            ``bench/RESULTS_synthetic_decoder_oom.md`` for the measurements and the (now
+            ``docs/bench/RESULTS_synthetic_decoder_oom.md`` for the measurements and the (now
             separately fixed, via ``SimplifyConsumeInput`` in ``onnxsim.cpp``) root cause.
             Outside the fast-path case (``check_n > 0``, or another reason it doesn't apply)
             the model is still saved to ``output_path`` before returning, just without that
@@ -9327,9 +9327,9 @@ def simplify(
                     # ``ModelProto``-returning contract for callers who only need the graph
                     # shape, not the tensor values. See ``output_path``'s docstring above for
                     # why this is a secondary optimization rather than the main fix for
-                    # bench/TODO_large_decoder_submodule_oom.md -- that turned out to be
+                    # docs/bench/TODO_large_decoder_submodule_oom.md -- that turned out to be
                     # inside the C++ core (``SimplifyConsumeInput`` in ``onnxsim.cpp``), not
-                    # here; see ``bench/RESULTS_synthetic_decoder_oom.md`` for how that was
+                    # here; see ``docs/bench/RESULTS_synthetic_decoder_oom.md`` for how that was
                     # found.
                     if output_path is not None:
                         C.simplify_path(

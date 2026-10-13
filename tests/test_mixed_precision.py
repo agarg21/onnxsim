@@ -341,7 +341,7 @@ def test_mixed_precision_full_hessian_output_stays_close_to_float():
 # search_mixed_precision_for_budget
 # --------------------------------------------------------------------------- #
 # Named `_text_model` (rather than reusing `_model` above) since this repo's
-# CLAUDE.md asks new test model-building code to go through `onnx.parser`,
+# AGENTS.md asks new test model-building code to go through `onnx.parser`,
 # but `_model` above already names the onnx.helper-based builder the earlier
 # tests in this file use.
 def _text_model(body, initializer=(), opset=21, ir_version=10):
@@ -365,7 +365,7 @@ def _search_test_model(seed=0, outlier=20.0):
     # scale) that the sensitivity ranking unambiguously ranks W2 above W1 on
     # any platform (their MSE*activation-energy scores differ by ~5 orders
     # of magnitude, nowhere near a rounding-boundary tie -- see this repo's
-    # own CLAUDE.md note on `tests/test_gptaq.py`'s prior single-seed
+    # own AGENTS.md note on `tests/test_gptaq.py`'s prior single-seed
     # flakiness for why that margin matters), while still leaving room for
     # promoting more layers to INT8 to actually reduce the measured output
     # error (an outlier so extreme it saturates the block scale would make

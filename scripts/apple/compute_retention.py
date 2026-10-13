@@ -5,7 +5,7 @@
 the float model's benchmark score the quantized (Core ML) model keeps, the
 same shape of number DeviceMark's (https://devicemark.github.io/) leaderboard
 reports alongside decode speed and memory. See
-`bench/TODO_quality_retention_eval.md` for the full plan this is one piece of.
+`docs/bench/TODO_quality_retention_eval.md` for the full plan this is one piece of.
 
 Usage:
     python run_quality_eval.py --model hf --model-args pretrained=... \\
@@ -31,7 +31,7 @@ def _resolve_score(value) -> tuple[float, str] | tuple[None, None]:
     number -- `acc_completed`, when present and defined, is DeviceMark's own
     retention definition (accuracy over only the samples that produced an
     answer before exhausting their generation budget, see
-    `bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures"), so
+    `docs/bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures"), so
     it's preferred here. Falls back to plain `acc` when `acc_completed` is
     absent (no explicit `--max-gen-toks` was passed to that run) or `None`
     (every sampled item hit the cap -- nothing to average). A bare number is
@@ -103,7 +103,7 @@ def build_records(
 
     The nested shape is convenient to print but awkward to accumulate across
     runs/models into a trend table without re-parsing it; this is the
-    machine-readable shape `bench/TODO_quality_retention_eval.md`'s
+    machine-readable shape `docs/bench/TODO_quality_retention_eval.md`'s
     "Reporting" section describes, written to `--output` alongside the
     existing nested `retention` payload (not instead of it, so nothing
     reading the old shape breaks).

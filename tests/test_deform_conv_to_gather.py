@@ -46,7 +46,7 @@ except ImportError:
 def _model(body, initializer=(), opset=17, ir_version=10, custom_domain="mmdeploy"):
     # `body` is just the graph declaration (`agraph (...) => (...) { ... }`),
     # not a full text-format model -- the ir_version/opset_import header is
-    # added here, once, per CLAUDE.md's `_model` helper convention.
+    # added here, once, per AGENTS.md's `_model` helper convention.
     model = parser.parse_model(
         f"""
         <

@@ -75,7 +75,7 @@ applied to it. The differential tests below instead check real end-to-end
 numeric behavior on concrete models.
 
 Differential tests build models via ``onnx.parser.parse_model()`` (per
-``CLAUDE.md``) and call the real ``onnxsim.quantize_bf16`` entry point found
+``AGENTS.md``) and call the real ``onnxsim.quantize_bf16`` entry point found
 above. One environment-specific wrinkle drives their shape: **this
 environment's ONNX Runtime CPU build has essentially no BFLOAT16 compute
 kernels** -- ``Add``/``Sub``/``Mul``/``Div``/``MatMul``/``Gemm``/``Sum``/

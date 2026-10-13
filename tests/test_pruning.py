@@ -8381,7 +8381,7 @@ def test_structured_pruning_conv_chain_tanh_gelu_decomposed_unaffected_by_triple
 # this shape directly (`Reshape`'s own int64 shape and `Shape`'s own dynamic
 # second `Reshape` operand are both just ordinary named initializers/nodes in
 # the text body -- no `ClearField`/byte-equality escape hatch needed the way
-# CLAUDE.md's own "rare case" carve-out anticipates), so no `onnx.helper`
+# AGENTS.md's own "rare case" carve-out anticipates), so no `onnx.helper`
 # fallback is needed here despite the `Reshape`/`Shape` dynamic-shape
 # dependency.
 
@@ -12651,7 +12651,7 @@ def test_structured_pruning_ese_gate_declines_on_extra_spine_consumer():
 # gate chains" section comment for the full matched/declined topology this
 # exercises, confirmed live via a real `torch.onnx.export` of a verbatim
 # reproduction of that module's own `forward`. Built directly via
-# `onnx.parser` (per this file's own module docstring/CLAUDE.md's
+# `onnx.parser` (per this file's own module docstring/AGENTS.md's
 # convention) with the exact node shapes/ordering the real export produces
 # (both `AveragePool`s read `spine` directly; only `pool_w`'s own output is
 # transposed before the `Concat`; the hard-swish decomposition is the exact
@@ -16019,7 +16019,7 @@ def test_structured_pruning_matmul_concat_declines_on_positive_axis_shape_unknow
     # carry a value_info entry each (as a partially shape-inferred graph
     # might, e.g. a symbolic-rank input propagated through) -- just one
     # with no `shape` field at all, ONNX's own "rank not statically known"
-    # spelling (see CLAUDE.md's own note on this pattern). _tensor_rank must
+    # spelling (see AGENTS.md's own note on this pattern). _tensor_rank must
     # treat that exactly like no annotation at all, not crash on it or
     # (worse) treat a present-but-empty shape as rank 0.
     K, Ca, Cb, Out = 8, 6, 4, 3
@@ -17230,7 +17230,7 @@ def test_structured_wanda_pruning_conv_concat_admits_block_aligned_grouped_conv_
 # even in the exact-division (`ratio=2`) case this section's own matcher
 # supports, where it's a structural no-op -- so the *positive* (matched)
 # test below builds the topology directly via `onnx.parser` (per this
-# file's own module docstring/CLAUDE.md's convention) with no trailing
+# file's own module docstring/AGENTS.md's convention) with no trailing
 # `Slice`, and a separate decline test below confirms that real,
 # `Slice`-terminated shape is (deliberately, for now) still declined
 # outright, unpruned, exactly as it already was.
@@ -25527,7 +25527,7 @@ def _qk_norm_rope_body(
     rotary_embedding_dim=0,
     rotary_num_heads=None,
 ):
-    # Returns a text fragment (per CLAUDE.md's own guidance for a reusable
+    # Returns a text fragment (per AGENTS.md's own guidance for a reusable
     # node sequence) plus the name of the final tensor it leaves behind --
     # `raw_name` itself, unchanged, when both `with_norm`/`with_rope` are
     # False.
@@ -27807,7 +27807,7 @@ def test_moe_whole_expert_pruning_multiple_nodes_pruned_independently():
 # (a custom-domain op whose fc1/fc2 weights are packed uint8 tensors -- the
 # parser's own tensor-literal syntax encodes float_data, not raw_data, and
 # has no uint8 literal syntax either), so every QMoE model below is built via
-# onnx.helper.make_node/make_tensor directly, per CLAUDE.md's own documented
+# onnx.helper.make_node/make_tensor directly, per AGENTS.md's own documented
 # fallback for exactly this kind of case.
 
 
@@ -30200,7 +30200,7 @@ def test_analyze_qmoe_nvfp4_expert_channel_pruning_matches_real_call():
 # than via a real session run -- an honest adjustment forced by that
 # environment fact, not a shortcut taken for convenience.
 #
-# Per CLAUDE.md's own guidance on when to fall back off the ``onnx.parser``
+# Per AGENTS.md's own guidance on when to fall back off the ``onnx.parser``
 # text format: the text format has no fp16/bfloat16 tensor-literal syntax
 # (confirmed: ``<float16 W = {1.5}>`` raises a ``ParseError``), though it
 # *does* support ``float16[...]``/``bfloat16[...]`` in a graph's own
@@ -32778,7 +32778,7 @@ def test_transformer_block_pruning_matches_fused_skip_layer_normalization_entry(
     # own *entry* norm -- exactly what onnxruntime's transformer optimizer
     # produces by fusing the *previous* residual `Add` with the following
     # `LayerNormalization`. Built directly with `onnx.helper.make_node`,
-    # not `onnx.parser` (CLAUDE.md's documented exception): the text
+    # not `onnx.parser` (AGENTS.md's documented exception): the text
     # format can't express a custom-domain op with this multi-output
     # fusion shape (a `com.microsoft` node with skipped middle outputs).
     #
@@ -35615,7 +35615,7 @@ def test_qdq_structured_pruning_conv_global_average_pool_flatten_gemm_pass_throu
     # `_slice_consumer_weight`. Both Conv layers' weights are quantized via
     # the REAL ``onnxsim.quantize_static`` tool (`_quantize_static_conv_weight`,
     # never a hand-rolled re-implementation) -- per this repo's own
-    # CLAUDE.md convention, only the fixture weights come from the real
+    # AGENTS.md convention, only the fixture weights come from the real
     # tool, while the surrounding graph structure is assembled via
     # `onnx.parser`.
     #
@@ -36932,7 +36932,7 @@ def test_prune_then_quantize_static_composes_correctly():
 #
 # INT4/UINT4 initializers are built via ``onnx.numpy_helper.from_array`` on
 # an ``ml_dtypes.int4``/``uint4`` array (`_int4`/`_uint4` below), never as
-# ``onnx.parser`` text literals -- per this repo's own CLAUDE.md, the text
+# ``onnx.parser`` text literals -- per this repo's own AGENTS.md, the text
 # format's tensor literals are encoded as ``float_data``, not the packed
 # ``raw_data`` a real INT4/UINT4 ``TensorProto`` (and this pass's own
 # ``onnx.numpy_helper.to_array``/``from_array`` round-trip) requires.
@@ -37945,7 +37945,7 @@ def test_analyze_structured_pruning_qdq_gated_matches_real_call():
 # can't hide.
 #
 # Nodes are built via ``onnx.helper.make_node`` rather than
-# ``onnx.parser.parse_model`` -- the CLAUDE.md-documented fallback for a
+# ``onnx.parser.parse_model`` -- the AGENTS.md-documented fallback for a
 # custom-domain op the text format cannot express cleanly here (optional
 # trailing inputs interleaved with present ones, e.g. a present
 # ``zero_points`` with an absent ``g_idx`` before a present ``bias``).
@@ -40203,7 +40203,7 @@ def test_matmul_nbits_pruning_invalid_sparsity_raises():
 # ``onnxruntime.quantization.matmul_bnb4_quantizer.MatMulBnb4Quantizer``'s
 # own ``bnb4_block_quant`` -- never a hand-rolled re-implementation of the
 # packing scheme -- so every packed ``B``/``absmax`` pair a test builds is
-# genuine quantizer output, exactly per this repo's CLAUDE.md guidance for
+# genuine quantizer output, exactly per this repo's AGENTS.md guidance for
 # a numpy-computed "large/packed" tensor. The graph skeleton is built via
 # ``onnx.parser.parse_model`` (this file's own ``_model`` helper), with the
 # quantized tensors attached programmatically afterward.
@@ -43075,7 +43075,7 @@ def _matmul_nbits_mlp_model(N, K, N2, block_size, W_gate, W_up, bias_gate, bias_
     ``norm_scale`` -- both left empty, see this section's own top comment
     for why this pass never needs to touch either) feeding a plain-float
     output projection. Built via ``onnx.helper`` rather than
-    ``onnx.parser.parse_model`` -- the same CLAUDE.md-documented fallback
+    ``onnx.parser.parse_model`` -- the same AGENTS.md-documented fallback
     this file's own plain-``MatMulNBits`` section above already uses, for
     the identical reason (optional inputs interleaved with present ones).
     Returns ``(model, info)`` with every independently-computed
@@ -48196,7 +48196,7 @@ def test_qlinear_gap_flatten_qgemm_real_quantize_static_pipeline_end_to_end():
 # actually under test is then built directly via ``onnx.parser.parse_model``
 # (this file's own ``_model`` helper) with those genuine quantized tensors
 # attached programmatically afterward -- the same "real quantizer for
-# fixtures, parser for graph structure" pattern this repo's own CLAUDE.md
+# fixtures, parser for graph structure" pattern this repo's own AGENTS.md
 # and the MatMulBnb4-round tests above establish (the scale/zero-point/int8
 # tensors need real array data a parser text literal can't spell out).
 #
@@ -50277,7 +50277,7 @@ def test_structured_not_eligible_reports_unmatched_gemmfastgelu():
 # ``onnx.parser.parse_model``'s text format has no way to spell a
 # graph-typed node attribute (an ``If``'s ``then_branch``/``else_branch``),
 # so every model built below uses ``onnx.helper.make_node``/``make_graph``
-# directly instead, per this repo's own CLAUDE.md guidance for exactly
+# directly instead, per this repo's own AGENTS.md guidance for exactly
 # this case.
 
 
@@ -51938,7 +51938,7 @@ def test_analyze_transformer_block_pruning_pools_target_across_if_branches():
 # `torch.onnx.export -> onnxsim.simplify() -> apply_attention_head_pruning`
 # pipeline end to end -- every other test in this section uses a hand-built
 # `onnx.parser` model reproducing that confirmed shape directly, per this
-# repo's own `CLAUDE.md` convention.
+# repo's own `AGENTS.md` convention.
 def _decomposed_gqa_model(
     K=16,
     H=4,
@@ -55321,7 +55321,7 @@ def test_decomposed_attention_packed_qkv_real_torch_export_pipeline():
 # attached programmatically -- the identical "real quantizer for fixtures,
 # parser for graph structure" pattern this file's own
 # ``DynamicQuantizeMatMul`` section above already established (per this
-# repo's own CLAUDE.md).
+# repo's own AGENTS.md).
 #
 # One test below
 # (`test_dynamic_quantize_conv_real_quantize_dynamic_pipeline_end_to_end`)
@@ -56450,7 +56450,7 @@ def test_dynamic_quantize_conv_global_average_pool_flatten_gemm_pass_through_mat
     # via the ordinary `_slice_consumer_weight`. Both `ConvInteger` layers'
     # weights are quantized via the REAL `onnxruntime.quantization
     # .quantize_dynamic` tool (`_quantize_dynamic_conv_weight`, never a
-    # hand-rolled re-implementation) -- per this repo's own CLAUDE.md
+    # hand-rolled re-implementation) -- per this repo's own AGENTS.md
     # convention, only the fixture weights come from the real tool, while
     # the surrounding graph structure is assembled via `onnx.parser`.
     #

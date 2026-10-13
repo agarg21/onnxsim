@@ -76,7 +76,7 @@ reasoning: an arbitrary ``consumer`` need not be Lipschitz, so a numeric
 ``|consumer(a) - consumer(b)|``.
 
 Differential tests build a plain float ``Conv`` (and a bias variant) via
-``onnx.parser`` (per ``CLAUDE.md``), run the real pass alone via
+``onnx.parser`` (per ``AGENTS.md``), run the real pass alone via
 ``simplify_isolated_extra`` (and, for the numeric-bound check, via
 :func:`onnxsim.quantize_weight_only`, which applies this rewrite among
 others -- see its own docstring), and confirm: the exact ``Conv(X,

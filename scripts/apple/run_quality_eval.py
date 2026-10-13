@@ -3,7 +3,7 @@
 
 A thin CLI over `lm_eval.simple_evaluate` (from `lm-evaluation-harness`,
 https://github.com/EleutherAI/lm-evaluation-harness) -- see
-`bench/TODO_quality_retention_eval.md` for why that harness rather than a
+`docs/bench/TODO_quality_retention_eval.md` for why that harness rather than a
 custom scorer: it already implements IFEval, MMLU-Pro, and MATH-500's prompt
 formatting, few-shot sampling, and (the part worth not reimplementing) each
 benchmark's answer scoring. This script only adds two things on top: a
@@ -36,7 +36,7 @@ was passed explicitly, so there's a known budget to check a response against)
 `"total_n"`, `"completed_n"`, and `"acc_completed"` (accuracy over only the
 samples that produced an answer before exhausting that budget) -- DeviceMark's
 own retention definition, see `is_completed`'s docstring and
-`bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures".
+`docs/bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures".
 `compute_retention.py` prefers `acc_completed` when present and defined,
 falling back to `acc` otherwise.
 """
@@ -53,7 +53,7 @@ def is_completed(response_token_count: int, max_gen_toks: int | None) -> bool | 
     """Whether a `generate_until` response finished before exhausting its
     generation budget -- DeviceMark's own definition of a benchmark item
     "producing an answer" within its token cap, see
-    `bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures".
+    `docs/bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures".
     Validated empirically (2026-09-03) against real `mmlu_pro_biology`
     generations: every sample whose extracted answer was `lm_eval`'s
     `[invalid]` (couldn't find a parseable answer) had a response token count

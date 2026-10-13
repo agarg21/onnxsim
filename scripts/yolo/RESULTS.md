@@ -78,7 +78,7 @@ Ultralytics' own `simplify=True` export path now uses
 [onnxslim](https://github.com/inisis/OnnxSlim) rather than onnxsim, so it is
 worth checking how the two compare on the same exports. Running both
 simplifiers on the raw ONNX (reproduce with
-`python bench/onnxslim_comparison.py <exported .onnx> ...`; onnxslim `0.1.94`):
+`python docs/bench/onnxslim_comparison.py <exported .onnx> ...`; onnxslim `0.1.94`):
 
 | Spec | orig | onnxsim | onnxslim | same op histogram |
 |---|---:|---:|---:|:---:|

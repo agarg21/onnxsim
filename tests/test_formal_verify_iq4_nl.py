@@ -160,7 +160,7 @@ reference it is documented to agree with).
 Differential tests
 --------------------------------------------------------------------------
 
-Built via ``onnx.parser`` (per ``CLAUDE.md``) with ``numpy_helper.from_array``
+Built via ``onnx.parser`` (per ``AGENTS.md``) with ``numpy_helper.from_array``
 for the (random, so not text-literal-expressible) weight initializer. This
 pass has TWO reachable entry points, both exercised below: the opt-in
 optimizer name ``"iq4_nl"`` via ``simplify_isolated_extra`` (confirming the

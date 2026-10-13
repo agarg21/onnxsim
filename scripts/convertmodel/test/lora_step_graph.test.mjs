@@ -117,7 +117,7 @@ async function main() {
   if (!existsSync(MODULE_JS) || !existsSync(MODULE_WASM)) {
     const why =
       `scripts/convertmodel/onnxsim.{js,wasm} not found -- build the wasm module ` +
-      `(./build_wasm.sh) and copy it next to the page to run this test`;
+      `(./scripts/build_wasm.sh) and copy it next to the page to run this test`;
     if (process.env.LORA_REQUIRE_WASM) {
       console.error("FAIL:", why);
       process.exit(1);

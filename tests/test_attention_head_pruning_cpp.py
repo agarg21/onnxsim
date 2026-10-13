@@ -11570,7 +11570,7 @@ def test_cpp_attention_head_pruning_matches_python_reference_output():
 # `onnx.parser.parse_model`'s text format has no way to spell a graph-typed
 # node attribute (an `If`'s `then_branch`/`else_branch`), so the model below
 # uses `onnx.helper.make_node`/`make_graph` directly, per this repo's own
-# CLAUDE.md guidance for exactly this case -- see `test_structured_pruning_
+# AGENTS.md guidance for exactly this case -- see `test_structured_pruning_
 # cpp.py`'s own matching "Subgraph recursion" section for the `Loop`-body
 # half of this coverage (the two C++ port test files split the `If`/`Loop`
 # cases between them rather than duplicating both in each).
@@ -16583,7 +16583,7 @@ def test_cpp_decomposed_gqa_qk_norm_pruning_matches_oracle_and_python_reference_
 # exports it, and runs it through `onnxsim.simplify()` -- exactly the same
 # fixture-construction pattern (kept deliberately in sync; a real
 # `torch.onnx.export` graph cannot be reasonably hand-spelled via
-# `onnx.parser.parse_model`, per this repo's own CLAUDE.md note on this
+# `onnx.parser.parse_model`, per this repo's own AGENTS.md note on this
 # convention's own limits). Rather than re-deriving each one's own numpy
 # oracle (already done exhaustively in `test_pruning.py`), each test here
 # instead directly confirms this C++ port's own parity bar: comparing

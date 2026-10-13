@@ -6,7 +6,7 @@ needs ``idx`` to be a compile-time constant, or any shape to be statically
 known (beyond a rank when an ``axis`` attribute is negative) -- so it runs by
 default and every model below is simplified with a plain
 ``onnxsim.simplify(...)`` call. Every model is built with the ONNX text
-format parser (``onnx.parser``) per CLAUDE.md's convention for this repo's
+format parser (``onnx.parser``) per AGENTS.md's convention for this repo's
 tests, and equivalence-checked against concrete ``input_data`` the same way
 as the other migrated test files.
 """

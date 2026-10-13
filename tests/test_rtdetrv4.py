@@ -14,7 +14,7 @@
 # research repo, not a library) and is not yet available through Hugging Face
 # transformers, so there is no small, offline, importable reference
 # implementation to build a tiny instance from the way the RF-DETR/YOLO tests
-# do. Per CLAUDE.md, this instead builds a small representative graph
+# do. Per AGENTS.md, this instead builds a small representative graph
 # directly via ``onnx.parser`` that exercises the op patterns specific to the
 # RT-DETR family (confirmed from the paper and the public RT-DETR/RT-DETRv2/
 # D-FINE reference implementations RT-DETRv4 is built on):

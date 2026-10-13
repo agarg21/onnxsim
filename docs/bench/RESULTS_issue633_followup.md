@@ -7,7 +7,7 @@
 **Tools:** onnxsim (this repo, `HEAD` at the time of writing: `9a0016b`, which already
 includes #634/#635/#637/#638/#641), onnxslim `0.1.96`, onnx `1.22.0`, onnxruntime `1.29.0`.
 **Reproduce:** `ONNXSIM_PROFILE=out.json python -c "..."` per the snippets below, or
-`python bench/onnxslim_comparison.py cait_xxs36_224_Opset17 mixer_l16_224_in21k_Opset17`
+`python docs/bench/onnxslim_comparison.py cait_xxs36_224_Opset17 mixer_l16_224_in21k_Opset17`
 for the onnxslim side-by-side.
 
 ## TL;DR

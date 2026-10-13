@@ -34,7 +34,7 @@ speedup measurement. Measured on a connected NanoPC-T6, two identical runs put
 -10.7%: these graphs run in 0.03-0.09 ms, which is below the launch-overhead
 noise floor, so the sign of the difference is not reproducible. Use
 ``ab_latency_nanopc.py`` for any latency claim. See
-``bench/RESULTS_nanopc_rk3588.md``.
+``docs/bench/RESULTS_nanopc_rk3588.md``.
 """
 
 from __future__ import annotations

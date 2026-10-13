@@ -1,7 +1,7 @@
 """Tests for the opt-in ``rewrite_gridsample_to_gather`` pass.
 
 Every model is a single 2-D ``GridSample`` node, built with the ONNX text
-format parser (``onnx.parser``, no torch dependency) per CLAUDE.md's
+format parser (``onnx.parser``, no torch dependency) per AGENTS.md's
 convention for this repo's tests. Each is run through
 ``onnxsim.simplify(..., extra_optimizers=["rewrite_gridsample_to_gather"])``,
 which numerically equivalence-checks the rewritten graph against the original

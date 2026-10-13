@@ -130,7 +130,7 @@ zero-pad-then-discard argument (a zero can never be a block's own
 Differential tests
 --------------------------------------------------------------------------
 
-Built via ``onnx.parser`` (per ``CLAUDE.md``) with ``numpy_helper.
+Built via ``onnx.parser`` (per ``AGENTS.md``) with ``numpy_helper.
 from_array`` for random weight initializers. This pass has TWO reachable
 entry points, both exercised below, mirroring ``test_formal_verify_iq4_nl.
 py``'s own convention: the opt-in optimizer name ``"gguf_q4_0"`` via

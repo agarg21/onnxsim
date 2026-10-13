@@ -2,7 +2,7 @@
 numeric verification that the tinygrad ``Tensor`` graph each generator
 builds computes the same thing as the actual ONNX node.
 
-Models are built via the ONNX text format parser (see CLAUDE.md's testing
+Models are built via the ONNX text format parser (see AGENTS.md's testing
 guidance); ``onnx.parser`` never assigns ``NodeProto.name``, so ``_named``
 sets it programmatically after parsing, same as
 ``tests/test_webgpu_kernel_metadata.py``.

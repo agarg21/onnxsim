@@ -138,7 +138,7 @@ def _grouped_conv_live_weight_model(cin, cout, group, k, size, stride, pad, nd):
     weight -- the shape a real audio model puts on the wire. Wav2Vec2-
     Conformer's gated conv module uses a fully depthwise 1-D `Conv`
     (`group == cin == cout`, per `docs/axera-audio-speech-op-coverage.md`);
-    built via `onnx.parser` per this repo's CLAUDE.md convention for new
+    built via `onnx.parser` per this repo's AGENTS.md convention for new
     test model-building code.
     """
     cin_pg = cin // group

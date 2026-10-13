@@ -119,7 +119,7 @@ python scripts/regression/run_regression.py --shard 0 --num-shards 6 \
 
 # summarize: which span dominates each model, aggregated across the set, and
 # (given the CSV too) how much of each model's real wall-clock time the
-# profiler's spans actually cover -- see bench/RESULTS_profiling_survey.md
+# profiler's spans actually cover -- see docs/bench/RESULTS_profiling_survey.md
 # for why that gap can be the more important number for a large model.
 python scripts/regression/summarize_profiles.py "profiles/*.json" --csv shard-0.csv
 ```
@@ -141,7 +141,7 @@ Every `run_regression.py` invocation -- including every scheduled and
 every model, one `<model>.pass_phases.txt` in `--profile-pass-phases-dir`
 (default `pass_phases`) per model. This is what answers *which single pass*
 (e.g. `extract_constant_to_initializer`, see
-`bench/RESULTS_issue633_followup.md`) dominates a given model -- finer-grained
+`docs/bench/RESULTS_issue633_followup.md`) dominates a given model -- finer-grained
 than `ONNXSIM_PROFILE`'s per-span trace, and, unlike a coarse pass/fail +
 timing summary, actually points at what to optimize next once the obvious
 bottlenecks are gone. It's on unconditionally (unlike `--profile-dir`/`profile`

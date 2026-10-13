@@ -101,7 +101,7 @@ implies nothing about ``|consumer(a) - consumer(b)|`` in general.
 The genuinely NEW content in this file is entirely in the differential
 tests, confirming the flatten-then-block-then-reshape-back mechanics against
 the real compiled pass: two Conv weight shapes built via ``onnx.parser`` (per
-``CLAUDE.md``) at opset 21 (INT4 tensors and ``DequantizeLinear``'s
+``AGENTS.md``) at opset 21 (INT4 tensors and ``DequantizeLinear``'s
 ``block_size`` attribute both need it) -- ``[Cout=2, Cin=2, kH=4, kW=4]``
 (``inner = 32``, exactly ONE block, the simplest case) and ``[Cout=2, Cin=1,
 kH=8, kW=8]`` (``inner = 64``, exactly TWO blocks, to actually exercise a

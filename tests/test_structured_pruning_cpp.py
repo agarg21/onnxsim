@@ -4104,7 +4104,7 @@ def test_cpp_structured_pruning_matches_python_reference_output():
 # `onnx.parser.parse_model`'s text format has no way to spell a graph-typed
 # node attribute (an `If`'s `then_branch`/`else_branch`, a `Loop`'s
 # `body`), so every model below uses `onnx.helper.make_node`/`make_graph`
-# directly instead, per this repo's own CLAUDE.md guidance for exactly this
+# directly instead, per this repo's own AGENTS.md guidance for exactly this
 # case.
 
 
@@ -5284,10 +5284,10 @@ def test_cpp_structured_pruning_matmul_silu_decomposed_matches_python_reference_
 # mirroring tests/test_pruning.py's own MatMulNBits coverage (see that
 # file's own `_nbits_*` helpers, independently re-implemented here rather
 # than imported -- this file's own established "no cross-import between
-# test files" precedent). Models are built via onnx.parser (per CLAUDE.md's
+# test files" precedent). Models are built via onnx.parser (per AGENTS.md's
 # convention); the packed uint8 `B`/`scales`/`zero_points` initializers are
 # attached programmatically via onnx.numpy_helper.from_array afterward
-# (CLAUDE.md's documented exception: these must be byte-exact, not spelled
+# (AGENTS.md's documented exception: these must be byte-exact, not spelled
 # out as text literals -- the parser encodes tensor literals as
 # `float_data`/`int32_data`, not `raw_data`).
 
@@ -7118,11 +7118,11 @@ def test_cpp_qdq_structured_pruning_gelu_gated_ffn_matches_oracle():
 # the REAL ``onnxruntime.quantization.matmul_bnb4_quantizer.MatMulBnb4
 # Quantizer``'s own ``bnb4_block_quant`` -- never a hand-rolled
 # reimplementation of the packing scheme -- so every packed ``B``/``absmax``
-# pair a test builds is genuine quantizer output, per CLAUDE.md's own
+# pair a test builds is genuine quantizer output, per AGENTS.md's own
 # guidance for a numpy-computed "large/packed" tensor. Models are built via
-# onnx.parser (per CLAUDE.md's convention); the packed ``B``/``absmax``
+# onnx.parser (per AGENTS.md's convention); the packed ``B``/``absmax``
 # initializers are attached programmatically via onnx.numpy_helper.from_array
-# afterward (CLAUDE.md's documented exception -- these must be byte-exact,
+# afterward (AGENTS.md's documented exception -- these must be byte-exact,
 # not spelled out as text literals).
 
 
@@ -7494,9 +7494,9 @@ def test_cpp_structured_pruning_matmul_bnb4_separate_bias_add_tied_declines():
 # own coverage for both ops (see that file's own `_fp8bw_*`/`_fp4bw_*`
 # helpers, independently re-implemented here rather than imported -- this
 # file's own established "no cross-import between test files" precedent).
-# Models are built via onnx.parser (per CLAUDE.md's convention); the packed
+# Models are built via onnx.parser (per AGENTS.md's convention); the packed
 # FLOAT8E4M3FN/uint8 `B`/scale-table initializers are attached
-# programmatically via onnx.numpy_helper.from_array afterward (CLAUDE.md's
+# programmatically via onnx.numpy_helper.from_array afterward (AGENTS.md's
 # documented exception -- these must be byte-exact, not spelled out as text
 # literals). Neither op has a real CPU kernel in this environment (see
 # onnxsim/pruning.py's own section comment for the empirical confirmation --

@@ -9,7 +9,7 @@ carrying its duration and ``args.peak_rss_mb``. This script aggregates those
 per model (mirroring the console table ``PrintSummary`` prints, but across the
 whole sampled set at once) and, when given the regression CSVs alongside the
 traces, reports how much of each model's *total* wall time the profiler's own
-spans actually cover -- see ``bench/RESULTS_profiling_survey.md`` for why that
+spans actually cover -- see ``docs/bench/RESULTS_profiling_survey.md`` for why that
 gap matters: for a large model, most of the time can be Python<->C++
 marshalling that happens outside the profiled ``Simplify()`` call entirely.
 
@@ -214,7 +214,7 @@ def main(argv):
             "accounts for essentially all of the model's time; much larger means most "
             "time is spent outside the profiled `Simplify()` call (Python<->C++ "
             "marshalling, `onnx.checker.check_model`, ...) -- see "
-            "`bench/RESULTS_profiling_survey.md`._\n"
+            "`docs/bench/RESULTS_profiling_survey.md`._\n"
         )
 
     # --- Aggregate: which span dominates across the whole sampled set ------- #

@@ -229,7 +229,7 @@ single-level, fully-independent-per-block model.
 Differential/structural tests
 --------------------------------------------------------------------------
 
-Built via ``onnx.parser`` (per ``CLAUDE.md``) with ``numpy_helper.from_array``
+Built via ``onnx.parser`` (per ``AGENTS.md``) with ``numpy_helper.from_array``
 for weight initializers. Two entry points are exercised, mirroring IQ4_NL's
 own precedent: the opt-in optimizer name ``"gguf_q6_k"`` via
 ``simplify_isolated_extra`` (confirming the pass is actually registered and

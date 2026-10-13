@@ -131,7 +131,7 @@ def test_find_q_proj_weight_traces_producer_edges_not_names():
     ONNX text format's `<...>` node syntax sets node *attributes*, not the
     `NodeProto.name` field itself (confirmed directly: a `<name = "...">`
     entry parses without error but leaves `NodeProto.name` empty), so this
-    model is built with `onnx.helper.make_node` instead -- the CLAUDE.md-
+    model is built with `onnx.helper.make_node` instead -- the AGENTS.md-
     documented exception for a case the text form cannot express.
     """
     import numpy as np

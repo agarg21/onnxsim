@@ -19,7 +19,7 @@ import torch
 import onnxsim
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
 
-# onnxruntime is an optional, Python-only dependency (see CLAUDE.md) with no
+# onnxruntime is an optional, Python-only dependency (see AGENTS.md) with no
 # s390x wheel; every test in this file runs a model through it, so skip the
 # whole module cleanly rather than hard-failing collection where it's absent.
 onnxruntime = pytest.importorskip("onnxruntime")

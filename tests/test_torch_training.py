@@ -197,7 +197,7 @@ def test_drop_unused_functions_removes_an_uncalled_function_definition():
 
     Built with ``onnx.helper`` rather than ``onnx.parser``: a FunctionProto
     with its own, different ``opset_import`` attached to a model isn't
-    expressible in the parser's text format (CLAUDE.md's documented
+    expressible in the parser's text format (AGENTS.md's documented
     fallback case).
     """
     reduce_mean_fn = onnx.helper.make_function(

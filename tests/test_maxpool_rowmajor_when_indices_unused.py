@@ -13,7 +13,7 @@ consumer (tracked by the in-memory graph IR), not merely whether a second
 output name is declared, so a *declared-but-dead* `Indices` output is still
 safely rewritten.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention. Numeric
+Models are built with ``onnx.parser`` per AGENTS.md's convention. Numeric
 equivalence comes from ``onnxsim.simplify``'s own ``check_n``.
 """
 

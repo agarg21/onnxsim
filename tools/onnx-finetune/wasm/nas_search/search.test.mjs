@@ -7,7 +7,7 @@
 // Skips (does not fail) if onnxruntime-web is not installed here, matching
 // ../federated_lora/step_graph_runner.test.mjs's own convention -- `npm
 // install` in this directory to run it for real. generate_nas_step_graphs.py
-// needs onnxsim's own C++ extension built (see the repo's CLAUDE.md) -- this
+// needs onnxsim's own C++ extension built (see the repo's AGENTS.md) -- this
 // test does not attempt to build it, only to run it.
 //
 // Usage:

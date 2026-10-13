@@ -101,7 +101,7 @@ differential test's real-onnxruntime confirmation of the same fact (window
 sizes 9 and 4096) later in this file.
 
 Differential tests build standalone ``AveragePool``/``GlobalAveragePool``
-models via ``onnx.parser`` (per ``CLAUDE.md``) and run the real pass through
+models via ``onnx.parser`` (per ``AGENTS.md``) and run the real pass through
 the nanobind-exposed
 ``onnxsim.onnxsim_cpp2py_export.quantize_qoperator_pool(model_bytes,
 activation_ranges)`` -- the dedicated Pool entry point (see

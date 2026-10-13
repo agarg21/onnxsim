@@ -99,7 +99,7 @@ def _int4_block_scale(w_nk, block_size):
 def _assert_on_int4_grid(original_nk, reconstructed_nk, block_size=32, atol=1e-3):
     # Confirms, directly against the ONNX initializer's own numpy value
     # (never round-tripped through onnxruntime -- see this repo's own
-    # CLAUDE.md platform-numerics note), that every element of
+    # AGENTS.md platform-numerics note), that every element of
     # ``reconstructed_nk`` is exactly ``code * scale`` for an integer
     # ``code`` in [-7, 7] and the *original* weight's own per-(row, block)
     # RTN scale -- true block-wise INT4 precision, not merely "close to" the

@@ -17,7 +17,7 @@ a function that has no dispatcher to build the surrounding graph for it.
 Both test functions here build their own small ONNX graph directly with
 ``onnx.helper``/the module's own ``_Builder``, rather than via
 ``onnx.parser`` (this repo's usual preference for test-authored models --
-see the repo's CLAUDE.md): the whole point of these tests is to exercise
+see the repo's AGENTS.md): the whole point of these tests is to exercise
 the actual node-emission logic inside ``_interleave_gate_up``/
 ``_gpt_oss_moe_ffn``, which only exists as calls against ``_Builder``, so
 there is no hand-written text graph to parse in the first place -- the

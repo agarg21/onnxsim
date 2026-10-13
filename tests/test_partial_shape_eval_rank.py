@@ -73,7 +73,7 @@ def _pads_chain_initializers(torch_pad):
 
 
 # Reused as a text fragment so callers can interpolate it like the rest of the
-# body (see CLAUDE.md's note on reusable node sequences).
+# body (see AGENTS.md's note on reusable node sequences).
 _PADS_CHAIN = """
   cos = ConstantOfShape <value = int64[1] {0}> (cos_in)
   cc0 = Concat <axis = 0> (torch_pad, cos)

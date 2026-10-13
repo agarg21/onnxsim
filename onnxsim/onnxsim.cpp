@@ -744,7 +744,7 @@ static onnx::ModelProto SimplifyImpl(
   // the same move-based Import/Export round trip as OptAndShape's own
   // resident Graph above, instead of a deep copy -- this is what actually
   // avoids the extra ~1x-model-size peak documented in
-  // bench/RESULTS_synthetic_decoder_oom.md, since it was traced to exactly
+  // docs/bench/RESULTS_synthetic_decoder_oom.md, since it was traced to exactly
   // this copy, not (as first suspected) anything on the Python side.
   onnx::ModelProto sim_model;
   if (mutable_model != nullptr) {
@@ -1102,10 +1102,10 @@ void SimplifyPath(
     // result and never read again beforehand -- exactly the case
     // SimplifyConsumeInput's doc comment calls out as safe, and the one this
     // investigation was written for (see
-    // bench/RESULTS_synthetic_decoder_oom.md): it avoids the ~1x-model-size
-    // deep copy ``Simplify()`` would otherwise make of ``model`` to get a
-    // mutable working copy, cutting the peak RSS of simplifying a large
-    // external-data model roughly in half.
+    // docs/bench/RESULTS_synthetic_decoder_oom.md): it avoids the
+    // ~1x-model-size deep copy ``Simplify()`` would otherwise make of ``model``
+    // to get a mutable working copy, cutting the peak RSS of simplifying a
+    // large external-data model roughly in half.
     model = SimplifyConsumeInput(
         executor, model, skip_optimizers, constant_folding, shape_inference,
         tensor_size_threshold, target_opset_version, rewriter,

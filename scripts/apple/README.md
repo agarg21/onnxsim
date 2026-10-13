@@ -148,7 +148,7 @@ remainder, for instance, still fails because tinygrad does not implement
 `NonMaxSuppression` or `RoiAlign` either.
 
 M4 results for the Hexagon-deployed YOLO11n, YOLO26n, and YOLO26s models are
-in [`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
+in [`docs/bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../docs/bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
 The Core ML translator lowers static nearest-neighbor Resize to Core ML's own
 `resize_nearest_neighbor` when the resize is a whole-number replication of its
 input, and otherwise to constant index gathers, which preserve ONNX's sampling
@@ -173,7 +173,7 @@ YOLO26s is unchanged because its Resize input is not a whole-number
 replication, so it keeps the gathers; its head is large enough that the two
 `Resize` nodes are not on the critical path. Note these FLOAT16 latencies are
 lower than the `CPU_AND_NE` FLOAT16 numbers recorded in
-[`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md),
+[`docs/bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../docs/bench/RESULTS_m4_hexagon_yolo_coreml_metal.md),
 which predate the native-Resize change; that file's accuracy notes still apply.
 
 ## rustnn WebNN vs. tinygrad benchmark (`benchmark_webnn_tinygrad.py`)
@@ -213,7 +213,7 @@ python scripts/apple/benchmark_sam_hybrid.py "$SAM_WORK/edgesam" \
 On an M4 Mac mini, with 8 measured runs after 3 warm-ups, the following
 medians include both model predictions and the encoder-to-decoder handoff.
 The reference is a single sample image and center-point prompt; see
-[`bench/RESULTS_m4_sam_hybrid.md`](../../bench/RESULTS_m4_sam_hybrid.md)
+[`docs/bench/RESULTS_m4_sam_hybrid.md`](../../docs/bench/RESULTS_m4_sam_hybrid.md)
 for the full results and accuracy limits.
 
 | model | input | Core ML → Core ML | Core ML → Metal JIT | Hexagon HTP reference |
@@ -238,7 +238,7 @@ the same two axes (decode tok/s, peak memory) as
 methodology. DeviceMark's own on-device runtime is a different, private
 "Core AI" engine (`aimodel` format), not `CoreML.framework`, and its board
 tests a different model roster (Qwen3.5, LFM2.5, Granite-4.0-H, and others --
-see `bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures"
+see `docs/bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures"
 section) -- this benchmark answers the same *kind* of question for onnxsim's
 own Core ML exporter, not a literal comparison against DeviceMark's own
 numbers.
@@ -269,7 +269,7 @@ smoke-test tier (`HuggingFaceTB/SmolLM2-135M-Instruct`, plus its
 `--quantize-weights`/`--matmul-to-conv` variants -- see below) and the
 few-billion-parameter tier -- the same rough weight class as DeviceMark's own
 leaderboard (roughly 0.8-5B; its own current roster is a different,
-non-overlapping model list, see `bench/TODO_quality_retention_eval.md`)
+non-overlapping model list, see `docs/bench/TODO_quality_retention_eval.md`)
 (`HuggingFaceTB/SmolLM2-1.7B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct`,
 `Qwen/Qwen2.5-3B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`,
 `meta-llama/Llama-3.2-3B-Instruct`, `microsoft/Phi-3.5-mini-instruct`) --
@@ -880,7 +880,7 @@ correctness; they say nothing about actual model *quality* -- DeviceMark's
 third axis (alongside decode speed and memory), scored via IFEval, MMLU-Pro,
 and MATH-500, plus **retention**: how much of the float model's benchmark
 score survives quantization (`quantized_score / float_score`). See
-`bench/TODO_quality_retention_eval.md` for the full plan (including exactly
+`docs/bench/TODO_quality_retention_eval.md` for the full plan (including exactly
 how DeviceMark itself defines this -- subset sizes, 0-shot, and a
 completed-only accuracy `compute_retention.py` now replicates too, see below);
 this is the first implemented slice of it.
@@ -994,7 +994,7 @@ you, and one flag worth knowing about:
   multi-billion-parameter model's weights). Passing a path instead uses
   onnx's/onnxsim's own file-based C++ entry points, which need only about
   1x the model's size in peak memory rather than 2x+ (see
-  `bench/RESULTS_synthetic_decoder_oom.md` in the repo root for the
+  `docs/bench/RESULTS_synthetic_decoder_oom.md` in the repo root for the
   investigation that fixed the `onnxsim.simplify` side of this).
 - `main_export(..., do_validation=False)` skips `optimum`'s own
   PyTorch-vs-ONNX-Runtime comparison pass, which otherwise keeps a second
@@ -1059,7 +1059,7 @@ models to run `run_llm_decode_benchmark.py` against on macOS -- the actual
 "reproduce a DeviceMark-style benchmark" step (in spirit: same rough weight
 class and the same decode-tok/s-and-memory axes, not literally DeviceMark's
 own models or its private on-device runtime -- see
-`bench/TODO_quality_retention_eval.md`). The default list spans a few
+`docs/bench/TODO_quality_retention_eval.md`). The default list spans a few
 architecture families in DeviceMark's own ~0.8-5B weight class (Llama-style,
 Qwen2, Phi-3), not just one, since `onnxsim/coreml_export.py`'s translator is
 a hand-written ONNX-to-MIL mapping where different architectures can exercise

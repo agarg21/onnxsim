@@ -1442,7 +1442,7 @@ def test_export_archive_roundtrips_unnamed_attribute_tensor(export_fn, import_fn
 @pytest.mark.skipif(sys.platform == "win32", reason="resource.getrusage is POSIX-only")
 def test_simplify_path_peak_memory_stays_near_model_size():
     # Regression test for the root cause documented in
-    # bench/RESULTS_synthetic_decoder_oom.md / bench/TODO_large_decoder_submodule_oom.md:
+    # docs/bench/RESULTS_synthetic_decoder_oom.md / docs/bench/TODO_large_decoder_submodule_oom.md:
     # Simplify() used to unconditionally deep-copy its whole input model into a
     # mutable working copy (`sim_model = model` in onnxsim.cpp), so peak RSS for a
     # large external-data model was ~1.9-2x its own size. SimplifyConsumeInput
@@ -1458,7 +1458,7 @@ def test_simplify_path_peak_memory_stays_near_model_size():
     # test: at 196 MiB-1.5 GiB, the pre-fix vs post-fix delta was a near-constant
     # ~28 MiB regardless of model size (not a ratio), whereas at ~2.2+ GiB (crossing
     # the threshold) it was a clean ~2.06x (pre-fix) vs ~1.07x (post-fix) at every
-    # size tried. So this reuses bench/decoder_oom_repro.py's own generator sized to
+    # size tried. So this reuses docs/bench/decoder_oom_repro.py's own generator sized to
     # land just above that threshold (11 layers, ~2.3 GiB) rather than
     # reimplementing the same decoder-block shape here at a size that was never
     # actually measured against pre-fix behavior.
@@ -1514,7 +1514,7 @@ def test_simplify_path_peak_memory_stays_near_model_size():
     assert peak_mib < total_mib * 1.5, (
         f"peak RSS ({peak_mib:.0f} MiB) for a {total_mib:.0f} MiB external-data "
         "model is too high -- this is the double-materialization regression "
-        "SimplifyConsumeInput fixed (see bench/RESULTS_synthetic_decoder_oom.md)"
+        "SimplifyConsumeInput fixed (see docs/bench/RESULTS_synthetic_decoder_oom.md)"
     )
 
 
@@ -1541,7 +1541,7 @@ def _make_add_model():
 
 def test_output_path_fast_path_saves_directly_and_skips_reload():
     # Regression test for a real, if secondary, inefficiency documented in
-    # bench/RESULTS_synthetic_decoder_oom.md: on the check_n=0 fast path,
+    # docs/bench/RESULTS_synthetic_decoder_oom.md: on the check_n=0 fast path,
     # simplify() used to always call onnx.load(fast_out_path) (full data inline)
     # purely to satisfy its return contract, even when the caller's very next
     # step is to save the result again (as onnxsim's own CLI does).

@@ -1,7 +1,7 @@
 """Tests for the opt-in ``rewrite_tensor_scatter_to_scatter_elements`` pass.
 
 Every model is a single ``TensorScatter`` node (opset 24), built with the ONNX
-text format parser (``onnx.parser``) per CLAUDE.md's convention for this
+text format parser (``onnx.parser``) per AGENTS.md's convention for this
 repo's tests. Rewriting models are run through
 ``onnxsim.simplify(..., extra_optimizers=["rewrite_tensor_scatter_to_scatter_elements"])``
 and equivalence-checked numerically against the original ``TensorScatter``

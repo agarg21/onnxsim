@@ -117,7 +117,7 @@ def main():
         "Off by default: it adds a background RSS-sampler thread and a trace "
         "write per model, overhead not worth paying on every scheduled run -- "
         "use it for investigating a specific slow/regressed run "
-        "(see bench/RESULTS_profiling_survey.md).",
+        "(see docs/bench/RESULTS_profiling_survey.md).",
     )
     ap.add_argument(
         "--profile-pass-phases-dir",
@@ -130,7 +130,7 @@ def main():
         "trace write, negligible next to a model's simplify time -- and "
         "without it there's no routine way to see which pass to optimize next "
         "once the obvious bottlenecks are gone (see "
-        "bench/RESULTS_issue633_followup.md). Pass an empty string to disable.",
+        "docs/bench/RESULTS_issue633_followup.md). Pass an empty string to disable.",
     )
     args = ap.parse_args()
 

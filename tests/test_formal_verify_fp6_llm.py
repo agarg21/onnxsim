@@ -155,8 +155,8 @@ multiplicands inside the same query) for the same Z3-hang-avoidance
 reason the MXFP4 file's own docstring cites.
 
 Differential tests build a plain float ``MatMul``/``Gemm`` via
-``onnx.parser`` (per ``CLAUDE.md``) with ``numpy_helper.from_array`` for
-random weight initializers (per ``CLAUDE.md``'s own "keep large/random
+``onnx.parser`` (per ``AGENTS.md``) with ``numpy_helper.from_array`` for
+random weight initializers (per ``AGENTS.md``'s own "keep large/random
 arrays out of text literals" guidance). Both the STRUCTURAL checks (only
 MatMul/vanilla-Gemm with a constant 2-D float32 weight matches -- a 4-D
 Conv weight and a non-vanilla Gemm, ``transA=1`` or ``alpha != 1``, both

@@ -2,7 +2,7 @@
 
 **PR:** [#482 — *Defer loading external tensor data to reduce memory usage*](https://github.com/onnxsim/onnxsim/pull/482)
 **Compared:** `b625e26` (parent, pre-PR) vs `7e500fc` (merge commit)
-**Reproduce:** `bench/peak_memory.py` (see its docstring)
+**Reproduce:** `docs/bench/peak_memory.py` (see its docstring)
 
 ## TL;DR
 

@@ -116,7 +116,7 @@ epsilon).
 Differential tests
 --------------------------------------------------------------------------
 
-Built via ``onnx.parser`` (per ``CLAUDE.md``) with ``numpy_helper.
+Built via ``onnx.parser`` (per ``AGENTS.md``) with ``numpy_helper.
 from_array`` for random weight initializers. This pass has TWO reachable
 entry points, both exercised below: the opt-in optimizer name
 ``"gguf_q4_1"`` via ``simplify_isolated_extra`` (confirming the pass is

@@ -84,12 +84,12 @@ transform doesn't need and this file doesn't attempt; the differential tests
 below instead check the real end-to-end numeric behavior on concrete models.
 
 Differential tests build models via ``onnx.parser.parse_model()`` (per
-``CLAUDE.md``) and call the real ``onnxsim.quantize_fp16`` entry point found
+``AGENTS.md``) and call the real ``onnxsim.quantize_fp16`` entry point found
 above, confirming: (1) with the pass's own default ``keep_io_types=True``, a
 non-tie float32 weight becomes a bit-exact-correct float16 value (checked
 against ``numpy``'s own ``.astype(np.float16)`` as an independent reference
 -- valid for a non-tie value even though numpy's ties-to-even convention
-differs from this pass's documented ties-away-from-zero, per ``CLAUDE.md``'s
+differs from this pass's documented ties-away-from-zero, per ``AGENTS.md``'s
 guidance on this exact wrinkle) and boundary ``Cast`` nodes appear exactly
 where the header comment says; (2) the overall numeric output, run through
 onnxruntime, stays close to (not equal to) the unquantized model's output;
@@ -226,7 +226,7 @@ def test_quantize_fp16_keep_io_types_rounds_weight_and_inserts_boundary_casts():
     # Non-tie weight values (arbitrary decimals essentially never land
     # exactly halfway between two representable float16 values) -- checked
     # bit-for-bit against numpy's own .astype(np.float16) as an independent
-    # reference, valid here per CLAUDE.md's guidance even though numpy's own
+    # reference, valid here per AGENTS.md's guidance even though numpy's own
     # tie-breaking rule (round-half-to-even) differs from this pass's
     # documented ties-away-from-zero, since neither value is a tie.
     w = np.array([0.1, -0.2, 1234.25, -6.7], dtype=np.float32)

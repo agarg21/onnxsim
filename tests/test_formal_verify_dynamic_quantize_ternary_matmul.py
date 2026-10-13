@@ -135,7 +135,7 @@ way an *equality* would; ``quantized_mac_bound`` itself does not attempt this
 either.
 
 Differential tests build a plain float ``MatMul`` via ``onnx.parser`` (per
-``CLAUDE.md``) with a HAND-CONSTRUCTED, genuinely ternary weight (fixed
+``AGENTS.md``) with a HAND-CONSTRUCTED, genuinely ternary weight (fixed
 per-column sign patterns times a chosen per-column scale -- not randomly
 sampled, so each column's ``max(|column|)`` is guaranteed to hit that exact
 chosen scale rather than only approximately by chance), run the real pass via

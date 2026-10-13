@@ -27,7 +27,7 @@
 // nothing to un-ignore in .gitignore.
 //
 // Needs the wasm module built and staged next to the page
-// (scripts/convertmodel/onnxsim.js + onnxsim.wasm, e.g. `./build_wasm.sh` then
+// (scripts/convertmodel/onnxsim.js + onnxsim.wasm, e.g. `./scripts/build_wasm.sh` then
 // `cp build-wasm-node-OFF/onnxsim.* scripts/convertmodel`, which is what
 // .github/workflows/static.yml does). Without it the test SKIPS, since the
 // convertmodel test job builds no wasm; QAT_REQUIRE_WASM=1 turns that skip
@@ -156,7 +156,7 @@ async function main() {
   if (!existsSync(MODULE_JS) || !existsSync(MODULE_WASM)) {
     const why =
       `scripts/convertmodel/onnxsim.{js,wasm} not found -- build the wasm module ` +
-      `(./build_wasm.sh) and copy it next to the page to run this test`;
+      `(./scripts/build_wasm.sh) and copy it next to the page to run this test`;
     if (process.env.QAT_REQUIRE_WASM) {
       console.error("FAIL:", why);
       process.exit(1);

@@ -1,7 +1,7 @@
 """Tests for :mod:`onnxsim.quant_error_eval` -- the harness that scores
 onnxsim's own existing quantization passes (SmoothQuant-style scaling,
 QuaRot/SpinQuant-style rotation) against arXiv:2609.21450's analysis. Model
-construction follows this repo's own convention (see CLAUDE.md): built via
+construction follows this repo's own convention (see AGENTS.md): built via
 ``onnx.parser`` rather than ``onnx.helper.make_node`` chains.
 """
 

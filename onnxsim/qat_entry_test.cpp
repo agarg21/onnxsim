@@ -7,7 +7,7 @@
  * tests/test_qat.py checks the Python the way a training pass has to be
  * checked: it runs the loop and measures that the reconstruction error falls.
  * None of that is reproducible here, because nothing in this build evaluates
- * an ONNX graph (the wheel does not compile ONNX Runtime -- see CLAUDE.md --
+ * an ONNX graph (the wheel does not compile ONNX Runtime -- see AGENTS.md --
  * and the WASM build hands evaluation to onnxruntime-web at run time). So
  * this covers the half that *is* checkable without an evaluator, and covers
  * it exactly: that the emitted step graph is a legal ONNX model, that the

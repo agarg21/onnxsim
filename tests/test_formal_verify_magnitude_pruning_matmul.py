@@ -72,7 +72,7 @@ treatment:
   selection-correctness content above.
 
 Differential tests build a small, hand-verifiable 4x2 ``MatMul`` weight via
-``onnx.parser.parse_model()`` (per this repo's own CLAUDE.md) with per-column
+``onnx.parser.parse_model()`` (per this repo's own AGENTS.md) with per-column
 magnitudes chosen so the sparsity=0.5 (keep 2 of 4 per output channel)
 top-2 selection has no ties at the cutoff, and confirm: the real compiled
 pass zeros exactly the two lowest-magnitude entries of each column, leaving

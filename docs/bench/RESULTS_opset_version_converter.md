@@ -5,7 +5,7 @@ is opt-in and effectively unused in onnxsim's own test suite (two tiny dedicated
 tests). Before considering it for wider use, profile it and fix what's actually
 slow.
 
-**Tool:** [`bench/opset_conversion_profile.py`](./opset_conversion_profile.py)
+**Tool:** [`docs/bench/opset_conversion_profile.py`](./opset_conversion_profile.py)
 (new) -- synthetic, self-contained (no downloads): a low-opset (9) Conv/BatchNorm/Relu
 stack with real numpy-backed initializer weights, at a few sizes, run through
 `simplify(model, target_opset_version="latest", profile=...)` in a subprocess,
@@ -121,7 +121,7 @@ converting a model with a stale/missing custom-op adapter is worse than the
 - `third_party/onnx` (branch `claude/onnx-version-converter-perf`, pushed to
   `onnxsim/onnx`, not yet merged/re-pinned): the consuming `convert_version`
   / `ConvertVersion` overloads.
-- `bench/opset_conversion_profile.py`: the profiling script used above, kept
+- `docs/bench/opset_conversion_profile.py`: the profiling script used above, kept
   for re-measuring after a Finding #2 fix or against real models.
 
 **Verified:** `tests/test_python_api.py`'s two `target_opset_version` tests and

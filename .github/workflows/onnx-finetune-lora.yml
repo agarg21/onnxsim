@@ -16,7 +16,7 @@ name: onnx-finetune LoRA/QLoRA
 #
 # lora-scripts-with-qlora additionally builds this repo's own onnxsim wheel
 # (ONNXSIM_BUILTIN_ORT=OFF, the same wheel-build path setup.py always uses --
-# see the top-level CLAUDE.md note that this does NOT build ONNX Runtime) so
+# see the top-level AGENTS.md note that this does NOT build ONNX Runtime) so
 # prepare_qlora.py's onnxsim.nf4 integration -- the part that actually needs
 # onnxsim importable -- gets exercised for real too instead of always skipping.
 
@@ -70,7 +70,7 @@ jobs:
           python-version: "3.11"
       - name: Install build + test deps
         run: pip install nanobind onnxruntime pytest
-      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- no ONNX Runtime build, see CLAUDE.md)
+      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- no ONNX Runtime build, see AGENTS.md)
         run: pip install -e . --no-build-isolation
       - name: "pytest tools/onnx-finetune/tests (every path: LoRA surgery, native .onnx_adapter export/load, and onnxsim.nf4 / prepare_qlora.py)"
         run: pytest tools/onnx-finetune/tests -v
