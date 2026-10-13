@@ -217,14 +217,12 @@ class Backward {
   // tensor name rather than GraphBuilder::GreaterMask's float.
   std::string MaskGreater(const std::string& x, const std::string& bound) {
     const std::string gt = b_.Op("Greater", {x, bound}, "greater");
-    return b_.Op("Cast", {gt}, {IntAttr("to", b_.float_type())},
-                 "cast");
+    return b_.Op("Cast", {gt}, {IntAttr("to", b_.float_type())}, "cast");
   }
 
   std::string MaskLess(const std::string& x, const std::string& bound) {
     const std::string lt = b_.Op("Less", {x, bound}, "less");
-    return b_.Op("Cast", {lt}, {IntAttr("to", b_.float_type())},
-                 "cast");
+    return b_.Op("Cast", {lt}, {IntAttr("to", b_.float_type())}, "cast");
   }
 
  private:

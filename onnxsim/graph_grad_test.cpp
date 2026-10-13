@@ -824,6 +824,21 @@ std::vector<int64_t> Int64Data(const onnx::TensorProto& tensor) {
   return values;
 }
 
+std::vector<double> DoubleData(const onnx::TensorProto& tensor) {
+  std::vector<double> values;
+  const std::string& raw = tensor.raw_data();
+  for (size_t i = 0; i + 8 <= raw.size(); i += 8) {
+    uint64_t bits = 0;
+    for (int k = 7; k >= 0; --k) {
+      bits = (bits << 8) | static_cast<unsigned char>(raw[i + k]);
+    }
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    values.push_back(value);
+  }
+  return values;
+}
+
 std::vector<float> FloatData(const onnx::TensorProto& tensor) {
   std::vector<float> values;
   const std::string& raw = tensor.raw_data();
@@ -1337,7 +1352,6 @@ void AMultiOutputNodeIsRefused() {
       "single-output", "a multi-output node should be refused");
 }
 
-
 // A float64 forward needs float64 constants and masks next to it: with
 // SetFloatType(DOUBLE) every floating-point initializer a rule builds is
 // DOUBLE, every mask Cast goes to DOUBLE, and a mean's 1/N is the double
@@ -1352,21 +1366,23 @@ void TheFloatTypeOfTheBuilderReachesEveryConstantAndMask() {
         Node("Clip", {"R", "lo", "hi"}, {"C"}),
         Node("ReduceMean", {"C", "ax0"}, {"Y"}, {IntAttr("keepdims", 0)}),
     };
-    const Shapes shapes{{"A", {3}}, {"R", {3}}, {"C", {3}}, {"lo", {}}, {"hi", {}}, {"Y", {}}};
+    const Shapes shapes{{"A", {3}}, {"R", {3}}, {"C", {3}},
+                        {"lo", {}}, {"hi", {}}, {"Y", {}}};
     const std::string seed = b.Const(1.0f, "seed");
     const auto grads = BuildBackward(b, slice, shapes, {{"Y", seed}}, {"A"});
     Check(grads.count("A") == 1, "the gradient of A is returned");
     bool saw_mean = false;
     for (const onnx::TensorProto& t : b.initializer()) {
       if (t.data_type() == onnx::TensorProto::INT64) continue;
-      Check(t.data_type() == type, "initializer " + t.name() + " has the builder's float type");
+      Check(t.data_type() == type,
+            "initializer " + t.name() + " has the builder's float type");
       if (t.name().find("bcast") == std::string::npos) continue;
       saw_mean = true;
       if (type == onnx::TensorProto::DOUBLE) {
-        double v = 0;
-        Check(t.raw_data().size() == 3 * sizeof(double), "a double per element");
-        std::memcpy(&v, t.raw_data().data(), sizeof(v));
-        Check(v == 1.0 / 3.0, "the mean's 1/N is the double 1/3");
+        const std::vector<double> v = DoubleData(t);
+        Check(v.size() == 3, "a double per element");
+        Check(v.size() == 3 && v[0] == 1.0 / 3.0,
+              "the mean's 1/N is the double 1/3");
       }
     }
     Check(saw_mean, "the mean rule built its broadcast constant");
@@ -1374,13 +1390,15 @@ void TheFloatTypeOfTheBuilderReachesEveryConstantAndMask() {
     for (const onnx::NodeProto& n : b.nodes()) {
       if (n.op_type() != "Cast") continue;
       saw_cast = true;
-      Check(n.attribute(0).i() == type, "the mask Cast goes to the builder's float type");
+      Check(n.attribute(0).i() == type,
+            "the mask Cast goes to the builder's float type");
     }
     Check(saw_cast, "Relu and Clip built masks");
   }
   GraphBuilder b;
-  CheckThrows<std::invalid_argument>([&] { b.SetFloatType(onnx::TensorProto::INT32); }, "FLOAT or DOUBLE",
-                                     "an integer type is not a float type");
+  CheckThrows<std::invalid_argument>(
+      [&] { b.SetFloatType(onnx::TensorProto::INT32); }, "FLOAT or DOUBLE",
+      "an integer type is not a float type");
 }
 
 }  // namespace
