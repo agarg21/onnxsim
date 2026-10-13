@@ -391,6 +391,70 @@ std::vector<std::string> CasePlanner() {
 }
 
 // Sorted by name, matching the generator's `for name in sorted(cases)`.
+// Hand-built forward nodes for the two backward cases below. They mirror the
+// text models in scripts/make_qat_parity_fixtures.py
+// (_BACKWARD_REDUCE_EXTREMES_TEXT and _BACKWARD_LOGSOFTMAX_CAST_TEXT), which
+// the Python side parses; a change to one must be made to the other.
+onnx::AttributeProto ParityIntAttr(const std::string& name, int64_t value) {
+  onnx::AttributeProto attribute;
+  attribute.set_name(name);
+  attribute.set_type(onnx::AttributeProto::INT);
+  attribute.set_i(value);
+  return attribute;
+}
+
+onnx::AttributeProto ParityIntsAttr(const std::string& name,
+                                    const std::vector<int64_t>& values) {
+  onnx::AttributeProto attribute;
+  attribute.set_name(name);
+  attribute.set_type(onnx::AttributeProto::INTS);
+  for (int64_t value : values) attribute.add_ints(value);
+  return attribute;
+}
+
+onnx::NodeProto ParityNode(const std::string& op_type,
+                           const std::vector<std::string>& inputs,
+                           const std::vector<std::string>& outputs,
+                           const std::vector<onnx::AttributeProto>& attrs) {
+  onnx::NodeProto node;
+  node.set_op_type(op_type);
+  for (const std::string& input : inputs) node.add_input(input);
+  for (const std::string& output : outputs) node.add_output(output);
+  for (const onnx::AttributeProto& attr : attrs) *node.add_attribute() = attr;
+  return node;
+}
+
+std::vector<std::string> RenderBackwardCase(
+    const std::vector<onnx::NodeProto>& nodes,
+    const std::map<std::string, std::vector<int64_t>>& shapes) {
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+  auto lines = RenderBuilder(b);
+  lines.push_back("  result " + grads.at("X"));
+  return lines;
+}
+
+std::vector<std::string> CaseBackwardReduceExtremes() {
+  const std::vector<onnx::NodeProto> nodes = {
+      ParityNode("ReduceMin", {"X"}, {"M"},
+                 {ParityIntsAttr("axes", {0}), ParityIntAttr("keepdims", 1)}),
+      ParityNode("ReduceMax", {"M"}, {"Y"},
+                 {ParityIntsAttr("axes", {1}), ParityIntAttr("keepdims", 0)}),
+  };
+  return RenderBackwardCase(nodes, {{"X", {2, 3}}, {"M", {1, 3}}, {"Y", {1}}});
+}
+
+std::vector<std::string> CaseBackwardLogSoftmaxCast() {
+  const std::vector<onnx::NodeProto> nodes = {
+      ParityNode("LogSoftmax", {"X"}, {"L"}, {ParityIntAttr("axis", 1)}),
+      ParityNode("Cast", {"L"}, {"Y"},
+                 {ParityIntAttr("to", onnx::TensorProto::DOUBLE)}),
+  };
+  return RenderBackwardCase(nodes,
+                            {{"X", {2, 3}}, {"L", {2, 3}}, {"Y", {2, 3}}});
+}
+
 const std::vector<std::pair<std::string, std::vector<std::string> (*)()>>&
 Cases() {
   static const std::vector<
@@ -398,6 +462,8 @@ Cases() {
       cases = {
           {"adam_update", CaseAdamUpdate},
           {"arithmetic", CaseArithmetic},
+          {"backward_logsoftmax_cast", CaseBackwardLogSoftmaxCast},
+          {"backward_reduce_extremes", CaseBackwardReduceExtremes},
           {"consts", CaseConsts},
           {"gather_rows", CaseGatherRows},
           {"masks_and_clip", CaseMasksAndClip},

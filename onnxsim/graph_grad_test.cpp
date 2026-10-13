@@ -202,6 +202,32 @@ Shapes AttentionishShapes() {
 }
 
 // The GELU-shaped transcendentals, ending in a rank change.
+// The ReduceMax/ReduceMin rule and the LogSoftmax/Cast rules, each on its own
+// slice so the allowlist sweep sees everything they emit.
+std::vector<onnx::NodeProto> ExtremumSlice() {
+  return {
+      Node("ReduceMax", {"A"}, {"M"},
+           {IntsAttr("axes", {1}), IntAttr("keepdims", 0)}),
+      Node("ReduceMin", {"A"}, {"N"},
+           {IntsAttr("axes", {0}), IntAttr("keepdims", 1)}),
+  };
+}
+
+Shapes ExtremumShapes() {
+  return {{"A", {2, 3}}, {"M", {2}}, {"N", {1, 3}}, {"Y", {2}}};
+}
+
+std::vector<onnx::NodeProto> LogSoftmaxCastSlice() {
+  return {
+      Node("LogSoftmax", {"A"}, {"L"}, {IntAttr("axis", 1)}),
+      Node("Cast", {"L"}, {"Y"}, {IntAttr("to", onnx::TensorProto::DOUBLE)}),
+  };
+}
+
+Shapes LogSoftmaxCastShapes() {
+  return {{"A", {2, 3}}, {"L", {2, 3}}, {"Y", {2, 3}}};
+}
+
 std::vector<onnx::NodeProto> TranscendentalSlice() {
   return {
       Node("Erf", {"A"}, {"E"}),
@@ -313,6 +339,7 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
   const std::set<std::string> expected = {"Add",
                                           "AveragePool",
                                           "BatchNormalization",
+                                          "Cast",
                                           "Clip",
                                           "Conv",
                                           "Div",
@@ -324,11 +351,14 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
                                           "InstanceNormalization",
                                           "LayerNormalization",
                                           "Log",
+                                          "LogSoftmax",
                                           "MatMul",
                                           "MaxPool",
                                           "Mul",
                                           "Neg",
+                                          "ReduceMax",
                                           "ReduceMean",
+                                          "ReduceMin",
                                           "ReduceSum",
                                           "Relu",
                                           "Reshape",
@@ -374,6 +404,8 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
       {ElementwiseSlice(), ElementwiseShapes(), {"A", "B", "C"}},
       {AttentionishSlice(), AttentionishShapes(), {"X", "W"}},
       {TranscendentalSlice(), TranscendentalShapes(), {"A"}},
+      {ExtremumSlice(), ExtremumShapes(), {"A"}},
+      {LogSoftmaxCastSlice(), LogSoftmaxCastShapes(), {"A"}},
       {GemmSlice(), GemmShapes(), {"A", "W", "Cb"}},
       {LayerNormSlice(), LayerNormShapes(), {"X", "S", "Bn"}},
       {BatchNormSlice(), BatchNormShapes(), {"X", "S", "Bn", "Mn", "Vr"}},
@@ -396,7 +428,7 @@ void TheEmittedBackwardStaysInsideTheOperatorAllowlist() {
     emitted.insert(types.begin(), types.end());
   }
   Check(emitted == BackwardOps(),
-        "the seven slices together should emit every allowlisted op and no "
+        "the slices together should emit every allowlisted op and no "
         "other; got {" +
             Join(emitted) + "}");
 }
@@ -1403,6 +1435,80 @@ void TheFloatTypeOfTheBuilderReachesEveryConstantAndMask() {
 
 }  // namespace
 
+// A max or min spreads its gradient over the tied extremes with a count, so
+// the emitted nodes must be the mask, the tie count and the division, in that
+// order, after the keepdims reshape. Pinned by op type, since the parity
+// fixture pins the names.
+void TheExtremumRuleEmitsTheMaskCountAndDivisionInOrder() {
+  GraphBuilder b("bw_");
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("ReduceMax", {"A"}, {"M"},
+           {IntsAttr("axes", {1}), IntAttr("keepdims", 0)})};
+  BuildBackward(b, nodes, {{"A", {2, 3}}, {"M", {2}}}, {{"M", "dM"}}, {"A"});
+  // M is [2] but the keepdims shape is [2, 1]: the forward output and the
+  // incoming gradient are each reshaped once. Then the mask is 1 - (x < m),
+  // the tie count is its sum, and the gradient is g / count * mask.
+  const std::vector<std::string> expected = {
+      "Reshape", "Reshape", "Less", "Cast", "Sub", "ReduceSum", "Div", "Mul"};
+  Check(OpTypes(b) == expected,
+        "ReduceMax should emit mask, tie count, then the even split");
+}
+
+void TheReduceMinRuleUsesTheOtherComparison() {
+  GraphBuilder b("bw_");
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("ReduceMin", {"A"}, {"M"},
+           {IntsAttr("axes", {0}), IntAttr("keepdims", 1)})};
+  BuildBackward(b, nodes, {{"A", {2, 3}}, {"M", {1, 3}}}, {{"M", "dM"}}, {"A"});
+  // keepdims=1 means no reshape. A min's non-extreme elements lie above m,
+  // so the mask compares with Greater, not Less.
+  const std::vector<std::string> expected = {"Greater",   "Cast", "Sub",
+                                             "ReduceSum", "Div",  "Mul"};
+  Check(OpTypes(b) == expected,
+        "ReduceMin should compare with Greater and skip the reshape");
+}
+
+void TheLogSoftmaxRuleEmitsItsDocumentedNodesInOrder() {
+  GraphBuilder b("bw_");
+  BuildBackward(b, {Node("LogSoftmax", {"A"}, {"L"}, {IntAttr("axis", 1)})},
+                {{"A", {2, 3}}, {"L", {2, 3}}}, {{"L", "dL"}}, {"A"});
+  // dx = g - exp(y) * sum(g): the sum, then exp(y), then the product, then
+  // the subtraction. No Cast is emitted for a LogSoftmax on its own.
+  const std::vector<std::string> expected = {"ReduceSum", "Exp", "Mul", "Sub"};
+  Check(OpTypes(b) == expected,
+        "LogSoftmax should emit sum, exp of the output, product, subtraction");
+}
+
+void ACastBackToFloatTypeIsEmittedAndOtherCastsAreRefused() {
+  // float32 -> float16 is differentiable: its gradient is cast back to the
+  // builder's float type.
+  GraphBuilder b("bw_");
+  BuildBackward(
+      b,
+      {Node("Cast", {"A"}, {"H"}, {IntAttr("to", onnx::TensorProto::FLOAT16)})},
+      {{"A", {2, 3}}, {"H", {2, 3}}}, {{"H", "dH"}}, {"A"});
+  Check(OpTypes(b) == std::vector<std::string>{"Cast"},
+        "a Cast to float16 should emit one Cast back to the builder's type");
+  Check(b.nodes().size() == 1 && b.nodes()[0].attribute_size() == 1 &&
+            b.nodes()[0].attribute(0).i() == onnx::TensorProto::FLOAT,
+        "the emitted Cast should target the builder's float type");
+
+  // A Cast to the builder's own float type cannot be told apart from a
+  // narrowing or an identity, and a Cast to an integer carries no gradient.
+  for (int32_t to : {static_cast<int32_t>(onnx::TensorProto::FLOAT),
+                     static_cast<int32_t>(onnx::TensorProto::INT64)}) {
+    GraphBuilder refused("bw_");
+    CheckThrows<UnsupportedOpError>(
+        [&] {
+          BuildBackward(refused,
+                        {Node("Cast", {"A"}, {"Y"}, {IntAttr("to", to)})},
+                        {{"A", {2, 3}}, {"Y", {2, 3}}}, {{"Y", "dY"}}, {"A"});
+        },
+        "not differentiated",
+        "a Cast to " + std::to_string(to) + " should be refused");
+  }
+}
+
 int main() {
   TheSupportedOpsAreExactlyThePythonRuleTable();
   TheBackwardOpsAreThePythonAllowlistAndSitInsideEpFriendlyOps();
@@ -1435,6 +1541,10 @@ int main() {
   AMissingShapeIsReportedRatherThanAssumed();
   AMultiOutputNodeIsRefused();
   TheFloatTypeOfTheBuilderReachesEveryConstantAndMask();
+  TheExtremumRuleEmitsTheMaskCountAndDivisionInOrder();
+  TheReduceMinRuleUsesTheOtherComparison();
+  TheLogSoftmaxRuleEmitsItsDocumentedNodesInOrder();
+  ACastBackToFloatTypeIsEmittedAndOtherCastsAreRefused();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);
