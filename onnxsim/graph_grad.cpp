@@ -1368,6 +1368,93 @@ std::vector<OptStr> GradSoftmax(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Mul(y, centred)};
 }
 
+std::vector<OptStr> GradReduceExtreme(Backward& ctx,
+                                      const onnx::NodeProto& node,
+                                      const std::string& g) {
+  // ReduceMax and ReduceMin. See _grad_reduce_extreme in graph_grad.py: the
+  // mask of arg-extreme elements is 1 - (x strictly beyond y), and the
+  // incoming gradient is split evenly over the tie count.
+  const std::string& x = node.input(0);
+  const std::string& y_out = node.output(0);
+  const Shape in_shape = ctx.ShapeOf(x);
+  const Shape out_shape = ctx.ShapeOf(y_out);
+  std::vector<OptStr> rest(static_cast<size_t>(node.input_size() - 1),
+                           std::nullopt);
+  const std::vector<int64_t> axes_list = ReducedAxes(node, in_shape, out_shape);
+  const std::set<int64_t> axes(axes_list.begin(), axes_list.end());
+  if (axes.empty()) {
+    std::vector<OptStr> grads{g};
+    grads.insert(grads.end(), rest.begin(), rest.end());
+    return grads;
+  }
+
+  Shape keepdims_shape = in_shape;
+  for (int64_t axis : axes) keepdims_shape[static_cast<size_t>(axis)] = 1;
+  std::string y = y_out;
+  std::string grad = g;
+  if (out_shape != keepdims_shape) {
+    const std::string shape_const = ctx.b().ConstInt64(keepdims_shape, "shape");
+    y = ctx.b().Op("Reshape", {y, shape_const}, "reshape");
+    grad = ctx.b().Op("Reshape", {grad, shape_const}, "reshape");
+  }
+
+  const std::string not_extreme = node.op_type() == "ReduceMax"
+                                      ? ctx.MaskLess(x, y)
+                                      : ctx.MaskGreater(x, y);
+  const std::string hit = ctx.b().Sub(ctx.b().Const(1.0f), not_extreme);
+  const std::string axes_const = ctx.b().ConstInt64(
+      std::vector<int64_t>(axes.begin(), axes.end()), "axes");
+  const std::string count = ctx.b().Op("ReduceSum", {hit, axes_const},
+                                       {IntAttr("keepdims", 1)}, "reducesum");
+  std::vector<OptStr> grads{ctx.b().Mul(ctx.b().Div(grad, count), hit)};
+  grads.insert(grads.end(), rest.begin(), rest.end());
+  return grads;
+}
+
+std::vector<OptStr> GradLogSoftmax(Backward& ctx, const onnx::NodeProto& node,
+                                   const std::string& g) {
+  // dx = g - exp(y) * sum(g) along the axis, written from the forward output
+  // y. See _grad_logsoftmax in graph_grad.py.
+  const std::string& y = node.output(0);
+  const int64_t rank = static_cast<int64_t>(ctx.ShapeOf(node.input(0)).size());
+  if (rank == 0) {
+    throw UnsupportedOpError("LogSoftmax over a rank-0 input (node " +
+                             Quoted(node.output(0)) + ") has no axis to sum");
+  }
+  const int64_t raw_axis = AttrInt(node, "axis", -1);
+  const int64_t axis = ((raw_axis % rank) + rank) % rank;
+  const std::string axes_const = ctx.b().ConstInt64({axis}, "axes");
+  const std::string total = ctx.b().Op("ReduceSum", {g, axes_const},
+                                       {IntAttr("keepdims", 1)}, "reducesum");
+  const std::string soft = ctx.b().Op("Exp", {y}, "exp");
+  return {ctx.b().Sub(g, ctx.b().Mul(soft, total))};
+}
+
+std::vector<OptStr> GradCast(Backward& ctx, const onnx::NodeProto& node,
+                             const std::string& g) {
+  // Cast between float types: the gradient is cast back to the builder's
+  // float type, which is the input's type under the same assumption
+  // graph_grad.py's _grad_cast states. See that docstring for the refusal
+  // of a Cast to the float type itself and for the rounding direction.
+  const int64_t to = AttrInt(node, "to", -1);
+  const int64_t input_type = ctx.b().float_type();
+  if ((to != onnx::TensorProto::FLOAT16 && to != onnx::TensorProto::FLOAT &&
+       to != onnx::TensorProto::DOUBLE) ||
+      to == input_type) {
+    throw UnsupportedOpError(
+        "Cast to " + std::to_string(to) + " is not differentiated here (node " +
+        Quoted(node.output(0)) +
+        "): only a Cast to a float type other than the builder's float type "
+        "is, because the input of a Cast is taken to be the builder's float "
+        "type and that cannot be checked for a Cast to that type itself");
+  }
+  std::vector<OptStr> grads{
+      ctx.b().Op("Cast", {g}, {IntAttr("to", input_type)}, "cast")};
+  grads.insert(grads.end(), static_cast<size_t>(node.input_size() - 1),
+               std::nullopt);
+  return grads;
+}
+
 std::vector<OptStr> GradLayerNormalization(Backward& ctx,
                                            const onnx::NodeProto& node,
                                            const std::string& g) {
@@ -2555,6 +2642,7 @@ const std::map<std::string, Rule>& Rules() {
           {"Add", &GradAddTemplated},
           {"AveragePool", &GradAveragePool},
           {"BatchNormalization", &GradBatchNormalizationTemplated},
+          {"Cast", &GradCast},
           {"Clip", &GradClip},
           {"Concat", &GradConcat},
           {"Conv", &GradConv},
@@ -2568,14 +2656,17 @@ const std::map<std::string, Rule>& Rules() {
           {"InstanceNormalization", &GradInstanceNormalization},
           {"LayerNormalization", &GradLayerNormalization},
           {"Log", &GradLogTemplated},
+          {"LogSoftmax", &GradLogSoftmax},
           {"Max", &GradMax},
           {"MatMul", &GradMatMul},
           {"MaxPool", &GradMaxPool},
           {"Min", &GradMin},
           {"Mul", &GradMulTemplated},
           {"Neg", &GradNegTemplated},
+          {"ReduceMax", &GradReduceExtreme},
           {"Pad", &GradPad},
           {"ReduceMean", &GradReduce},
+          {"ReduceMin", &GradReduceExtreme},
           {"ReduceSum", &GradReduce},
           {"Relu", &GradRelu},
           {"Reshape", &GradReshape},

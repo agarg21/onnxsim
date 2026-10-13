@@ -462,6 +462,58 @@ def _case_planner() -> Dict[str, Any]:
     return out
 
 
+def _case_backward_reduce_extremes() -> Dict[str, Any]:
+    """The ReduceMin and ReduceMax VJPs, as one backward walk.
+
+    The inner ReduceMin keeps dims, so its gradient needs no reshape; the
+    outer ReduceMax drops its axis, so its gradient takes the keepdims
+    reshape of both the forward output and the incoming gradient. That is
+    the path with the most reordering risk: one shape constant shared by two
+    Reshape nodes, emitted before the arg-extreme mask.
+    """
+    model = onnx.parser.parse_model(_BACKWARD_REDUCE_EXTREMES_TEXT)
+    shapes = {"X": [2, 3], "M": [1, 3], "Y": [1]}
+    b = qat_graph.GraphBuilder("bw_")
+    grads = graph_grad.build_backward(
+        b, list(model.graph.node), shapes, {"Y": "dY"}, ["X"]
+    )
+    out = _describe(b)
+    out["result"] = grads["X"]
+    return out
+
+
+def _case_backward_logsoftmax_cast() -> Dict[str, Any]:
+    """The LogSoftmax and float -> float Cast VJPs, as one backward walk.
+
+    The Cast is the output node, so its rule runs first and casts the
+    incoming gradient to float32 before LogSoftmax's rule reads it.
+    """
+    model = onnx.parser.parse_model(_BACKWARD_LOGSOFTMAX_CAST_TEXT)
+    shapes = {"X": [2, 3], "L": [2, 3], "Y": [2, 3]}
+    b = qat_graph.GraphBuilder("bw_")
+    grads = graph_grad.build_backward(
+        b, list(model.graph.node), shapes, {"Y": "dY"}, ["X"]
+    )
+    out = _describe(b)
+    out["result"] = grads["X"]
+    return out
+
+
+# Forward models for the two backward cases above. Their nodes and shapes are
+# mirrored by hand in onnxsim/qat_graph_parity_test.cpp; keep them in step.
+_BACKWARD_REDUCE_EXTREMES_TEXT = """<ir_version: 8, opset_import: ["": 17]>
+g (float[2,3] X) => (float[1] Y) {
+  M = ReduceMin <axes = [0], keepdims = 1> (X)
+  Y = ReduceMax <axes = [1], keepdims = 0> (M)
+}"""
+
+_BACKWARD_LOGSOFTMAX_CAST_TEXT = """<ir_version: 8, opset_import: ["": 17]>
+g (float[2,3] X) => (double[2,3] Y) {
+  L = LogSoftmax <axis = 1> (X)
+  Y = Cast <to = 11> (L)
+}"""
+
+
 CASES = {
     "arithmetic": _case_arithmetic,
     "masks_and_clip": _case_masks_and_clip,
@@ -472,6 +524,8 @@ CASES = {
     "sgd_momentum_update": _case_sgd_momentum_update,
     "step_graph": _case_step_graph,
     "planner": _case_planner,
+    "backward_reduce_extremes": _case_backward_reduce_extremes,
+    "backward_logsoftmax_cast": _case_backward_logsoftmax_cast,
 }
 
 

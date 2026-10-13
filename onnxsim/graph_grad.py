@@ -1864,6 +1864,112 @@ def _grad_softmax(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional
     return [ctx.b.mul(y, ctx.b.sub(g, total))]
 
 
+def _grad_reduce_extreme(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``ReduceMax`` and ``ReduceMin``: the gradient goes to the elements that
+    attain the extreme, split evenly among them when several tie.
+
+    The forward output ``y`` is the extreme of the reduced elements, so an
+    element is *not* an extreme exactly when it lies strictly beyond ``y``
+    (``x < y`` for a max, ``x > y`` for a min). ``hit = 1 - not_extreme`` is
+    therefore the 0/1 mask of the arg-extreme elements, and the tie count is
+    its sum over the reduced axes. Dividing the incoming gradient by that
+    count before multiplying by the mask is the even split -- the same
+    convention :func:`_grad_maxpool` uses for its own ties.
+
+    The tie count is computed at run time (a ``ReduceSum`` of the mask), not
+    as a build-time constant, so ties are split correctly for any input
+    values. ``NaN`` inputs are not handled: a comparison with ``NaN`` is
+    false, so such an element counts as an extreme.
+    """
+    x = node.input[0]
+    y = node.output[0]
+    in_shape = ctx.shape(x)
+    out_shape = ctx.shape(y)
+    rest: List[Optional[str]] = [None] * (len(node.input) - 1)
+    axes = sorted(set(_reduced_axes(node, in_shape, out_shape)))
+    if not axes:
+        return [g] + rest
+
+    keepdims_shape = tuple(1 if i in axes else d for i, d in enumerate(in_shape))
+    if out_shape != keepdims_shape:
+        shape = ctx.int64_const(keepdims_shape, "shape")
+        y = ctx.b.op("Reshape", [y, shape])
+        g = ctx.b.op("Reshape", [g, shape])
+
+    if node.op_type == "ReduceMax":
+        not_extreme = ctx.mask_less(x, y)
+    else:
+        not_extreme = ctx.mask_greater(x, y)
+    hit = ctx.b.sub(ctx.b.const(1.0), not_extreme)
+    count = ctx.b.op("ReduceSum", [hit, ctx.int64_const(axes, "axes")], keepdims=1)
+    return [ctx.b.mul(ctx.b.div(g, count), hit)] + rest
+
+
+def _grad_logsoftmax(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """``dx = g - exp(y) * sum(g)`` along the axis, with ``y`` the forward
+    output (``log_softmax(x)``, so ``exp(y)`` is the softmax).
+
+    Like :func:`_grad_softmax`, this reuses the forward output rather than
+    re-running the normalization. ``axis`` defaults to ``-1`` as it does for
+    :func:`_grad_softmax`, which is the opset-13 default. An opset-11-or-older
+    ``LogSoftmax`` defaults to axis 1, which this rule cannot see: such a node
+    must carry an explicit ``axis`` attribute, or it is differentiated along
+    axis -1 instead.
+    """
+    y = node.output[0]
+    rank = len(ctx.shape(node.input[0]))
+    if rank == 0:
+        raise UnsupportedOpError(
+            f"LogSoftmax over a rank-0 input (node {y!r}) has no axis to sum"
+        )
+    axis = int(_attr(node, "axis", -1)) % rank
+    total = ctx.b.op("ReduceSum", [g, ctx.int64_const([axis], "axes")], keepdims=1)
+    soft = ctx.b.op("Exp", [y])
+    return [ctx.b.sub(g, ctx.b.mul(soft, total))]
+
+
+# The float types a Cast rule accepts as an output. Non-float targets (ints,
+# bool) carry no gradient and are refused rather than silently passed through.
+_CAST_FLOAT_TYPES = (
+    onnx.TensorProto.FLOAT16,
+    onnx.TensorProto.FLOAT,
+    onnx.TensorProto.DOUBLE,
+)
+
+
+def _grad_cast(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``Cast`` between float types: the gradient is cast back to the input's
+    float type.
+
+    The rule needs the input's element type, and a shape alone does not carry
+    it. This module's builder is float32 (``qat_graph.GraphBuilder`` has no
+    other float type), so the input is taken to be float32, and the rule
+    refuses any Cast whose target is float32 itself -- there the input type
+    cannot be recovered, and guessing would emit a gradient of the wrong
+    dtype. The C++ mirror makes the same refusal against the builder's own
+    float type.
+
+    Direction of rounding: a Cast to a wider type (float32 -> float64) is
+    exact in the forward, and its backward narrows the gradient back to
+    float32, which rounds. A Cast to a narrower type (float32 -> float16)
+    rounds in the forward, and its backward widens the gradient exactly.
+    """
+    to = _attr(node, "to", None)
+    if to not in _CAST_FLOAT_TYPES or to == onnx.TensorProto.FLOAT:
+        raise UnsupportedOpError(
+            f"Cast to {to} is not differentiated here (node {node.output[0]!r}): "
+            "only a Cast to a float type other than float32 is, because the "
+            "input of a Cast is taken to be the builder's float32 and that "
+            "cannot be checked for a Cast to float32 itself"
+        )
+    rest: List[Optional[str]] = [None] * (len(node.input) - 1)
+    return [ctx.b.op("Cast", [g], to=onnx.TensorProto.FLOAT)] + rest
+
+
 def _grad_layer_normalization(
     ctx: _Backward, node: onnx.NodeProto, g: str
 ) -> List[Optional[str]]:
@@ -2896,11 +3002,18 @@ def _grad_div_templated(
     ]
 
 
+# Deliberately no ``Sin``/``Cos`` rules. Their VJPs need both ``cos(x)`` and
+# ``sin(x)``, and neither op is in :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS`,
+# so the rule would fall outside :data:`BACKWARD_OPS`. No op in that set
+# computes a trigonometric function, and ``cos(x)`` cannot be recovered from
+# ``sin(x)`` alone (the sign is lost), so there is no allowed-op formulation to
+# fall back on. ``Sin`` is the refusal the tests pin.
 _RULES: Dict[str, Rule] = {
     "Abs": _grad_abs,
     "Add": _grad_add_templated,
     "AveragePool": _grad_averagepool,
     "BatchNormalization": _grad_batch_normalization_templated,
+    "Cast": _grad_cast,
     "Clip": _grad_clip,
     "Concat": _grad_concat,
     "Conv": _grad_conv,
@@ -2914,14 +3027,17 @@ _RULES: Dict[str, Rule] = {
     "InstanceNormalization": _grad_instance_normalization,
     "LayerNormalization": _grad_layer_normalization,
     "Log": _grad_log_templated,
+    "LogSoftmax": _grad_logsoftmax,
     "Max": _grad_max,
     "MatMul": _grad_matmul,
     "MaxPool": _grad_maxpool,
     "Min": _grad_min,
     "Mul": _grad_mul_templated,
     "Neg": _grad_neg_templated,
+    "ReduceMax": _grad_reduce_extreme,
     "Pad": _grad_pad,
     "ReduceMean": _grad_reduce,
+    "ReduceMin": _grad_reduce_extreme,
     "ReduceSum": _grad_reduce,
     "Relu": _grad_relu,
     "Reshape": _grad_reshape,

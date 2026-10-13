@@ -3,7 +3,7 @@
 # Asserted against onnxsim/qat_graph.py (tests/test_qat_parity.py) and
 # against onnxsim/qat_graph_builder.cpp (onnxsim/qat_graph_parity_test.cpp).
 ops Abs,Add,Cast,Clip,Div,Exp,Gather,Greater,Identity,Less,MatMul,Mul,Neg,Pow,ReduceMean,ReduceSum,Reshape,Sigmoid,Sign,Sqrt,Sub,Transpose
-rules Abs,Add,AveragePool,BatchNormalization,Clip,Concat,Conv,Div,Erf,Exp,Expand,Gather,Gemm,Identity,InstanceNormalization,LayerNormalization,Log,MatMul,Max,MaxPool,Min,Mul,Neg,Pad,ReduceMean,ReduceSum,Relu,Reshape,Sigmoid,Slice,Softmax,Sqrt,Squeeze,Sub,Tanh,Transpose,Unsqueeze,Where
+rules Abs,Add,AveragePool,BatchNormalization,Cast,Clip,Concat,Conv,Div,Erf,Exp,Expand,Gather,Gemm,Identity,InstanceNormalization,LayerNormalization,Log,LogSoftmax,MatMul,Max,MaxPool,Min,Mul,Neg,Pad,ReduceMax,ReduceMean,ReduceMin,ReduceSum,Relu,Reshape,Sigmoid,Slice,Softmax,Sqrt,Squeeze,Sub,Tanh,Transpose,Unsqueeze,Where
 backward_ops Add,Cast,Div,Exp,Gather,Greater,Identity,Less,MatMul,Mul,Neg,ReduceMean,ReduceSum,Reshape,Sqrt,Sub,Transpose
 model_text <ir_version: 10, opset_import: ["" : 21]>
 model_text g (float[4,32] X) => (float[4,32] Y) {
@@ -45,6 +45,35 @@ case arithmetic
   node Mul [sigmoid_9,sigmoid_9] [mul_10] {}
   node ReduceMean [mul_10] [reducemean_11] {keepdims=0}
   result reducemean_11
+case backward_logsoftmax_cast
+  init bw_axes_2 7 [1] 1
+  node Cast [dY] [bw_cast_1] {to=1}
+  node ReduceSum [bw_cast_1,bw_axes_2] [bw_reducesum_3] {keepdims=1}
+  node Exp [L] [bw_exp_4] {}
+  node Mul [bw_exp_4,bw_reducesum_3] [bw_mul_5] {}
+  node Sub [bw_cast_1,bw_mul_5] [bw_sub_6] {}
+  result bw_sub_6
+case backward_reduce_extremes
+  init bw_shape_1 7 [2] 1,1
+  init bw_c_6 1 [] 0x3f800000
+  init bw_axes_8 7 [1] 1
+  init bw_c_14 1 [] 0x3f800000
+  init bw_axes_16 7 [1] 0
+  node Reshape [Y,bw_shape_1] [bw_reshape_2] {}
+  node Reshape [dY,bw_shape_1] [bw_reshape_3] {}
+  node Less [M,bw_reshape_2] [bw_less_4] {}
+  node Cast [bw_less_4] [bw_cast_5] {to=1}
+  node Sub [bw_c_6,bw_cast_5] [bw_sub_7] {}
+  node ReduceSum [bw_sub_7,bw_axes_8] [bw_reducesum_9] {keepdims=1}
+  node Div [bw_reshape_3,bw_reducesum_9] [bw_div_10] {}
+  node Mul [bw_div_10,bw_sub_7] [bw_mul_11] {}
+  node Greater [X,M] [bw_greater_12] {}
+  node Cast [bw_greater_12] [bw_cast_13] {to=1}
+  node Sub [bw_c_14,bw_cast_13] [bw_sub_15] {}
+  node ReduceSum [bw_sub_15,bw_axes_16] [bw_reducesum_17] {keepdims=1}
+  node Div [bw_mul_11,bw_reducesum_17] [bw_div_18] {}
+  node Mul [bw_div_18,bw_sub_15] [bw_mul_19] {}
+  result bw_mul_19
 case consts
   init pre_c_1 1 [] 0x3f000000
   init pre_c_2 1 [2,2] 0x3f800000,0x40000000,0x40400000,0x40800000

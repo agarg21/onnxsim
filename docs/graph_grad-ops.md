@@ -35,6 +35,7 @@ templatable but deliberately are not.
 | `Add` | `da = db = g`, broadcast-reduced | Y | `_grad_add_templated` (ref: `_grad_add`) | `GradAddTemplated` (ref: `GradAdd`) |
 | `AveragePool` | col2im of `g`, scaled by each window's `1/count` | | `_grad_averagepool` | `GradAveragePool` |
 | `BatchNormalization` | `xhat`/`inv`-based; the rule whose hand-written `dvar` factor motivated the whole templating effort | Y | `_grad_batch_normalization_templated` (ref: `_grad_batch_normalization`) | `GradBatchNormalizationTemplated` (ref: `GradBatchNormalization`) |
+| `Cast` | float -> float only: `g` cast back to the builder's float type (float32 in Python). A widening Cast's VJP rounds to float32; a narrowing one's is exact. Refused for a Cast to float32 itself or to a non-float type | | `_grad_cast` | `GradCast` |
 | `Clip` | `g` where `lo < x < hi` (strict), `0` elsewhere | | `_grad_clip` | `GradClip` |
 | `Concat` | one `Gather` per input, pulling that input's own contiguous slice of `g` back out along the concat axis (`Split`'s adjoint, reached the other way); every input's offset and width is static | `_grad_concat` | `GradConcat` |
 | `Conv` | `dX`/`dW` as im2col/col2im `MatMul`s (never a `Conv`/`ConvTranspose` of its own), `dB = sum(g)` | | `_grad_conv` | `GradConv` |
@@ -48,14 +49,17 @@ templatable but deliberately are not.
 | `InstanceNormalization` | `LayerNormalization`'s shape, reduced over spatial axes only | | `_grad_instance_normalization` | `GradInstanceNormalization` |
 | `LayerNormalization` | `xhat`-based `dx`/`dscale`/`dbias` | | `_grad_layer_normalization` | `GradLayerNormalization` |
 | `Log` | `dx = g/x` (singular at `x = 0`, genuinely) | Y | `_grad_log_templated` (ref: `_grad_log`) | `GradLogTemplated` (ref: `GradLog`) |
+| `LogSoftmax` | `dx = g - exp(y)·Σ(g)` along the axis (reuses `y`) | | `_grad_logsoftmax` | `GradLogSoftmax` |
 | `MatMul` | `dA = g @ Bᵀ`, `dB = Aᵀ @ g` | | `_grad_matmul` | `GradMatMul` |
 | `Max` | two inputs only: `g` to the selected input, `1/2` each on an exact tie; broadcasting undone by `reduce_to`; a variadic `Max` is refused | | `_grad_max` | `GradMax` |
 | `MaxPool` | col2im, credit split among tied maxima | | `_grad_maxpool` | `GradMaxPool` |
 | `Min` | two inputs only: `g` to the selected input, `1/2` each on an exact tie; broadcasting undone by `reduce_to`; a variadic `Min` is refused | | `_grad_min` | `GradMin` |
 | `Mul` | `da = g·b`, `db = g·a` | Y | `_grad_mul_templated` (ref: `_grad_mul`) | `GradMulTemplated` (ref: `GradMul`) |
 | `Neg` | `dx = -g` | Y | `_grad_neg_templated` (ref: `_grad_neg`) | `GradNegTemplated` (ref: `GradNeg`) |
+| `ReduceMax` | `g` to the arg-max elements, split evenly over ties (mask from `x < y`, count by `ReduceSum`) | | `_grad_reduce_extreme` | `GradReduceExtreme` |
 | `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only, a constant scalar `constant_value` gets no gradient | `_grad_pad` | `GradPad` |
 | `ReduceMean` | `g` broadcast back, scaled by `1/N` | | `_grad_reduce` | `GradReduce` |
+| `ReduceMin` | as `ReduceMax`, with the mask from `x > y` | | `_grad_reduce_extreme` | `GradReduceExtreme` |
 | `ReduceSum` | `g` broadcast back, unscaled | | `_grad_reduce` | `GradReduce` |
 | `Relu` | `dx = g · (x > 0)` -- **not** templated; see below | | `_grad_relu` | `GradRelu` |
 | `Reshape` | `g` reshaped back to the input's own shape | | `_grad_reshape` | `GradReshape` |

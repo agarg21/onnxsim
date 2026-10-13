@@ -107,7 +107,12 @@ def _as_double(model: onnx.ModelProto) -> onnx.ModelProto:
     return doubled
 
 
-def _backward_model(model: onnx.ModelProto, targets, seed_name="dY"):
+def _backward_model(
+    model: onnx.ModelProto,
+    targets,
+    seed_name="dY",
+    seed_type=onnx.TensorProto.FLOAT,
+):
     """``model``'s forward nodes followed by the emitted backward, as one
     graph whose outputs are the requested gradients.
 
@@ -161,9 +166,7 @@ def _backward_model(model: onnx.ModelProto, targets, seed_name="dY"):
             )
         )
     inputs = list(model.graph.input) + [
-        onnx.helper.make_tensor_value_info(
-            seed_name, onnx.TensorProto.FLOAT, shapes[output]
-        )
+        onnx.helper.make_tensor_value_info(seed_name, seed_type, shapes[output])
     ]
     graph = onnx.helper.make_graph(
         nodes,
@@ -498,6 +501,51 @@ _CASES = {
         """
         g (float[3,4] A) => (float[3,4] Y) {
           Y = Softmax (A)
+        }
+        """,
+        None,
+    ),
+    # ReduceMax/ReduceMin with random (tie-free) inputs: the arg-extreme
+    # is unique almost surely, so the finite difference is a clean
+    # reference here. Ties are checked exactly below, where the central
+    # difference is not a valid reference (it gives 1/2 per tied element,
+    # not 1/k for k ties).
+    "reducemax_all": (
+        """
+        g (float[3,4] A) => (float Y) {
+          Y = ReduceMax <keepdims = 0> (A)
+        }
+        """,
+        None,
+    ),
+    "reducemax_axis1_keepdims": (
+        """
+        g (float[3,4] A) => (float[3,1] Y) {
+          Y = ReduceMax <axes = [1], keepdims = 1> (A)
+        }
+        """,
+        None,
+    ),
+    "reducemin_axis0": (
+        """
+        g (float[3,4] A) => (float[4] Y) {
+          Y = ReduceMin <axes = [0], keepdims = 0> (A)
+        }
+        """,
+        None,
+    ),
+    "logsoftmax_last_axis": (
+        """
+        g (float[3,4] A) => (float[3,4] Y) {
+          Y = LogSoftmax (A)
+        }
+        """,
+        None,
+    ),
+    "logsoftmax_axis0": (
+        """
+        g (float[3,4] A) => (float[3,4] Y) {
+          Y = LogSoftmax <axis = 0> (A)
         }
         """,
         None,
@@ -2759,6 +2807,28 @@ def test_reduce_mean_over_a_dynamic_axis_is_refused():
         )
 
 
+def _emitted_casts(backward):
+    """The Cast nodes the backward builder emitted, not the forward's own
+    (the builder names every node it emits with its ``bw_`` prefix)."""
+    return [
+        n
+        for n in backward.graph.node
+        if n.op_type == "Cast" and n.output[0].startswith("bw_")
+    ]
+
+
+def _analytic(model, feeds, seed, target, seed_type=onnx.TensorProto.FLOAT):
+    """The emitted backward's gradient of ``model``'s output w.r.t.
+    ``target``, run through onnxruntime. ``seed`` is the incoming gradient
+    of the output, fed as-is."""
+    backward = _backward_model(model, [target], seed_type=seed_type)
+    session = ort.InferenceSession(
+        backward.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (grad,) = session.run([f"grad_{target}"], dict(feeds, dY=seed))
+    return grad
+
+
 # The structural rules (Slice, Concat, Pad, Expand, Squeeze, Unsqueeze) are
 # checked against finite differences above, and against hand-derived values
 # here. Finite differences show the gradient is the derivative; the exact
@@ -2774,6 +2844,194 @@ def _gradient_of(model, target, feeds, seed):
     )
     (grad,) = session.run([f"grad_{target}"], dict(feeds, dY=seed))
     return grad
+
+
+# Ties for ReduceMax/ReduceMin. The expected gradients are written out by
+# hand: the arg-extreme elements of each reduced group share the incoming
+# gradient evenly, so a group with k ties gives each of them 1/k.
+@pytest.mark.parametrize(
+    "op,values,seed,expected",
+    [
+        (
+            "ReduceMax",
+            # Row 0: max 3 tied twice. Row 1: max 2 tied twice. Row 2: all
+            # three tied at 5.
+            [[1.0, 3.0, 3.0], [2.0, 2.0, 0.0], [5.0, 5.0, 5.0]],
+            [1.0, 2.0, 3.0],
+            [[0.0, 0.5, 0.5], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]],
+        ),
+        (
+            "ReduceMin",
+            [[4.0, 1.0, 1.0], [2.0, 2.0, 3.0], [0.0, 0.0, 0.0]],
+            [1.0, 2.0, 3.0],
+            [[0.0, 0.5, 0.5], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]],
+        ),
+    ],
+)
+def test_reduce_max_and_min_split_a_tie_evenly(op, values, seed, expected):
+    model = _model(
+        f"""
+        g (float[3,3] A) => (float[3] Y) {{
+          Y = {op} <axes = [1], keepdims = 0> (A)
+        }}
+        """
+    )
+    feeds = {"A": np.asarray(values, dtype=np.float32)}
+    got = _analytic(model, feeds, np.asarray(seed, dtype=np.float32), "A")
+    np.testing.assert_allclose(got, np.asarray(expected, dtype=np.float32), atol=1e-7)
+
+
+def test_reduce_max_over_a_fully_tied_tensor_splits_across_all_elements():
+    """All four elements tie, so each takes a quarter of the gradient --
+    the k-way case the central difference cannot be used to check."""
+    model = _model(
+        """
+        g (float[2,2] A) => (float Y) {
+          Y = ReduceMax <keepdims = 0> (A)
+        }
+        """
+    )
+    feeds = {"A": np.full((2, 2), 7.0, dtype=np.float32)}
+    got = _analytic(model, feeds, np.asarray(8.0, dtype=np.float32), "A")
+    np.testing.assert_allclose(got, np.full((2, 2), 2.0, dtype=np.float32))
+
+
+def test_reduce_max_gradient_sums_to_the_seed_per_reduced_group():
+    """Each reduced group passes exactly its own incoming gradient on, however
+    many elements tie: the gradients in a group sum to the seed."""
+    model = _model(
+        """
+        g (float[4,3] A) => (float[4] Y) {
+          Y = ReduceMax <axes = [1], keepdims = 0> (A)
+        }
+        """
+    )
+    rng = np.random.default_rng(3)
+    values = rng.integers(0, 3, size=(4, 3)).astype(np.float32)
+    seed = rng.standard_normal(4).astype(np.float32)
+    got = _analytic(model, {"A": values}, seed, "A")
+    np.testing.assert_allclose(got.sum(axis=1), seed, rtol=1e-6, atol=1e-6)
+
+
+# LogSoftmax against the Softmax-based identity log_softmax(x) = log(softmax(x)).
+# Two independent emissions -- the new LogSoftmax rule, and the existing
+# Softmax rule chained through the existing Log rule -- must produce the same
+# gradient for the same forward value.
+@pytest.mark.parametrize("axis", [-1, 0])
+def test_logsoftmax_gradient_matches_log_of_softmax(axis):
+    direct = _model(
+        f"""
+        g (float[3,4] A) => (float[3,4] Y) {{
+          Y = LogSoftmax <axis = {axis}> (A)
+        }}
+        """
+    )
+    via_softmax = _model(
+        f"""
+        g (float[3,4] A) => (float[3,4] Y) {{
+          S = Softmax <axis = {axis}> (A)
+          Y = Log (S)
+        }}
+        """
+    )
+    rng = np.random.default_rng(11)
+    feeds = {"A": rng.standard_normal((3, 4)).astype(np.float32)}
+    seed = rng.standard_normal((3, 4)).astype(np.float32)
+    np.testing.assert_allclose(
+        _analytic(direct, feeds, seed, "A"),
+        _analytic(via_softmax, feeds, seed, "A"),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+def test_cast_to_double_gradient_is_cast_back_to_float32_with_rounding():
+    """A float32 -> float64 Cast is exact in the forward; its VJP narrows the
+    incoming float64 gradient to float32, which rounds. So the gradient is
+    the float32 nearest the seed, exactly -- the one place the rounding is
+    visible, and it is the rounding the emitted Cast actually does."""
+    model = _model(
+        """
+        g (float[2,3] A) => (double[2,3] Y) {
+          Y = Cast <to = 11> (A)
+        }
+        """
+    )
+    backward = _backward_model(model, ["A"], seed_type=onnx.TensorProto.DOUBLE)
+    casts = _emitted_casts(backward)
+    assert [n.attribute[0].i for n in casts] == [onnx.TensorProto.FLOAT]
+    rng = np.random.default_rng(5)
+    seed = rng.standard_normal((2, 3))
+    got = _analytic(
+        model,
+        {"A": rng.standard_normal((2, 3)).astype(np.float32)},
+        seed,
+        "A",
+        seed_type=onnx.TensorProto.DOUBLE,
+    )
+    np.testing.assert_array_equal(got, seed.astype(np.float32))
+
+
+def test_cast_round_trip_through_double_matches_the_analytic_square():
+    """``y = (double(x))**2``: the Cast sits inside a chain whose derivative is
+    known in closed form, ``2 x seed``. The gradient is correct to float32
+    precision, which is what the narrowing back to float32 leaves."""
+    model = _model(
+        """
+        g (float[2,3] A) => (double[2,3] Y) {
+          D = Cast <to = 11> (A)
+          Y = Mul (D, D)
+        }
+        """
+    )
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal((2, 3)).astype(np.float32)
+    seed = rng.standard_normal((2, 3))
+    got = _analytic(model, {"A": x}, seed, "A", seed_type=onnx.TensorProto.DOUBLE)
+    expected = 2.0 * x.astype(np.float64) * seed
+    np.testing.assert_allclose(got, expected.astype(np.float32), rtol=1e-6, atol=1e-6)
+
+
+def test_cast_to_float16_gradient_is_widened_exactly():
+    """A narrowing Cast (float32 -> float16) rounds in the forward; its VJP
+    widens the gradient back to float32, which is exact. The emitted node is
+    the widening Cast, with no other op."""
+    model = _model(
+        """
+        g (float[2,3] A) => (float16[2,3] Y) {
+          Y = Cast <to = 10> (A)
+        }
+        """
+    )
+    backward = _backward_model(model, ["A"])
+    casts = _emitted_casts(backward)
+    assert [n.attribute[0].i for n in casts] == [onnx.TensorProto.FLOAT]
+
+
+@pytest.mark.parametrize(
+    "to,type_name",
+    [
+        (onnx.TensorProto.FLOAT, "float"),
+        (onnx.TensorProto.INT64, "int64"),
+        (onnx.TensorProto.BOOL, "bool"),
+    ],
+)
+def test_a_cast_this_rule_cannot_invert_is_refused(to, type_name):
+    """A Cast to float32 leaves the input type unknowable (see
+    ``graph_grad._grad_cast``), and a Cast to a non-float type carries no
+    gradient. Both are refused rather than guessed."""
+    forward = _model(
+        f"""
+        g (float[2,3] A) => ({type_name}[2,3] Y) {{
+          Y = Cast <to = {to}> (A)
+        }}
+        """
+    )
+    b = qat_graph.GraphBuilder()
+    with pytest.raises(graph_grad.UnsupportedOpError, match="not differentiated"):
+        graph_grad.build_backward(
+            b, list(forward.graph.node), _static_shapes(forward), {"Y": "dY"}, ["A"]
+        )
 
 
 def test_a_strided_slice_scatters_the_seed_to_the_strided_positions():
