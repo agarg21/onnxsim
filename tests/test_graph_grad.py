@@ -2566,6 +2566,11 @@ def _analytic(model, feeds, seed, target, seed_type=onnx.TensorProto.FLOAT):
     ``target``, run through onnxruntime. ``seed`` is the incoming gradient
     of the output, fed as-is."""
     backward = _backward_model(model, [target], seed_type=seed_type)
+    session = ort.InferenceSession(
+        backward.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (grad,) = session.run([f"grad_{target}"], dict(feeds, dY=seed))
+    return grad
 
 
 # The structural rules (Slice, Concat, Pad, Expand, Squeeze, Unsqueeze) are
