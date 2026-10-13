@@ -96,7 +96,7 @@ def _decomposed_layernorm(affine=False, opset=17):
           y = Add(scaled, beta)
         }}
         """)
-    # Kept as numpy-built initializers per this repo's CLAUDE.md guidance --
+    # Kept as numpy-built initializers per this repo's AGENTS.md guidance --
     # the parser encodes tensor literals as `float_data`, byte-different
     # from a `numpy_helper.from_array` tensor, which does not matter here
     # but matches this project's established convention regardless.

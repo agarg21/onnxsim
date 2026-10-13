@@ -6,7 +6,7 @@ records this as the fix for the one op ``onnxsim.graph_grad`` emits that is
 absent from a real NPU's op-support list). Usable from any binding via
 ``extra_optimizers=["neg_to_mul"]``.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention. Numeric
+Models are built with ``onnx.parser`` per AGENTS.md's convention. Numeric
 equivalence comes from ``onnxsim.simplify``'s own ``check_n``.
 """
 

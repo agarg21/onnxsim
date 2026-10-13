@@ -1,7 +1,7 @@
 """Tests for the opt-in ``rewrite_gathernd_to_gather`` pass.
 
 Every model is a single ``GatherND`` node, built with the ONNX text format
-parser (``onnx.parser``) per CLAUDE.md's convention for this repo's tests.
+parser (``onnx.parser``) per AGENTS.md's convention for this repo's tests.
 Rewriting models are run through ``onnxsim.simplify(...,
 extra_optimizers=["rewrite_gathernd_to_gather"])``, which numerically
 equivalence-checks the rewritten graph against the original ``GatherND`` node

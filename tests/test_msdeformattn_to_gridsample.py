@@ -37,7 +37,7 @@ default ``import_custom_schemas=True`` then bridges it into onnxsim's own
 schema registry.
 
 Models are built with the ONNX text format parser (``onnx.parser``), per
-CLAUDE.md's convention for this repo's tests.
+AGENTS.md's convention for this repo's tests.
 """
 
 import collections

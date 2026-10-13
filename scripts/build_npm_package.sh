@@ -11,5 +11,5 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd)
 
 cd "$ROOT_DIR"
-ORT_WEB=ON "$ROOT_DIR/build_wasm.sh"
+ORT_WEB=ON "$SCRIPT_DIR/build_wasm.sh"
 "$SCRIPT_DIR/stage_npm_package.sh"

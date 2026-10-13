@@ -971,7 +971,7 @@ _CASES = {
     ),
     # Gather: an embedding lookup. `idx` is a text-literal int64 initializer,
     # not a graph input -- `_feeds` only ever produces random float32, so an
-    # integer index has to be spelled as a constant the way CLAUDE.md's
+    # integer index has to be spelled as a constant the way AGENTS.md's
     # guidance describes, and it also means `data` is the only graph input,
     # so it is the only (and therefore the default) differentiation target.
     "gather_embedding": (

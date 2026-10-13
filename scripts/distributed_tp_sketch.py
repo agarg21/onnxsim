@@ -15,7 +15,7 @@ gradient against an independent computation rather than trusting it.
    This graph is built and printed for inspection only -- it is never run.
    Running it for real needs an onnxruntime build compiled with
    ``--enable_training --use_nccl``, which is nowhere close to what
-   ``pip install onnxruntime`` gives you (see this repo's own ``CLAUDE.md``:
+   ``pip install onnxruntime`` gives you (see this repo's own ``AGENTS.md``:
    even the *wheel build* of onnxsim itself never compiles ONNX Runtime, let
    alone a training+NCCL one), and it needs an actual multi-GPU NCCL fabric
    besides. Neither exists in a sandbox, so this half exists purely so the

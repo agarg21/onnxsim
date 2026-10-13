@@ -10,7 +10,7 @@
 // ../distill_step_graph/step_graph_runner.test.mjs's own convention --
 // `npm install` in this directory to run it for real. The Python-side
 // pieces (the generator and the aggregator) need onnxsim's own C++
-// extension built (see the repo's CLAUDE.md) -- this test does not attempt
+// extension built (see the repo's AGENTS.md) -- this test does not attempt
 // to build it, only to run it.
 //
 // Usage:

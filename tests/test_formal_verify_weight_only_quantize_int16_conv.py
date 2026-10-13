@@ -112,7 +112,7 @@ consumer need not be Lipschitz, so a bound on
 ``|consumer(Conv(X, W)) - consumer(Conv(X, Wdq))|``.
 
 Differential tests build a plain float ``Conv`` (and a bias variant) via
-``onnx.parser`` (per ``CLAUDE.md``), run the real pass alone via
+``onnx.parser`` (per ``AGENTS.md``), run the real pass alone via
 ``simplify_isolated_extra`` (and, for the numeric-bound check, via
 :func:`onnxsim.quantize_weight_only_int16`), and confirm: the exact
 ``Conv(X, DequantizeLinear(Wq, Ws, axis=0))`` chain fires; ``Wq`` is truly

@@ -67,7 +67,7 @@ onnx::ModelProto ApplyAttentionHeadPruning(
 // runtime), the C++ port of pruning.py's own
 // `apply_moe_expert_channel_pruning`. `num_experts` (whole-expert pruning,
 // which needs runtime calibration data this build has no ONNX Runtime to
-// provide -- see CLAUDE.md) is out of scope; see
+// provide -- see AGENTS.md) is out of scope; see
 // structured_pruning_entry.cpp's own "MoE (com.microsoft::MoE) expert-
 // intermediate-channel pruning" section comment for the full scope and
 // safety argument.

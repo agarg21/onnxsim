@@ -4,7 +4,7 @@ Every model is built via ``onnx.helper`` (not ``onnx.parser``): these models
 need real float initializer data -- Conv/Gemm weights permuted at generation
 time, whose exact byte-for-byte correctness this file checks against a
 NumPy-computed expected permutation -- and the ONNX text format's tensor
-literals are ``float_data``, not ``raw_data`` (see CLAUDE.md's own carve-out
+literals are ``float_data``, not ``raw_data`` (see AGENTS.md's own carve-out
 for exactly this case).
 
 These are structural/unit tests only: they inspect the generated C *text*

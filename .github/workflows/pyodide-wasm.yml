@@ -6,7 +6,7 @@
 # toolchain pinning below, and its Status section for what is/isn't verified.
 #
 # This is a THIRD, separate build path from the Python wheel (setup.py) and
-# the standalone WASM CLI (build_wasm.sh / static.yml) -- see CLAUDE.md and
+# the standalone WASM CLI (build_wasm.sh / static.yml) -- see AGENTS.md and
 # build_wasm_pyodide.sh's own header comment. It does not touch either.
 #
 # Toolchain pins, and why (see docs/wasm_pyodide.md for the full detail):
@@ -34,7 +34,7 @@ on:
   pull_request:
     paths: &pyodide-wasm-paths
       - ".github/workflows/pyodide-wasm.yml"
-      - "build_wasm_pyodide.sh"
+      - "scripts/build_wasm_pyodide.sh"
       - "docs/wasm_pyodide.md"
       - "scripts/pyodide_smoke_test.mjs"
       - "scripts/pyodide_demo/**"
@@ -166,7 +166,7 @@ jobs:
         run: |
           . ./emsdk/emsdk_env.sh
           export PYTHON_EXECUTABLE=python3
-          ./build_wasm_pyodide.sh
+          ./scripts/build_wasm_pyodide.sh
           echo "SO_PATH=${PWD}/build-wasm-pyodide/onnxsim_cpp2py_export.abi3.so" >> "$GITHUB_ENV"
 
       - name: ccache statistics

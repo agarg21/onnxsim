@@ -38,7 +38,7 @@
 // under nas_search_candidates/ are pre-generated, committed fixtures --
 // `python3 ../../../tools/onnx-finetune/scripts/generate_nas_step_graphs.py
 // -o test/nas_search_candidates --batch-size 32 --dim 16 --out 8`, run once
-// with onnxsim's own C++ extension built (see the repo's CLAUDE.md) and the
+// with onnxsim's own C++ extension built (see the repo's AGENTS.md) and the
 // result checked in, exactly like sibling fixtures
 // step_train_loop_demo.onnx/.json.
 //

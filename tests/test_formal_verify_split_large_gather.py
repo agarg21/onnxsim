@@ -183,7 +183,7 @@ def test_split_large_gather_chunk_selection_is_load_bearing():
 
 def _gather_model(data_sig, out_rank, ga, indices):
     # `indices` is attached as a numpy-built initializer after parsing (per
-    # CLAUDE.md: large/constant arrays are built programmatically, not
+    # AGENTS.md: large/constant arrays are built programmatically, not
     # spelled out as ONNX text literals) -- and it must be a genuine
     # initializer (not e.g. a same-shaped graph input) so onnxsim's own
     # random-sample equivalence check (run by `simplify_isolated_extra`)

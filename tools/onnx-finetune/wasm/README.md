@@ -140,12 +140,12 @@ the top of this file for the separate `distill_step_graph/` runner).
 
 Requires `emcmake`/`emcc` (from emsdk) and a host `protoc` binary (protobuf's
 codegen runs on the host during a cross build, same requirement as
-`../../build_wasm.sh` has for onnxsim itself):
+`../../scripts/build_wasm.sh` has for onnxsim itself):
 
 ```sh
 # from an onnxruntime source checkout with training support (same one used
 # for the native build, see ../README.md)
-PROTOC=$(which protoc)  # or build one, see ../../build_wasm.sh
+PROTOC=$(which protoc)  # or build one, see ../../scripts/build_wasm.sh
 
 emcmake cmake -B build \
   -DORT_SOURCE_DIR=/path/to/onnxruntime \

@@ -38,7 +38,7 @@ on:
     # wasm module and never touches them.
     paths: &static-paths
       - ".github/workflows/static.yml"
-      - "build_wasm.sh"
+      - "scripts/build_wasm.sh"
       - "CMakeLists.txt"
       - "cmake/**"
       - "onnxsim/**"
@@ -217,7 +217,7 @@ jobs:
           ./emsdk/emsdk install ${EMSCRIPTEN_VERSION}
           ./emsdk/emsdk activate ${EMSCRIPTEN_VERSION}
           . ./emsdk/emsdk_env.sh
-          EMPROFILE=1 ORT_WEB=ON ./build_wasm.sh
+          EMPROFILE=1 ORT_WEB=ON ./scripts/build_wasm.sh
           rm scripts/convertmodel/onnxsim.*
           cp build-wasm-node-OFF-ortweb/onnxsim.* scripts/convertmodel
       # Surface ccache statistics on the run's summary page, the same way

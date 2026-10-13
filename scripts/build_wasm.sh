@@ -11,7 +11,8 @@ WITH_NODE_RAW_FS=${1:-OFF}
 # (see docs/wasm_ort_web.md). It needs no ONNX Runtime source and no ORT compile.
 ORT_WEB=${ORT_WEB:-OFF}
 
-cd $SCRIPT_DIR
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd)
+cd "$ROOT_DIR"
 if which protoc ; then
     PROTOC=$(which protoc)
 else

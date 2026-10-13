@@ -118,7 +118,7 @@ confirming an ``inner`` not divisible by 32 makes the Conv survive
 completely untouched (not merely "quantized differently").
 
 Differential tests build a plain float ``Conv`` (rank >= 3 weight) via
-``onnx.parser`` (per ``CLAUDE.md``) at opset 21 (``DequantizeLinear``'s
+``onnx.parser`` (per ``AGENTS.md``) at opset 21 (``DequantizeLinear``'s
 ``block_size`` attribute needs it -- confirmed from
 ``patternMatchPredicate``'s own ``opset < 21`` check, the same floor as the
 INT4 Conv pass even though plain per-channel INT8 needs only opset 13),

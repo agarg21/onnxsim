@@ -293,7 +293,7 @@ def _lstm_model(seq=5, batch=2, inp=3, hid=4, with_bias=True, with_state=True):
 
     Built with `onnx.helper` rather than the text format: the parser has no
     syntax for an omitted optional input (`LSTM`'s `sequence_lens`, skipped
-    here via `''` at the protobuf level) -- the CLAUDE.md-documented
+    here via `''` at the protobuf level) -- the AGENTS.md-documented
     exception for a case the text form cannot express.
     """
     rng = np.random.RandomState(0)

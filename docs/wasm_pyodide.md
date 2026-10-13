@@ -41,7 +41,7 @@ This is a **third** build path, separate from and not touching:
 
 - **The Python wheel build** (`setup.py`) -- builds the same extension for
   the *host* platform, always with `ONNXSIM_BUILTIN_ORT=OFF`. See
-  `CLAUDE.md` for why this never compiles ONNX Runtime.
+  `AGENTS.md` for why this never compiles ONNX Runtime.
 - **The standalone WASM CLI build** (`build_wasm.sh`) -- builds
   `onnxsim_bin`, a self-contained CLI/JS module for the browser, with
   `ONNXSIM_PYTHON=OFF`.
@@ -174,7 +174,7 @@ source /path/to/matching/emsdk/emsdk_env.sh
 
 PYODIDE_PYTHON_INCLUDE=/path/to/xbuildenv/.../include/python3.13 \
 PYTHON_EXECUTABLE=/path/to/host/python3.13 \
-  ./build_wasm_pyodide.sh
+  ./scripts/build_wasm_pyodide.sh
 ```
 
 `PYTHON_EXECUTABLE` needs `nanobind` pip-installed (`pip install nanobind`);

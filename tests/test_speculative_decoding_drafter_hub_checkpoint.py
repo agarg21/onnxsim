@@ -2,7 +2,7 @@
 ``tests/test_speculative_decoding_drafter_torch_export.py``: those two build
 a synthetic, EAGLE3-shaped graph (by hand, and via a real ``torch.onnx.export``
 respectively) at a tiny 32-dim size kept as literal test code per this repo's
-convention (see CLAUDE.md). This file instead downloads and exercises an
+convention (see AGENTS.md). This file instead downloads and exercises an
 actual **published** EAGLE3 drafter checkpoint from the Hugging Face Hub --
 ``AngelSlim/Qwen3-1.7B_eagle3`` (paired with the real Qwen3-1.7B target
 model) -- the smallest real EAGLE3 checkpoint found on the Hub at the time

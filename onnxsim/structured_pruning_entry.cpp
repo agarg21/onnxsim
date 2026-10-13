@@ -15640,7 +15640,7 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
 //     after ApplyQMoEExpertChannelPruning below, via the same DLPack
 //     ModelExecutor-bridge pattern ApplyStructuredWandaPruning established
 //     (see this file's own "MoE whole-expert pruning" section comment) --
-//     the C++ core still links no ONNX Runtime of its own (see CLAUDE.md:
+//     the C++ core still links no ONNX Runtime of its own (see AGENTS.md:
 //     the wheel build always passes `-DONNXSIM_BUILTIN_ORT=OFF`); the
 //     caller supplies whatever executor actually runs the model.
 //
@@ -16638,7 +16638,7 @@ std::unordered_set<std::string> ApplyMoeWholeExpertChains(
 // complementary WHOLE-EXPERT half (`apply_qmoe_whole_expert_pruning`)
 // needs runtime calibration data (an ONNX Runtime inference session
 // observing router activations), which this C++ port has no ONNX Runtime
-// linked into at all (see CLAUDE.md: the wheel build never builds ORT) --
+// linked into at all (see AGENTS.md: the wheel build never builds ORT) --
 // so it stays out of scope here, exactly like every other calibration-
 // driven pass this file's own established precedent already excludes
 // (Wanda-style importance, whole-expert usage-based pruning, ...).

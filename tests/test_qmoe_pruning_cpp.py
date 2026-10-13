@@ -6,7 +6,7 @@ section). Scope note: only the EXPERT-CHANNEL half is ported -- the
 complementary WHOLE-EXPERT half (``apply_qmoe_whole_expert_pruning``) needs
 runtime calibration data (a real ONNX Runtime inference session observing
 router activations), which this C++ port has no ONNX Runtime linked into at
-all (see the repo's own CLAUDE.md: the wheel build never builds ORT), so it
+all (see the repo's own AGENTS.md: the wheel build never builds ORT), so it
 stays out of scope here too.
 
 Covers ``quant_type='int'`` (whole-row and blockwise) and
@@ -26,7 +26,7 @@ built via ``onnx.parser``'s text format at all (a custom-domain op whose
 ``fc1``/``fc2`` weights are packed ``uint8`` tensors -- the parser's own
 tensor-literal syntax encodes ``float_data``, not ``raw_data``, and has no
 uint8 literal syntax either), so every QMoE model below is built via
-``onnx.helper.make_node``/``make_tensor`` directly, per CLAUDE.md's own
+``onnx.helper.make_node``/``make_tensor`` directly, per AGENTS.md's own
 documented fallback for exactly this kind of case.
 
 This environment's onnxruntime (1.29.0) has NO CPU kernel at all for

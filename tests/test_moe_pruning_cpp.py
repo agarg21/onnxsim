@@ -6,7 +6,7 @@ whole-expert pruning (``onnxsim.apply_moe_whole_expert_pruning``, which needs
 runtime calibration data via an ``onnxruntime.InferenceSession`` observing
 router activations) is NOT ported, matching this codebase's established
 C++-port scope decision (this build has no ONNX Runtime linked into it at
-all -- see the repo's own CLAUDE.md).
+all -- see the repo's own AGENTS.md).
 
 Tests here are adapted from ``tests/test_pruning.py``'s own
 ``apply_moe_expert_channel_pruning`` coverage (search

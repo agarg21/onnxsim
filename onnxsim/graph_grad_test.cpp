@@ -8,7 +8,7 @@
  * really checked: 104 finite-difference comparisons against a float64
  * re-evaluation of the forward. That is not reproducible here, because
  * nothing in this build evaluates an ONNX graph -- the wheel does not compile
- * ONNX Runtime (see CLAUDE.md) and the WASM build hands evaluation to
+ * ONNX Runtime (see AGENTS.md) and the WASM build hands evaluation to
  * onnxruntime-web at run time. So this test covers the half that *is*
  * checkable without an evaluator, and covers it exactly: the rule table's
  * membership, the refusals, the operator allowlist the emitted graph must

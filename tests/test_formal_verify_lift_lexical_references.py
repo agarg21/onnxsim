@@ -109,7 +109,7 @@ pass:
   ``test_lift_lexical_references_negative_control_needs_metadata_invariance_axiom``
   below -- confirming the *soundness argument itself* is not vacuously true.)
 
-On subgraph model construction: per ``CLAUDE.md``, ``onnx.parser.parse_model()``
+On subgraph model construction: per ``AGENTS.md``, ``onnx.parser.parse_model()``
 was tried first and confirmed (empirically, standalone) to support both
 ``If`` and ``Loop`` nodes with nested body ``GraphProto``s, including bodies
 that reference outer-scope names -- so the text form is used throughout below

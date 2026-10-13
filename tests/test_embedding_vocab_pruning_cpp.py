@@ -968,7 +968,7 @@ def test_bfloat16_magnitude_pruning_matches_array_oracle():
 # first, via `_pack_uint8_bits` below, mirroring the schema doc's own
 # "for bits < 8 the values are packed along the last dimension"). Every
 # test here uses `onnx.helper`/`onnx.numpy_helper.from_array` rather than
-# `onnx.parser`, per CLAUDE.md's own documented fallback: the parser's text
+# `onnx.parser`, per AGENTS.md's own documented fallback: the parser's text
 # format encodes tensor literals as `float_data`, has no notion of ONNX's
 # native sub-4-bit packing at all, and can't express a hand-packed uint8
 # byte layout either -- both need genuine `numpy`-array-shaped tensor

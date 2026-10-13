@@ -69,7 +69,7 @@ practice. A single line inside it — `Value::uniqueName()`'s cached-name return
   `setup.py`'s `cmake_build` already defaults to `-DCMAKE_BUILD_TYPE=RelWithDebInfo`
   on Linux, confirmed via the printed cmake invocation and `file
   onnxsim_cpp2py_export*.so` showing `with debug_info, not stripped`).
-  `ONNXSIM_BUILTIN_ORT=OFF` throughout, per this repo's `CLAUDE.md` — no ONNX Runtime
+  `ONNXSIM_BUILTIN_ORT=OFF` throughout, per this repo's `AGENTS.md` — no ONNX Runtime
   was built. Build took ~9 minutes on 4 cores.
 - `onnxruntime` is **not** pip-installed in this environment, so constant folding
   falls back to onnx's (slower) reference evaluator. This inflates `FoldConstant`'s

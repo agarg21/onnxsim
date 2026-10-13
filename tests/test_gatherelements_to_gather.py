@@ -1,10 +1,10 @@
 """Tests for the opt-in ``rewrite_gatherelements_to_gather`` pass.
 
 Every model is a single ``GatherElements`` node, built with the ONNX text
-format parser (``onnx.parser``) per CLAUDE.md's convention for this repo's
+format parser (``onnx.parser``) per AGENTS.md's convention for this repo's
 tests. A constant, axis-invariant ``indices`` is spelled directly as a text
 tensor literal (an initializer with no matching graph input, so it is
-``is_constant_initializer``-true) -- CLAUDE.md's "small, fixed/deterministic
+``is_constant_initializer``-true) -- AGENTS.md's "small, fixed/deterministic
 constants are fine as text literals" case. Rewriting models are run through
 ``onnxsim.simplify(..., extra_optimizers=["rewrite_gatherelements_to_gather"])``,
 equivalence-checked against the original ``GatherElements`` node using fixed

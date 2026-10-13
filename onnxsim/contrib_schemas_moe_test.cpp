@@ -35,7 +35,7 @@
  * (onnxruntime/contrib_ops/cuda/moe/qmoe_kernels.cu) and cross-checked
  * against an independent numpy transliteration of that same source. That
  * cross-check, like the onnxruntime one above, needs Python dependencies
- * onnxsim's C++ build doesn't have (see CLAUDE.md), which is why it isn't
+ * onnxsim's C++ build doesn't have (see AGENTS.md), which is why it isn't
  * reproduced as a C++ test here.
  *
  * fc3 (silu-only, ONNX Runtime's "Mixtral case": fc2(silu(fc1(x)) *

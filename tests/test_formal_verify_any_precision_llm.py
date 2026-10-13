@@ -100,7 +100,7 @@ where it happens) since that registration is itself part of this pass's
 contract.
 
 Differential tests build a plain float ``MatMul``/``Gemm`` via
-``onnx.parser`` (per ``CLAUDE.md``), with reasonably-sized weights (K=64,
+``onnx.parser`` (per ``AGENTS.md``), with reasonably-sized weights (K=64,
 several output channels) -- run purely through
 ``onnxsim.apply_any_precision_llm_cpp`` and inspected via
 ``numpy_helper``/direct initializer access; no ONNX Runtime session is

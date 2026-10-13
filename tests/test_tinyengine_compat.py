@@ -65,7 +65,7 @@ def test_conv_activation_fusion_depends_on_conv_being_sole_producer():
     TFLite's `Conv2D`/`DepthwiseConv2D` `FusedActivationFunction` fusion
     (see `tinyengine_ops.is_fusable_activation`'s docstring). A `Relu` fed
     by anything else (here, an `Add`) has no standalone dispatch case.
-    Built via `onnx.parser` per this repo's CLAUDE.md guidance for new
+    Built via `onnx.parser` per this repo's AGENTS.md guidance for new
     test models; the 1x1 kernel keeps the tensor literals small.
     """
     import onnx
@@ -100,7 +100,7 @@ def test_resize_only_supports_nearest_mode():
     """Only `Resize(mode="nearest")` maps onto `RESIZE_NEAREST_NEIGHBOR`;
     `linear`/`cubic` have no TinyEngine equivalent in this dispatch.
 
-    Uses `onnx.helper` rather than `onnx.parser` (see this repo's CLAUDE.md):
+    Uses `onnx.helper` rather than `onnx.parser` (see this repo's AGENTS.md):
     `Resize`'s optional `roi`/`scales` inputs are most naturally expressed
     as the empty-string positional placeholders `make_node` supports, which
     the text format has no equivalent for.

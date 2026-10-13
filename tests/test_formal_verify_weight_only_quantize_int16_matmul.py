@@ -69,7 +69,7 @@ code/scale multiplicands) is used from the start rather than discovered by
 trial and error after a slow query.
 
 Differential tests build a plain float ``MatMul``/``Gemm`` via ``onnx.parser``
-(per ``CLAUDE.md``), run the real pass alone via ``simplify_isolated_extra``
+(per ``AGENTS.md``), run the real pass alone via ``simplify_isolated_extra``
 (and, for the numeric-bound check, via :func:`onnxsim.quantize_weight_only_int16`,
 which applies exactly this rewrite -- see its own docstring in
 ``onnx_simplifier.py``; no dedicated Python entry point search was needed

@@ -120,7 +120,7 @@ every prior pass in this family) and the standard vacuity negative control
 round out the Z3 side.
 
 Differential tests build a plain float ``MatMul``/``Gemm`` via
-``onnx.parser`` (per ``CLAUDE.md``) with ``K`` a multiple of 32
+``onnx.parser`` (per ``AGENTS.md``) with ``K`` a multiple of 32
 (``kMXBlockSize``) -- e.g. ``K = 64`` -- run the real pass alone via
 ``simplify_isolated_extra`` (``extra_optimizers=["weight_only_quantize_
 mxfp4_matmul"]``) and, for the numeric bound check, via the dedicated

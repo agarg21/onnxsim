@@ -13,7 +13,7 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Mirrors onnxsim's own wasm build (../../CMakeLists.txt's EMSCRIPTEN branch,
-# see also ../../build_wasm.sh) rather than reinventing it: ONNX Runtime is
+# see also ../../scripts/build_wasm.sh) rather than reinventing it: ONNX Runtime is
 # built as a static wasm archive and absorbed straight into this module via
 # add_subdirectory, instead of linking a prebuilt libonnxruntime as the
 # native ../CMakeLists.txt does (there's no shared-library concept in a wasm

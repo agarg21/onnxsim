@@ -1,6 +1,6 @@
 """End-to-end companion to ``tests/test_speculative_decoding_drafter.py``:
 that file's graph is hand-built via ``onnx.parser`` text (per this repo's own
-convention, see CLAUDE.md); this one builds the *same* architecture as a real
+convention, see AGENTS.md); this one builds the *same* architecture as a real
 PyTorch ``nn.Module`` and puts it through ``torch.onnx.export`` for real,
 before feeding the result to the same onnxsim passes. Hand-written ONNX text
 can't accidentally reproduce exporter-specific quirks -- this closes that

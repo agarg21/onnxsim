@@ -27,7 +27,7 @@ mechanics already covered by ``tests/test_fuse_attention.py`` and
 ``tests/test_fuse_gqa.py``) to isolate exactly those two drafter-specific
 traits, at a size (32-dim hidden, so every quantizable layer's reduction
 size is a clean multiple of the INT4 pass's 32-element block) small enough
-to keep as literal text per this repo's convention (see CLAUDE.md) while
+to keep as literal text per this repo's convention (see AGENTS.md) while
 still exercising the same op patterns -- weighted MatMul, plus two
 activation-only MatMuls for the attention score/value products that must be
 left unquantized -- found in the real checkpoint's exported graph.

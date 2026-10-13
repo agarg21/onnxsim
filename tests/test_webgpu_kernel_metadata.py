@@ -2,7 +2,7 @@
 custom WebGPU program (one or more kernel steps) to a node's own
 ``metadata_props`` and reading it back.
 
-Models are built via the ONNX text format parser (see CLAUDE.md's testing
+Models are built via the ONNX text format parser (see AGENTS.md's testing
 guidance). ``onnx.parser`` never assigns ``NodeProto.name`` -- confirmed by
 inspection, since the text format has no syntax for it -- so ``_named`` sets
 it programmatically after parsing, the documented fallback for what the text

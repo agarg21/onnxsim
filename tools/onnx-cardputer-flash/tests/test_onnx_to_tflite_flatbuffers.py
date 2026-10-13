@@ -1,7 +1,7 @@
 """Tests for onnx_to_tflite_flatbuffers.py.
 
 Fast, unconditional test: builds a tiny synthetic "fake-quant sandwich"
-ONNX model with onnx.parser (see repo CLAUDE.md) and checks the emitted
+ONNX model with onnx.parser (see repo AGENTS.md) and checks the emitted
 .tflite's structure directly with the vendored schema bindings -- no
 TFLite runtime needed, just the `flatbuffers` package this script itself
 requires.

@@ -39,7 +39,7 @@ from onnx.reference import ReferenceEvaluator
 
 # generate_distillation_step_graph.py needs the onnxsim package importable
 # (onnxsim.graph_grad/qat_graph) -- the *compiled* onnxsim extension, not
-# just a pip package (see CLAUDE.md). onnx-finetune-lora.yml's
+# just a pip package (see AGENTS.md). onnx-finetune-lora.yml's
 # lora-scripts job deliberately runs `pytest tools/onnx-finetune/tests`
 # without building onnxsim at all ("no compiled onnxsim extension needed"),
 # so this must skip there rather than error out at collection time.

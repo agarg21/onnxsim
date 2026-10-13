@@ -1,7 +1,7 @@
 """Tests for the opt-in ``rewrite_gather_over_concat`` pass.
 
 Every model is built with the ONNX text format parser (``onnx.parser``) per
-CLAUDE.md's convention for this repo's tests. Rewriting models are run
+AGENTS.md's convention for this repo's tests. Rewriting models are run
 through ``onnxsim.simplify(..., extra_optimizers=["rewrite_gather_over_concat"])``,
 which numerically equivalence-checks the rewritten graph against the
 original ``Concat`` + ``Gather`` pair (via onnxruntime, or the onnx

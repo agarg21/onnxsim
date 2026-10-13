@@ -13,7 +13,7 @@ onnxsim-core counterpart, usable from any binding (Python, C, Rust, npm) via
 script.
 
 Every model is built with the ONNX text format parser (``onnx.parser``) per
-CLAUDE.md's convention for this repo's tests. ``onnxsim.simplify``'s own
+AGENTS.md's convention for this repo's tests. ``onnxsim.simplify``'s own
 ``check_n`` machinery gives the numeric-equivalence check (onnxruntime, or
 the onnx reference evaluator when onnxruntime is not installed) -- except
 for ``VALID``, where the installed ``onnx`` package's own

@@ -8,7 +8,7 @@ file's docstring records ``transA == 0`` as a real vendor compiler
 requirement). Usable from any binding via
 ``extra_optimizers=["gemm_transA_to_transpose"]``.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention.
+Models are built with ``onnx.parser`` per AGENTS.md's convention.
 Numeric equivalence comes from ``onnxsim.simplify``'s own ``check_n``.
 """
 

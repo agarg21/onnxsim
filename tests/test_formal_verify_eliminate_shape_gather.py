@@ -84,7 +84,7 @@ strategy, and is dropped unconditionally.
 Consequently, exactly as for ``extract_constant_to_initializer``, there is no
 way to run "the real compiled pass, in isolation" against a concrete model
 *through onnxsim's own public Python surface* -- the surface this suite
-otherwise insists on testing against (see CLAUDE.md and every other
+otherwise insists on testing against (see AGENTS.md and every other
 ``test_formal_verify_*.py`` file). An earlier version of the sibling
 ``extract_constant_to_initializer`` file drove onnxoptimizer's C++ pass class
 directly via a small C++ harness compiled at test time against this

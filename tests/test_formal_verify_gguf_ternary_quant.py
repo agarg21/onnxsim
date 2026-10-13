@@ -178,7 +178,7 @@ mirroring the C++ exactly) rather than added as its own Z3 hypothesis.
 Differential tests
 --------------------------------------------------------------------------
 
-Built via ``onnx.parser`` (per ``CLAUDE.md``) with ``numpy_helper.from_array``
+Built via ``onnx.parser`` (per ``AGENTS.md``) with ``numpy_helper.from_array``
 for random weight initializers. Entry points (both exercised, mirroring
 IQ4_NL's own two-entry-point convention): the opt-in optimizer name
 ``"gguf_ternary_quant"`` via ``simplify_isolated_extra``, and the dedicated

@@ -82,7 +82,7 @@ def _dequantize_int4_generic(model):
     # reconstructs its full dense output directly from the ONNX
     # initializers -- no onnxruntime involved, so this is exact regardless
     # of CPU architecture (see this repo's own numerics guidance in
-    # CLAUDE.md-adjacent test files: onnxruntime's MatMul reduction order
+    # AGENTS.md-adjacent test files: onnxruntime's MatMul reduction order
     # isn't bit-exact across architectures, but plain numpy on the raw
     # tensors is).
     dq_node = next(n for n in model.graph.node if n.op_type == "DequantizeLinear")

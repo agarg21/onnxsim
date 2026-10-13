@@ -132,7 +132,7 @@ jobs:
     timeout-minutes: 60
     env:
       # Only the core simplifier is needed; skip the quantization/pruning
-      # algorithm library to cut compile time (see CLAUDE.md).
+      # algorithm library to cut compile time (see AGENTS.md).
       ONNXSIM_NON_CORE_FEATURES: "0"
       ONNXSIM_RUSTNN_DEVICE_TYPES: "cpu,npu"
       ONNXSIM_TINYGRAD_DEVICES: "CPU,METAL"

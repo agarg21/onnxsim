@@ -184,7 +184,7 @@ def test_decomposed_layer_norm_flagged_as_normalization_risk():
     flagged: edgeai-tidl-tools' transformer-support notes prefer the fused
     `LayerNormalization` op over this decomposed form -- see
     `tidl_ops.has_decomposed_normalization`'s docstring. Built via
-    `onnx.parser` per this repo's CLAUDE.md guidance for new test models.
+    `onnx.parser` per this repo's AGENTS.md guidance for new test models.
     """
     import onnx
     from onnx import parser

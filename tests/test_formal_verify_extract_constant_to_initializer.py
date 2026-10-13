@@ -52,7 +52,7 @@ dropped, unconditionally.
 Consequently, unlike every sibling file in this suite, there is no way to
 run "the real compiled pass, in isolation" against a concrete model *through
 onnxsim's own public Python surface* -- the surface this suite otherwise
-insists on testing against (see CLAUDE.md and every other
+insists on testing against (see AGENTS.md and every other
 ``test_formal_verify_*.py`` file). An earlier version of this file drove
 onnxoptimizer's ``ExtractConstantToInitializer`` class directly via a small
 C++ harness compiled at test time against this checkout's

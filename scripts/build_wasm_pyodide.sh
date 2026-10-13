@@ -12,7 +12,7 @@ set -ex
 #     native host target)
 #   - the standalone WASM CLI build (build_wasm.sh, ONNXSIM_PYTHON=OFF,
 #     ONNXSIM_BUILTIN_ORT=ON by default)
-# (see CLAUDE.md). Opt-in and additive only.
+# (see AGENTS.md). Opt-in and additive only.
 #
 # ---------------------------------------------------------------------------
 # Prerequisites (this script does not install any of these):
@@ -67,7 +67,7 @@ set -ex
 #   source /path/to/matching/emsdk/emsdk_env.sh
 #   PYODIDE_PYTHON_INCLUDE=/path/to/target/include/python3.13 \
 #   PYTHON_EXECUTABLE=/path/to/host/python3.13 \
-#     ./build_wasm_pyodide.sh
+#     ./scripts/build_wasm_pyodide.sh
 # ---------------------------------------------------------------------------
 
 # Check the toolchain is available before anything else, same as build_wasm.sh.
@@ -75,7 +75,8 @@ command -v emcmake
 command -v em++
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-cd "$SCRIPT_DIR"
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd)
+cd "$ROOT_DIR"
 
 if [ -z "${PYODIDE_PYTHON_INCLUDE:-}" ]; then
     echo "error: PYODIDE_PYTHON_INCLUDE must be set to the target Pyodide" >&2
@@ -147,7 +148,7 @@ emcmake cmake \
     -DPython_INCLUDE_DIR="$PYODIDE_PYTHON_INCLUDE" \
     -DPython_INCLUDE_DIRS="$PYODIDE_PYTHON_INCLUDE" \
     -DPython_FIND_ABI="ANY;ANY;ANY;ANY" \
-    "$SCRIPT_DIR"
+    "$ROOT_DIR"
 
 cmake --build . --target onnxsim_cpp2py_export -j"$(nproc)"
 

@@ -101,7 +101,7 @@ differential tests below instead check real end-to-end numeric behavior on
 concrete models.
 
 Differential tests build models via ``onnx.parser.parse_model()`` (per
-``CLAUDE.md``) and call the real ``onnxsim.quantize_fp8`` entry point found
+``AGENTS.md``) and call the real ``onnxsim.quantize_fp8`` entry point found
 above. Model opsets must be >= 19 (unlike the fp16/bf16 files' opset 13/18)
 since ``Cast``'s own float8 support -- and float8 element types at all --
 only exist from opset 19 on.

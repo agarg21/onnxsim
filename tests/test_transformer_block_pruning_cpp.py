@@ -31,7 +31,7 @@ real pure-Python implementation *before* it was deleted -- see
 inlined directly rather than as a checked-in ``.onnx`` file: this repo's
 own ``.gitignore`` excludes ``*.onnx`` outright, and there is no existing
 ``tests/golden/``-style fixture-directory convention to follow instead --
-see CLAUDE.md's own "Prefer onnx.parser-based model construction in tests"
+see AGENTS.md's own "Prefer onnx.parser-based model construction in tests"
 note for the same "keep fixtures in the test file itself" spirit) --
 preserving the original regression coverage (did the behavior change?)
 without asserting a tautology.

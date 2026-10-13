@@ -5,7 +5,6 @@
 - Branch: `codex/xdna-resnet-graph-fusion` (upstream: `origin/codex/xdna-resnet-graph-fusion`).
 - Device runs and compiles were performed through the RPC server; no RPC server is left running.
 - This note summarizes the XDNA/RPC progress on this branch.
-- Do not add `.commandcode/`; it is unrelated workspace content.
 
 ## Runtime findings
 

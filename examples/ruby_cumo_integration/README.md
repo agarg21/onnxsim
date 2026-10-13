@@ -31,7 +31,7 @@ entry would otherwise hide a Ruby `lib/` here too.)
 
 1. **The `onnxsim_c` shared library**, built with the C API enabled (this
    compiles the full onnxsim stack, including ONNX Runtime as a
-   constant-folding backend -- see the [top-level `CLAUDE.md`](../../CLAUDE.md)
+   constant-folding backend -- see the [top-level `AGENTS.md`](../../AGENTS.md)
    for why that's unlike the Python wheel build):
 
    ```sh
@@ -126,7 +126,7 @@ compile time.
 syntax](https://onnx.ai/onnx/repo-docs/Syntax.html) -- the same format
 `onnx.parser.parse_model` reads in Python, and what this repo's own tests
 prefer over `onnx.helper.make_node`/`make_graph`/`make_model` chains (see the
-top-level [`CLAUDE.md`](../../CLAUDE.md)) -- rather than building the graph
+top-level [`AGENTS.md`](../../AGENTS.md)) -- rather than building the graph
 field by field:
 
 ```
@@ -147,7 +147,7 @@ API now exposes one: `onnxsim_parse_model_text` (added alongside this
 sample) wraps onnx's `OnnxParser::Parse<ModelProto>` -- the exact same parser
 Python's `onnx.parser.parse_model` calls, since onnx (and its parser) is
 always built regardless of `ONNXSIM_BUILTIN_ORT` (see the top-level
-`CLAUDE.md`) -- and hands back a serialized `ModelProto`, no protobuf library
+`AGENTS.md`) -- and hands back a serialized `ModelProto`, no protobuf library
 needed on the Ruby side. It's a small, generally useful addition to the
 shared C ABI: any binding with no protobuf tooling of its own -- this
 sample, but the same call is there for the [Rust bindings](../../rust/README.md)

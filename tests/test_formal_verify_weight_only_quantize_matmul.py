@@ -82,7 +82,7 @@ here; ``quantized_mac_bound`` itself, the template for this shape of claim,
 does not compose with a consumer either.
 
 Differential tests build a plain float ``MatMul``/``Gemm`` via
-``onnx.parser`` (per ``CLAUDE.md``), run the real pass alone via
+``onnx.parser`` (per ``AGENTS.md``), run the real pass alone via
 ``simplify_isolated_extra`` (and, for the numeric-bound check, via
 :func:`onnxsim.quantize_weight_only`, which applies exactly this rewrite --
 see its own docstring), and confirm: the exact ``MatMul(X,

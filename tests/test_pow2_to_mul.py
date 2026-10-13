@@ -6,7 +6,7 @@ records this as the fix for a vendor compiler's fused-activation matcher,
 which recognizes ``Pow(x, 2)`` as part of a larger pattern it cannot tile at
 every shape). Usable from any binding via ``extra_optimizers=["pow2_to_mul"]``.
 
-Models are built with ``onnx.parser`` per CLAUDE.md's convention. Numeric
+Models are built with ``onnx.parser`` per AGENTS.md's convention. Numeric
 equivalence comes from ``onnxsim.simplify``'s own ``check_n``.
 """
 

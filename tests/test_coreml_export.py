@@ -1576,7 +1576,7 @@ def test_constant_of_shape_dynamic_fp16():
     # `fill` fallback: extracting the fill value via numpy's `.item()` silently
     # discarded its fp16 dtype, so `fill` produced an fp32 tensor instead. The
     # text-format parser has no syntax for a node's tensor-valued attribute, so
-    # this one is built with onnx.helper (see CLAUDE.md's note on that exception).
+    # this one is built with onnx.helper (see AGENTS.md's note on that exception).
     x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT16, ["N", 4])
     y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT16, ["N", 4])
     shape_node = onnx.helper.make_node("Shape", ["x"], ["shp"])
