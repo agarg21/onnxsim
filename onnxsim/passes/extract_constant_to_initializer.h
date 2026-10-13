@@ -63,7 +63,8 @@ struct ExtractConstantToInitializer final : public PredicateBasedPass {
       // to skip a second deep copy of its raw_data/typed-data fields on top of
       // the one `node->t(kvalue)` already paid above. On a model with many
       // Constant nodes this pass was ~half its own cost (see
-      // docs/bench/RESULTS_profiling_survey.md's ONNXSIM_PROFILE_PASS_PHASES data).
+      // docs/bench/RESULTS_profiling_survey.md's ONNXSIM_PROFILE_PASS_PHASES
+      // data).
       new_init = graph.addInitializerAndCreateValue(std::move(t));
       node->output()->setUniqueName(nextReservedName(graph), false);
     } else {

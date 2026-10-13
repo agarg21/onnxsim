@@ -1102,10 +1102,10 @@ void SimplifyPath(
     // result and never read again beforehand -- exactly the case
     // SimplifyConsumeInput's doc comment calls out as safe, and the one this
     // investigation was written for (see
-    // docs/bench/RESULTS_synthetic_decoder_oom.md): it avoids the ~1x-model-size
-    // deep copy ``Simplify()`` would otherwise make of ``model`` to get a
-    // mutable working copy, cutting the peak RSS of simplifying a large
-    // external-data model roughly in half.
+    // docs/bench/RESULTS_synthetic_decoder_oom.md): it avoids the
+    // ~1x-model-size deep copy ``Simplify()`` would otherwise make of ``model``
+    // to get a mutable working copy, cutting the peak RSS of simplifying a
+    // large external-data model roughly in half.
     model = SimplifyConsumeInput(
         executor, model, skip_optimizers, constant_folding, shape_inference,
         tensor_size_threshold, target_opset_version, rewriter,
