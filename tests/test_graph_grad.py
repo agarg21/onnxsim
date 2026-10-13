@@ -3236,3 +3236,21 @@ def _refused(body, fragment):
 )
 def test_a_structural_op_outside_its_static_contract_is_refused(body, fragment):
     _refused(body, fragment)
+
+
+def test_constant_node_axes_are_read_like_an_initializer():
+    """A Squeeze whose axes are a Constant node's value builds the one Reshape an initializer would."""
+    model = onnx.parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["" : 18]>
+        g (float[2,1,4] A) => (float[2,4] Y) {
+          axes = Constant<value = int64[1] {1}>()
+          Y = Squeeze(A, axes)
+        }
+        """
+    )
+    b = qat_graph.GraphBuilder("bw_")
+    graph_grad.build_backward(
+        b, list(model.graph.node), _static_shapes(model), {"Y": "dY"}, ["A"]
+    )
+    assert [node.op_type for node in b.nodes] == ["Reshape"]

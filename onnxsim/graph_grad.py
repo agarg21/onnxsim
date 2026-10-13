@@ -242,8 +242,25 @@ class _Backward:
         self._initializers: Dict[str, onnx.TensorProto] = {}
         for tensor in b.initializer:
             self._initializers.setdefault(tensor.name, tensor)
+        # The "value" tensor of each Constant node of the forward graph, filled by build_backward.
+        self._constants: Dict[str, onnx.TensorProto] = {}
         # Shape metadata is fixed for one build_backward call; normalize on first use.
         self._shape_cache: Dict[str, Tuple[Union[int, str], ...]] = {}
+
+    def add_constants(self, nodes: Sequence[onnx.NodeProto]) -> None:
+        """Record the value of every Constant node; the first Constant of a name wins, as the first initializer does."""
+        for node in nodes:
+            if node.op_type != "Constant" or not node.output:
+                continue
+            for attr in node.attribute:
+                if attr.name == "value" and attr.type == onnx.AttributeProto.TENSOR:
+                    self._constants.setdefault(node.output[0], attr.t)
+                    break
+
+    def constant(self, name: str) -> Optional[onnx.TensorProto]:
+        """The tensor a shape, axes, pads or index operand names: an initializer, or the value of a Constant node."""
+        tensor = self._initializers.get(name)
+        return tensor if tensor is not None else self._constants.get(name)
 
     def shape(self, name: str) -> Tuple[Union[int, str], ...]:
         cached = self._shape_cache.get(name)
@@ -1484,10 +1501,10 @@ def _constant_ints(ctx: _Backward, name: str, node: onnx.NodeProto) -> List[int]
     constants. Keeping this lookup local avoids adding runtime shape plumbing
     to the backward graph.
     """
-    tensor = ctx._initializers.get(name)
+    tensor = ctx.constant(name)
     if tensor is None:
         raise UnsupportedOpError(
-            f"{node.op_type} parameter {name!r} must be a constant initializer "
+            f"{node.op_type} parameter {name!r} must be a constant initializer or a Constant node "
             f"(node {node.output[0]!r})"
         )
     try:
@@ -1688,10 +1705,10 @@ def _grad_pad(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str
             f"Pad with negative pads is unsupported (node {node.output[0]!r})"
         )
     if len(node.input) > 2 and node.input[2]:
-        value = ctx._initializers.get(node.input[2])
+        value = ctx.constant(node.input[2])
         if value is None:
             raise UnsupportedOpError(
-                f"Pad constant_value must be a constant initializer "
+                f"Pad constant_value must be a constant initializer or a Constant node "
                 f"(node {node.output[0]!r})"
             )
         if onnx.numpy_helper.to_array(value).size != 1:
@@ -2756,7 +2773,7 @@ def _grad_inference_dropout(
     runtime or true value would require applying the sampled mask and scaling.
     """
     if len(node.input) > 2 and node.input[2]:
-        training = ctx._initializers.get(node.input[2])
+        training = ctx.constant(node.input[2])
         if training is None:
             raise UnsupportedOpError(
                 f"Dropout training_mode must be a constant false initializer "
@@ -3354,6 +3371,7 @@ def build_backward(
         dict(_RULES, **_PYTHON_ONLY_RULES, **_CUSTOM_RULES) if rules is None else rules
     )
     ctx = _Backward(b, shapes)
+    ctx.add_constants(nodes)
     grads: Dict[str, str] = dict(grad_outputs)
 
     def accumulate(node: onnx.NodeProto, contributions: List[Optional[str]]) -> None:
