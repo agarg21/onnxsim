@@ -341,10 +341,12 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
                                           "BatchNormalization",
                                           "Cast",
                                           "Clip",
+                                          "Concat",
                                           "Conv",
                                           "Div",
                                           "Erf",
                                           "Exp",
+                                          "Expand",
                                           "Gather",
                                           "Gemm",
                                           "Identity",
@@ -357,17 +359,21 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
                                           "Mul",
                                           "Neg",
                                           "ReduceMax",
+                                          "Pad",
                                           "ReduceMean",
                                           "ReduceMin",
                                           "ReduceSum",
                                           "Relu",
                                           "Reshape",
                                           "Sigmoid",
+                                          "Slice",
                                           "Softmax",
                                           "Sqrt",
+                                          "Squeeze",
                                           "Sub",
                                           "Tanh",
-                                          "Transpose"};
+                                          "Transpose",
+                                          "Unsqueeze"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
             Join(SupportedOps()) + "}");
@@ -1509,6 +1515,256 @@ void ACastBackToFloatTypeIsEmittedAndOtherCastsAreRefused() {
   }
 }
 
+// The constant-parameter initializers the structural rules read (a Slice's
+// starts, a Pad's pads, an Expand's shape), built the way the Python test
+// harness builds them: int64 raw_data, little-endian.
+onnx::TensorProto Int64Init(const std::string& name,
+                            const std::vector<int64_t>& values) {
+  onnx::TensorProto tensor;
+  tensor.set_name(name);
+  tensor.set_data_type(onnx::TensorProto::INT64);
+  tensor.add_dims(static_cast<int64_t>(values.size()));
+  std::string raw;
+  for (int64_t value : values) {
+    const uint64_t bits = static_cast<uint64_t>(value);
+    for (int k = 0; k < 8; ++k) {
+      raw.push_back(static_cast<char>((bits >> (8 * k)) & 0xff));
+    }
+  }
+  tensor.set_raw_data(raw);
+  return tensor;
+}
+
+onnx::TensorProto FloatScalarInit(const std::string& name, float value) {
+  onnx::TensorProto tensor;
+  tensor.set_name(name);
+  tensor.set_data_type(onnx::TensorProto::FLOAT);
+  tensor.add_float_data(value);
+  return tensor;
+}
+
+// If this fails, the C++ Slice rule has drifted from _grad_slice in
+// graph_grad.py. The three cases are the unit-step case, the strided case
+// (which the selection matrix handles exactly, with no Pad), and a multi-axis
+// slice with negative bounds whose sliced axes sit off the last position, so
+// both Transposes are exercised. The strided selector is also checked value
+// for value: rows 0..2 pick columns 1, 3 and 5 of a 7-wide axis.
+void TheSliceRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  {
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("Slice", {"X", "starts", "ends", "axes"}, {"Y"})};
+    const Shapes shapes = {{"X", {4, 6}}, {"Y", {4, 4}}};
+    GraphBuilder b;
+    b.initializer() = {Int64Init("starts", {1}), Int64Init("ends", {5}),
+                       Int64Init("axes", {1})};
+    const auto grads = BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+    Check(OpTypes(b) == std::vector<std::string>({"MatMul"}),
+          "a unit-step Slice on the last axis should emit one MatMul");
+    Check(grads.at("X") == b.nodes().back().output(0),
+          "the Slice gradient should be the MatMul's output");
+    Check(Int64Data(b.initializer()[0]) == std::vector<int64_t>({1}),
+          "the forward starts initializer should be left untouched");
+  }
+  {
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("Slice", {"X", "starts", "ends", "axes", "steps"}, {"Y"})};
+    const Shapes shapes = {{"X", {4, 7}}, {"Y", {4, 3}}};
+    GraphBuilder b;
+    b.initializer() = {Int64Init("starts", {1}), Int64Init("ends", {7}),
+                       Int64Init("axes", {1}), Int64Init("steps", {2})};
+    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+    Check(OpTypes(b) == std::vector<std::string>({"MatMul"}),
+          "a strided Slice should emit one MatMul, with no Pad or scatter");
+    const onnx::TensorProto& selector = b.initializer().back();
+    Check(
+        std::vector<int64_t>(selector.dims().begin(), selector.dims().end()) ==
+            std::vector<int64_t>({3, 7}),
+        "the strided selector should be [count, dim] = [3, 7]");
+    Check(FloatData(selector) == std::vector<float>({0, 1, 0, 0, 0, 0, 0,  //
+                                                     0, 0, 0, 1, 0, 0, 0,  //
+                                                     0, 0, 0, 0, 0, 1, 0}),
+          "the strided selector should pick columns 1, 3 and 5");
+  }
+  {
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("Slice", {"X", "starts", "ends", "axes", "steps"}, {"Y"})};
+    const Shapes shapes = {{"X", {4, 6, 5}}, {"Y", {2, 6, 3}}};
+    GraphBuilder b;
+    b.initializer() = {Int64Init("starts", {1, -6}), Int64Init("ends", {-1, 5}),
+                       Int64Init("axes", {0, 2}), Int64Init("steps", {1, 2})};
+    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+    const std::vector<std::string> expected = {"Transpose", "MatMul",
+                                               "Transpose", "MatMul"};
+    Check(OpTypes(b) == expected,
+          "a two-axis Slice should emit graph_grad.py's nodes in its order");
+    Check(std::vector<int64_t>(b.nodes()[0].attribute(0).ints().begin(),
+                               b.nodes()[0].attribute(0).ints().end()) ==
+              std::vector<int64_t>({1, 2, 0}),
+          "the first Transpose should move axis 0 last");
+  }
+}
+
+// If this fails, the C++ Concat rule has drifted from _grad_concat in
+// graph_grad.py: one Gather per input, with the offsets computed from the
+// static shapes. A negative axis is normalized the same way.
+void TheConcatRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  {
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("Concat", {"A", "B", "C"}, {"Y"}, {IntAttr("axis", 1)})};
+    const Shapes shapes = {
+        {"A", {2, 3}}, {"B", {2, 1}}, {"C", {2, 4}}, {"Y", {2, 8}}};
+    GraphBuilder b;
+    const auto grads =
+        BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A", "B", "C"});
+    Check(
+        OpTypes(b) == std::vector<std::string>({"Gather", "Gather", "Gather"}),
+        "a three-input Concat should emit one Gather per input");
+    Check(
+        Int64Data(b.initializer()[0]) == std::vector<int64_t>({0, 1, 2}) &&
+            Int64Data(b.initializer()[1]) == std::vector<int64_t>({3}) &&
+            Int64Data(b.initializer()[2]) == std::vector<int64_t>({4, 5, 6, 7}),
+        "the offsets should be 0, 3 and 4 along the concat axis");
+    Check(grads.at("B") == b.nodes()[1].output(0),
+          "the second input's gradient should be the second Gather");
+  }
+  {
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("Concat", {"A", "B"}, {"Y"}, {IntAttr("axis", -2)})};
+    const Shapes shapes = {{"A", {2, 3}}, {"B", {2, 3}}, {"Y", {4, 3}}};
+    GraphBuilder b;
+    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A", "B"});
+    Check(OpTypes(b) == std::vector<std::string>({"Gather", "Gather"}) &&
+              b.nodes()[0].attribute(0).i() == 0 &&
+              b.nodes()[1].attribute(0).i() == 0,
+          "axis -2 of a rank-2 Concat should gather along axis 0");
+  }
+}
+
+// If this fails, the C++ Pad rule has drifted from _grad_pad in graph_grad.py.
+// The asymmetric pads [1, 0, 0, 2] crop axis 0 from the front and axis 1 from
+// the back, so the first Gather keeps rows 1..2 and the second keeps columns
+// 0..2. A nonzero constant_value has no gradient and emits the same nodes.
+void ThePadRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Pad", {"X", "pads"}, {"Y"}, {StrAttr("mode", "constant")})};
+  const Shapes shapes = {{"X", {2, 3}}, {"Y", {3, 5}}};
+  GraphBuilder b;
+  b.initializer() = {Int64Init("pads", {1, 0, 0, 2})};
+  const auto grads = BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+  Check(OpTypes(b) == std::vector<std::string>({"Gather", "Gather"}),
+        "an asymmetric Pad should emit one Gather per padded axis");
+  Check(Int64Data(b.initializer()[1]) == std::vector<int64_t>({1, 2}) &&
+            Int64Data(b.initializer()[2]) == std::vector<int64_t>({0, 1, 2}),
+        "the crop indices should be rows 1..2 and columns 0..2");
+  Check(grads.at("X") == b.nodes().back().output(0),
+        "the Pad gradient should be the last Gather");
+
+  const std::vector<onnx::NodeProto> valued = {Node(
+      "Pad", {"X", "pads", "value"}, {"Y"}, {StrAttr("mode", "constant")})};
+  const Shapes valued_shapes = {{"X", {2, 3}}, {"Y", {4, 5}}};
+  GraphBuilder c;
+  c.initializer() = {Int64Init("pads", {1, 1, 1, 1}),
+                     FloatScalarInit("value", 1.5f)};
+  const auto valued_grads =
+      BuildBackward(c, valued, valued_shapes, {{"Y", "dY"}}, {"X"});
+  Check(OpTypes(c) == std::vector<std::string>({"Gather", "Gather"}) &&
+            valued_grads.size() == 1,
+        "a nonzero Pad value should not change the emitted gradient");
+}
+
+// If this fails, the C++ Expand rule has drifted from _grad_expand in
+// graph_grad.py. Rank-extension broadcast ([3, 1] to [2, 3, 4]) sums two axes
+// and then reshapes; a leading size-1 axis ([1, 4] to [3, 4]) sums one axis and
+// needs no reshape.
+void TheExpandRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  {
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("Expand", {"X", "shape"}, {"Y"})};
+    const Shapes shapes = {{"X", {3, 1}}, {"Y", {2, 3, 4}}};
+    GraphBuilder b;
+    b.initializer() = {Int64Init("shape", {2, 3, 4})};
+    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+    Check(OpTypes(b) == std::vector<std::string>({"ReduceSum", "Reshape"}),
+          "a rank-extending Expand should emit a ReduceSum then a Reshape");
+    Check(Int64Data(b.initializer()[1]) == std::vector<int64_t>({0, 2}),
+          "the summed axes should be 0 and 2");
+  }
+  {
+    const std::vector<onnx::NodeProto> nodes = {
+        Node("Expand", {"X", "shape"}, {"Y"})};
+    const Shapes shapes = {{"X", {1, 4}}, {"Y", {3, 4}}};
+    GraphBuilder b;
+    b.initializer() = {Int64Init("shape", {3, 4})};
+    const auto grads = BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+    Check(OpTypes(b) == std::vector<std::string>({"ReduceSum"}),
+          "a size-1 leading axis should need only the ReduceSum");
+    Check(grads.at("X") == b.nodes().back().output(0),
+          "the Expand gradient should be the ReduceSum's output");
+  }
+}
+
+// If this fails, the C++ Squeeze/Unsqueeze rule has drifted from
+// _grad_squeeze_or_unsqueeze in graph_grad.py: both are a Reshape of the
+// incoming gradient back to the input's own shape.
+void TheSqueezeAndUnsqueezeRulesReshapeBackToTheInputShape() {
+  for (const char* op : {"Squeeze", "Unsqueeze"}) {
+    const bool squeeze = std::string(op) == "Squeeze";
+    const std::vector<onnx::NodeProto> nodes = {Node(op, {"A", "axes"}, {"Y"})};
+    const Shapes shapes = squeeze ? Shapes{{"A", {2, 1, 4}}, {"Y", {2, 4}}}
+                                  : Shapes{{"A", {2, 4}}, {"Y", {2, 1, 4}}};
+    GraphBuilder b;
+    b.initializer() = {Int64Init("axes", {1})};
+    BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A"});
+    Check(OpTypes(b) == std::vector<std::string>({"Reshape"}),
+          std::string(op) + " should emit one Reshape");
+    Check(Int64Data(b.initializer()[1]) ==
+              (squeeze ? std::vector<int64_t>({2, 1, 4})
+                       : std::vector<int64_t>({2, 4})),
+          std::string(op) + " should reshape back to its data's shape");
+  }
+}
+
+// If this fails, a Squeeze whose axes are computed at run time would be
+// differentiated as though its squeezed rank were a build-time fact.
+void ASqueezeWithNonConstantAxesIsRefused() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Squeeze", {"A", "axes"}, {"Y"})};
+  const Shapes shapes = {{"A", {2, 1, 4}}, {"Y", {2, 4}}};
+  GraphBuilder b;  // no "axes" initializer: it is a graph input
+  CheckThrows<UnsupportedOpError>(
+      [&] { BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A"}); },
+      "must be a constant initializer",
+      "a Squeeze with a runtime axes input should be refused");
+}
+
+// A Slice step that is not positive is outside the rule's contract, both for
+// the reason a negative step is ruled out in graph_grad.py and because a zero
+// step has no selection at all.
+void ASliceWithANonPositiveStepIsRefused() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Slice", {"X", "starts", "ends", "axes", "steps"}, {"Y"})};
+  const Shapes shapes = {{"X", {4, 6}}, {"Y", {4, 3}}};
+  GraphBuilder b;
+  b.initializer() = {Int64Init("starts", {5}), Int64Init("ends", {-7}),
+                     Int64Init("axes", {1}), Int64Init("steps", {-2})};
+  CheckThrows<UnsupportedOpError>(
+      [&] { BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"}); },
+      "positive steps", "a negative Slice step should be refused");
+}
+
+// Only constant-mode Pad has a gradient rule here. Reflect and edge modes route
+// gradient to the mirrored source positions, which this rule does not model.
+void APadWithAnUnsupportedModeIsRefused() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Pad", {"X", "pads"}, {"Y"}, {StrAttr("mode", "reflect")})};
+  const Shapes shapes = {{"X", {2, 3}}, {"Y", {2, 5}}};
+  GraphBuilder b;
+  b.initializer() = {Int64Init("pads", {0, 1, 0, 1})};
+  CheckThrows<UnsupportedOpError>(
+      [&] { BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"}); },
+      "Pad mode", "a reflect-mode Pad should be refused");
+}
+
 int main() {
   TheSupportedOpsAreExactlyThePythonRuleTable();
   TheBackwardOpsAreThePythonAllowlistAndSitInsideEpFriendlyOps();
@@ -1545,6 +1801,14 @@ int main() {
   TheReduceMinRuleUsesTheOtherComparison();
   TheLogSoftmaxRuleEmitsItsDocumentedNodesInOrder();
   ACastBackToFloatTypeIsEmittedAndOtherCastsAreRefused();
+  TheSliceRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheConcatRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  ThePadRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheExpandRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheSqueezeAndUnsqueezeRulesReshapeBackToTheInputShape();
+  ASqueezeWithNonConstantAxesIsRefused();
+  ASliceWithANonPositiveStepIsRefused();
+  APadWithAnUnsupportedModeIsRefused();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);
