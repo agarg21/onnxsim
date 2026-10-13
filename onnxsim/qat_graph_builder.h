@@ -94,11 +94,25 @@ class GraphBuilder {
   // A fresh unique name. `hint` becomes part of it, as in the Python.
   std::string Name(const std::string& hint = "t");
 
-  // A float32 initializer holding a scalar, or an arbitrarily-shaped array.
+  // The element type of every floating-point initializer and float mask this
+  // builder creates: FLOAT (the default) or DOUBLE. A gradient is built from
+  // the forward graph's own values, so a float64 forward needs float64
+  // constants next to it (Mul and Sub do not convert); everything else a rule
+  // emits is dtype-agnostic. The Python GraphBuilder has no counterpart yet.
+  void SetFloatType(int32_t elem_type);
+  int32_t float_type() const { return float_type_; }
+
+  // A float initializer (float32 unless SetFloatType said otherwise) holding a
+  // scalar, or an arbitrarily-shaped array.
   std::string Const(float value, const std::string& hint = "c");
   std::string Const(const std::vector<float>& values,
                     const std::vector<int64_t>& dims,
                     const std::string& hint = "c");
+  // `count` copies of `value`, shaped `dims`, rounded to the builder's float
+  // type only: unlike Const(std::vector<float>) a float64 builder gets the
+  // double itself (1/3 for a mean is not float(1/3) widened).
+  std::string ConstFill(double value, const std::vector<int64_t>& dims,
+                        const std::string& hint = "c");
 
   // Like Const(float, hint), but returns the same initializer for an
   // identical value requested more than once on this builder. Matches
@@ -195,6 +209,7 @@ class GraphBuilder {
   std::vector<onnx::FunctionProto> functions_;
   std::set<std::pair<std::string, std::string>> function_ids_;
   std::string prefix_;
+  int32_t float_type_ = onnx::TensorProto::FLOAT;
   int64_t counter_ = 0;
   // Keyed by the float's raw bit pattern -- see SharedConst.
   std::unordered_map<uint32_t, std::string> shared_consts_;

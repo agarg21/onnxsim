@@ -49,6 +49,15 @@ void AppendLittleEndian(std::string& out, float value) {
   }
 }
 
+void AppendLittleEndian(std::string& out, double value) {
+  uint64_t bits;
+  static_assert(sizeof(bits) == sizeof(value), "double must be 64 bits");
+  std::memcpy(&bits, &value, sizeof(bits));
+  for (int i = 0; i < 8; ++i) {
+    out.push_back(static_cast<char>((bits >> (8 * i)) & 0xff));
+  }
+}
+
 void AppendLittleEndian(std::string& out, int64_t value) {
   const uint64_t bits = static_cast<uint64_t>(value);
   for (int i = 0; i < 8; ++i) {
@@ -126,18 +135,19 @@ std::string GraphBuilder::Name(const std::string& hint) {
   return prefix_ + hint + "_" + std::to_string(counter_);
 }
 
+void GraphBuilder::SetFloatType(int32_t elem_type) {
+  if (elem_type != onnx::TensorProto::FLOAT &&
+      elem_type != onnx::TensorProto::DOUBLE) {
+    throw std::invalid_argument(
+        "GraphBuilder::SetFloatType: FLOAT or DOUBLE only");
+  }
+  float_type_ = elem_type;
+}
+
 std::string GraphBuilder::Const(float value, const std::string& hint) {
-  const std::string name = Name(hint);
-  onnx::TensorProto tensor;
-  tensor.set_name(name);
-  tensor.set_data_type(onnx::TensorProto::FLOAT);
   // No dims: a numpy scalar has shape (), and numpy_helper.from_array copies
   // that empty shape through.
-  std::string raw;
-  AppendLittleEndian(raw, value);
-  tensor.set_raw_data(std::move(raw));
-  initializer_.push_back(std::move(tensor));
-  return name;
+  return ConstFill(static_cast<double>(value), {}, hint);
 }
 
 std::string GraphBuilder::Const(const std::vector<float>& values,
@@ -146,11 +156,40 @@ std::string GraphBuilder::Const(const std::vector<float>& values,
   const std::string name = Name(hint);
   onnx::TensorProto tensor;
   tensor.set_name(name);
-  tensor.set_data_type(onnx::TensorProto::FLOAT);
+  tensor.set_data_type(float_type_);
   for (int64_t d : dims) tensor.add_dims(d);
   std::string raw;
-  raw.reserve(values.size() * sizeof(float));
-  for (float v : values) AppendLittleEndian(raw, v);
+  raw.reserve(values.size() * sizeof(double));
+  for (float v : values) {
+    if (float_type_ == onnx::TensorProto::DOUBLE) {
+      AppendLittleEndian(raw, static_cast<double>(v));
+    } else {
+      AppendLittleEndian(raw, v);
+    }
+  }
+  tensor.set_raw_data(std::move(raw));
+  initializer_.push_back(std::move(tensor));
+  return name;
+}
+
+std::string GraphBuilder::ConstFill(double value,
+                                    const std::vector<int64_t>& dims,
+                                    const std::string& hint) {
+  int64_t count = 1;
+  for (int64_t d : dims) count *= d;
+  const std::string name = Name(hint);
+  onnx::TensorProto tensor;
+  tensor.set_name(name);
+  tensor.set_data_type(float_type_);
+  for (int64_t d : dims) tensor.add_dims(d);
+  std::string raw;
+  for (int64_t i = 0; i < count; ++i) {
+    if (float_type_ == onnx::TensorProto::DOUBLE) {
+      AppendLittleEndian(raw, value);
+    } else {
+      AppendLittleEndian(raw, static_cast<float>(value));
+    }
+  }
   tensor.set_raw_data(std::move(raw));
   initializer_.push_back(std::move(tensor));
   return name;
@@ -277,13 +316,13 @@ std::string GraphBuilder::Clip(const std::string& a, float low, float high) {
 std::string GraphBuilder::GreaterMask(const std::string& a, float threshold) {
   const std::string bound = Const(threshold);
   const std::string gt = Op("Greater", {a, bound});
-  return Op("Cast", {gt}, {IntAttr("to", onnx::TensorProto::FLOAT)});
+  return Op("Cast", {gt}, {IntAttr("to", float_type_)});
 }
 
 std::string GraphBuilder::LessMask(const std::string& a, float threshold) {
   const std::string bound = Const(threshold);
   const std::string lt = Op("Less", {a, bound});
-  return Op("Cast", {lt}, {IntAttr("to", onnx::TensorProto::FLOAT)});
+  return Op("Cast", {lt}, {IntAttr("to", float_type_)});
 }
 
 std::string GraphBuilder::RoundToNearest(const std::string& a) {
@@ -294,7 +333,7 @@ std::string GraphBuilder::RoundToNearest(const std::string& a) {
       Op("Cast", {magnitude}, {IntAttr("to", onnx::TensorProto::INT32)});
   const std::string sign = Op("Sign", {a});
   const std::string rounded =
-      Op("Cast", {truncated}, {IntAttr("to", onnx::TensorProto::FLOAT)});
+      Op("Cast", {truncated}, {IntAttr("to", float_type_)});
   return Mul(sign, rounded);
 }
 

@@ -131,6 +131,11 @@ def _backward_model(model: onnx.ModelProto, targets, seed_name="dY"):
     shapes = _static_shapes(model)
     output = model.graph.output[0].name
     b = qat_graph.GraphBuilder("bw_")
+    # Forward constants (a Slice's starts, a Pad's pads, an Expand's shape) are
+    # read by the rules from the builder's own initializer list, the way
+    # compile_training.py seeds it, so the forward initializers go there and
+    # the emitted graph's initializer list is that one list, not a second copy.
+    b.initializer = list(model.graph.initializer)
     grads = graph_grad.build_backward(
         b, list(model.graph.node), shapes, {output: seed_name}, targets
     )
@@ -165,7 +170,7 @@ def _backward_model(model: onnx.ModelProto, targets, seed_name="dY"):
         "backward",
         inputs,
         outputs,
-        initializer=list(model.graph.initializer) + list(b.initializer),
+        initializer=list(b.initializer),
     )
     opset_imports = [onnx.helper.make_opsetid("", 17)]
     opset_imports += [onnx.helper.make_opsetid(fn.domain, 1) for fn in b.functions]
@@ -1177,6 +1182,107 @@ _CASES = {
         """
         g (float[2,8,3,3] X) => (float[2,2,6,6] Y) {
           Y = DepthToSpace <blocksize = 2, mode = "DCR"> (X)
+        }
+        """,
+        None,
+    ),
+    # Slice with constant parameters, one per shape of the rule: the unit
+    # step, a strided step (the selection matrix picks the strided positions
+    # exactly, so no Pad or scatter is needed), and two axes at once with
+    # negative bounds and an axis that is not the last one (so the Transposes
+    # run). Starts/ends/axes/steps are initializers, as they are in every
+    # exported model.
+    "slice_unit": (
+        """
+        g (float[4,6] X) => (float[4,4] Y)
+        <int64[1] starts = {1}, int64[1] ends = {5}, int64[1] axes = {1}>
+        {
+          Y = Slice(X, starts, ends, axes)
+        }
+        """,
+        None,
+    ),
+    "slice_strided": (
+        """
+        g (float[4,7] X) => (float[4,3] Y)
+        <int64[1] starts = {1}, int64[1] ends = {7}, int64[1] axes = {1},
+         int64[1] steps = {2}>
+        {
+          Y = Slice(X, starts, ends, axes, steps)
+        }
+        """,
+        None,
+    ),
+    "slice_two_axes_negative_bounds": (
+        """
+        g (float[4,6,5] X) => (float[2,6,3] Y)
+        <int64[2] starts = {1,-6}, int64[2] ends = {-1,5}, int64[2] axes = {0,2},
+         int64[2] steps = {1,2}>
+        {
+          Y = Slice(X, starts, ends, axes, steps)
+        }
+        """,
+        None,
+    ),
+    # Concat over three inputs of different widths, and a negative axis.
+    "concat_three_inputs": (
+        """
+        g (float[2,3] A, float[2,1] B, float[2,4] C) => (float[2,8] Y) {
+          Y = Concat <axis = 1> (A, B, C)
+        }
+        """,
+        None,
+    ),
+    "concat_negative_axis": (
+        """
+        g (float[2,3] A, float[2,3] B) => (float[4,3] Y) {
+          Y = Concat <axis = -2> (A, B)
+        }
+        """,
+        None,
+    ),
+    # Asymmetric constant-mode Pad: front padding on one axis, back padding
+    # on the other. The second case has a nonzero constant value, which is a
+    # constant of the forward and so has no gradient of its own.
+    "pad_asymmetric": (
+        """
+        g (float[2,3] X) => (float[3,5] Y)
+        <int64[4] pads = {1,0,0,2}>
+        {
+          Y = Pad <mode = "constant"> (X, pads)
+        }
+        """,
+        None,
+    ),
+    "pad_nonzero_value": (
+        """
+        g (float[2,3] X) => (float[4,5] Y)
+        <int64[4] pads = {1,1,1,1}, float value = {1.5}>
+        {
+          Y = Pad(X, pads, value)
+        }
+        """,
+        None,
+    ),
+    # Expand is a broadcast, so its gradient sums over the broadcast axes:
+    # one axis that was a size-1 leading axis of the data, and a rank
+    # extension plus a size-1 trailing axis.
+    "expand_leading_size_one": (
+        """
+        g (float[1,4] X) => (float[3,4] Y)
+        <int64[2] shape = {3,4}>
+        {
+          Y = Expand(X, shape)
+        }
+        """,
+        None,
+    ),
+    "expand_rank_extension": (
+        """
+        g (float[3,1] X) => (float[2,3,4] Y)
+        <int64[3] shape = {2,3,4}>
+        {
+          Y = Expand(X, shape)
         }
         """,
         None,
@@ -2651,3 +2757,224 @@ def test_reduce_mean_over_a_dynamic_axis_is_refused():
         graph_grad.build_backward(
             b, list(forward.graph.node), shapes, {"Y": "dY"}, ["X"]
         )
+
+
+# The structural rules (Slice, Concat, Pad, Expand, Squeeze, Unsqueeze) are
+# checked against finite differences above, and against hand-derived values
+# here. Finite differences show the gradient is the derivative; the exact
+# values show *which* entries it lands in, which a derivative check on random
+# inputs can get right only by accident of the seed.
+
+
+def _gradient_of(model, target, feeds, seed):
+    """The emitted backward's gradient for ``target``, run through ORT."""
+    backward = _backward_model(model, [target])
+    session = ort.InferenceSession(
+        backward.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (grad,) = session.run([f"grad_{target}"], dict(feeds, dY=seed))
+    return grad
+
+
+def test_a_strided_slice_scatters_the_seed_to_the_strided_positions():
+    # X[7] sliced [1:7:2] keeps positions 1, 3, 5. The seed [10, 20, 30] must
+    # land exactly there, with zeros elsewhere -- not merely have the right
+    # total or the right derivative at a random point.
+    model = _model(
+        """
+        g (float[7] X) => (float[3] Y)
+        <int64[1] starts = {1}, int64[1] ends = {7}, int64[1] axes = {0},
+         int64[1] steps = {2}>
+        {
+          Y = Slice(X, starts, ends, axes, steps)
+        }
+        """
+    )
+    feeds = {"X": np.arange(7, dtype=np.float32)}
+    seed = np.array([10, 20, 30], dtype=np.float32)
+    grad = _gradient_of(model, "X", feeds, seed)
+    np.testing.assert_array_equal(grad, [0, 10, 0, 20, 0, 30, 0])
+
+
+def test_a_concat_splits_the_seed_back_into_its_inputs_exactly():
+    model = _model(
+        """
+        g (float[2,2] A, float[2,1] B) => (float[2,3] Y) {
+          Y = Concat <axis = 1> (A, B)
+        }
+        """
+    )
+    feeds = {
+        "A": np.zeros((2, 2), dtype=np.float32),
+        "B": np.zeros((2, 1), dtype=np.float32),
+    }
+    seed = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
+    np.testing.assert_array_equal(
+        _gradient_of(model, "A", feeds, seed), [[1, 2], [4, 5]]
+    )
+    np.testing.assert_array_equal(_gradient_of(model, "B", feeds, seed), [[3], [6]])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            """
+            g (float[2,2] X) => (float[3,3] Y)
+            <int64[4] pads = {1,0,0,1}>
+            {
+              Y = Pad <mode = "constant"> (X, pads)
+            }
+            """,
+            id="zero-pad-value",
+        ),
+        pytest.param(
+            """
+            g (float[2,2] X) => (float[3,3] Y)
+            <int64[4] pads = {1,0,0,1}, float value = {1.5}>
+            {
+              Y = Pad(X, pads, value)
+            }
+            """,
+            id="nonzero-pad-value",
+        ),
+    ],
+)
+def test_an_asymmetric_pad_crops_the_seed_exactly(body):
+    # pads [1,0, 0,1] pads one row in front and one column behind, so the
+    # input occupies rows 1..2 and columns 0..1 of the [3, 3] output. Its
+    # gradient is seed[1:3, 0:2]. A nonzero constant value changes the output
+    # but not that gradient.
+    model = _model(body)
+    feeds = {"X": np.ones((2, 2), dtype=np.float32)}
+    seed = np.arange(9, dtype=np.float32).reshape(3, 3)
+    np.testing.assert_array_equal(
+        _gradient_of(model, "X", feeds, seed), [[3, 4], [6, 7]]
+    )
+
+
+def test_an_expand_sums_each_broadcast_axis_exactly():
+    # X[3,1] broadcast to [2,3,4]: axis 0 (new) and axis 2 (size 1 to 4) are
+    # summed. For row i the gradient is the sum of seed[:, i, :]. With seed =
+    # arange(24) that is 0..3 + 12..15 = 60, 4..7 + 16..19 = 92, and
+    # 8..11 + 20..23 = 124.
+    model = _model(
+        """
+        g (float[3,1] X) => (float[2,3,4] Y)
+        <int64[3] shape = {2,3,4}>
+        {
+          Y = Expand(X, shape)
+        }
+        """
+    )
+    feeds = {"X": np.zeros((3, 1), dtype=np.float32)}
+    seed = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    np.testing.assert_array_equal(
+        _gradient_of(model, "X", feeds, seed), [[60], [92], [124]]
+    )
+
+
+def test_the_structural_rules_are_builtin_and_not_python_only():
+    # They are in the parity-pinned table, not the Python-only one, because
+    # graph_grad.cpp now carries a mirror of each. tests/test_qat_parity.py
+    # checks that mirror against the fixture.
+    structural = {"Concat", "Expand", "Pad", "Slice", "Squeeze", "Unsqueeze"}
+    assert structural <= graph_grad.SUPPORTED_OPS
+    assert not (structural & set(graph_grad._PYTHON_ONLY_RULES))
+
+
+def _refused(body, fragment):
+    """``build_backward`` on ``body`` must raise UnsupportedOpError naming
+    ``fragment``. Built directly, not through the harness, since the harness
+    would only re-raise the same refusal."""
+    model = _model(body)
+    shapes = _static_shapes(model)
+    b = qat_graph.GraphBuilder("bw_")
+    b.initializer = list(model.graph.initializer)
+    with pytest.raises(graph_grad.UnsupportedOpError, match=fragment):
+        graph_grad.build_backward(
+            b,
+            list(model.graph.node),
+            shapes,
+            {model.graph.output[0].name: "dY"},
+            [value.name for value in model.graph.input],
+        )
+
+
+@pytest.mark.parametrize(
+    "body, fragment",
+    [
+        pytest.param(
+            """
+            g (float[2,1,4] A, int64[1] axes) => (float[2,4] Y) {
+              Y = Squeeze(A, axes)
+            }
+            """,
+            "'axes' must be a constant initializer",
+            id="squeeze-runtime-axes",
+        ),
+        pytest.param(
+            """
+            g (float[2,4] A, int64[1] axes) => (float[2,1,4] Y) {
+              Y = Unsqueeze(A, axes)
+            }
+            """,
+            "'axes' must be a constant initializer",
+            id="unsqueeze-runtime-axes",
+        ),
+        pytest.param(
+            """
+            g (float[4,6] X, int64[1] starts) => (float[4,4] Y)
+            <int64[1] ends = {5}, int64[1] axes = {1}>
+            {
+              Y = Slice(X, starts, ends, axes)
+            }
+            """,
+            "'starts' must be a constant initializer",
+            id="slice-runtime-starts",
+        ),
+        pytest.param(
+            """
+            g (float[4,6] X) => (float[4,5] Y)
+            <int64[1] starts = {5}, int64[1] ends = {0}, int64[1] axes = {1},
+             int64[1] steps = {-1}>
+            {
+              Y = Slice(X, starts, ends, axes, steps)
+            }
+            """,
+            "positive steps",
+            id="slice-negative-step",
+        ),
+        pytest.param(
+            """
+            g (float[2,3] X) => (float[2,5] Y)
+            <int64[4] pads = {0,1,0,1}>
+            {
+              Y = Pad <mode = "reflect"> (X, pads)
+            }
+            """,
+            "Pad mode",
+            id="pad-reflect",
+        ),
+        pytest.param(
+            """
+            g (float[2,3] X, int64[4] pads) => (float[2,5] Y) {
+              Y = Pad(X, pads)
+            }
+            """,
+            "'pads' must be a constant initializer",
+            id="pad-runtime-pads",
+        ),
+        pytest.param(
+            """
+            g (float[3,1] X, int64[3] shape) => (float[2,3,4] Y) {
+              Y = Expand(X, shape)
+            }
+            """,
+            "'shape' must be a constant initializer",
+            id="expand-runtime-shape",
+        ),
+    ],
+)
+def test_a_structural_op_outside_its_static_contract_is_refused(body, fragment):
+    _refused(body, fragment)

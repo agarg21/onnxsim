@@ -217,14 +217,12 @@ class Backward {
   // tensor name rather than GraphBuilder::GreaterMask's float.
   std::string MaskGreater(const std::string& x, const std::string& bound) {
     const std::string gt = b_.Op("Greater", {x, bound}, "greater");
-    return b_.Op("Cast", {gt}, {IntAttr("to", onnx::TensorProto::FLOAT)},
-                 "cast");
+    return b_.Op("Cast", {gt}, {IntAttr("to", b_.float_type())}, "cast");
   }
 
   std::string MaskLess(const std::string& x, const std::string& bound) {
     const std::string lt = b_.Op("Less", {x, bound}, "less");
-    return b_.Op("Cast", {lt}, {IntAttr("to", onnx::TensorProto::FLOAT)},
-                 "cast");
+    return b_.Op("Cast", {lt}, {IntAttr("to", b_.float_type())}, "cast");
   }
 
  private:
@@ -1341,15 +1339,10 @@ std::vector<OptStr> GradReduce(Backward& ctx, const onnx::NodeProto& node,
     fill = 1.0 / count;
   }
   Shape ones_shape = in_shape;
-  int64_t elements = 1;
   for (size_t i = 0; i < ones_shape.size(); ++i) {
     if (axes.count(static_cast<int64_t>(i)) == 0) ones_shape[i] = 1;
-    elements *= ones_shape[i];
   }
-  const std::string ones =
-      ctx.b().Const(std::vector<float>(static_cast<size_t>(elements),
-                                       static_cast<float>(fill)),
-                    ones_shape, "bcast");
+  const std::string ones = ctx.b().ConstFill(fill, ones_shape, "bcast");
   std::vector<OptStr> grads{ctx.b().Mul(grad, ones)};
   grads.insert(grads.end(), rest.begin(), rest.end());
   return grads;
@@ -1767,7 +1760,7 @@ std::vector<OptStr> GradGather(Backward& ctx, const onnx::NodeProto& node,
   const std::string flat_idx =
       ctx.b().Op("Reshape", {indices, flat_shape}, "reshape");
   const std::string idx_f = ctx.b().Op(
-      "Cast", {flat_idx}, {IntAttr("to", onnx::TensorProto::FLOAT)}, "cast");
+      "Cast", {flat_idx}, {IntAttr("to", ctx.b().float_type())}, "cast");
   const std::string zero = ctx.b().Const(0.0f);
   const std::string is_negative = ctx.MaskLess(idx_f, zero);
   const std::string count_const = ctx.b().Const(static_cast<float>(count));
@@ -2150,6 +2143,411 @@ std::vector<OptStr> GradDivTemplated(Backward& ctx, const onnx::NodeProto& node,
   return {ga, gb};
 }
 
+// ---------------------------------------------------------------------------
+// Rules over structural operators: Concat, Expand, Pad, Slice, Squeeze and
+// Unsqueeze. Each is a transcription of the same-named rule in graph_grad.py,
+// including the emission order. The shape, axes and pads operands are read from
+// constant initializers at build time (ConstInts below), so none of these
+// rules needs a runtime Shape/Gather.
+// ---------------------------------------------------------------------------
+
+const onnx::TensorProto* FindInitializer(Backward& ctx,
+                                         const std::string& name) {
+  for (const onnx::TensorProto& tensor : ctx.b().initializer()) {
+    if (tensor.name() == name) return &tensor;
+  }
+  return nullptr;
+}
+
+// Reads a little-endian integer of `width` bytes at `offset` of `raw`.
+int64_t ReadRawInt(const std::string& raw, size_t offset, size_t width,
+                   bool is_signed) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < width; ++i) {
+    value |= static_cast<uint64_t>(static_cast<uint8_t>(raw[offset + i]))
+             << (8 * i);
+  }
+  if (is_signed && width < 8 && (value >> (8 * width - 1)) != 0) {
+    value |= ~((uint64_t{1} << (8 * width)) - 1);
+  }
+  return static_cast<int64_t>(value);
+}
+
+// The integer values of a constant initializer, flattened -- _constant_ints in
+// graph_grad.py. Every integer dtype is read, raw_data or typed field alike,
+// because numpy_helper.to_array accepts them all.
+std::vector<int64_t> ConstInts(Backward& ctx, const std::string& name,
+                               const onnx::NodeProto& node) {
+  const onnx::TensorProto* tensor = FindInitializer(ctx, name);
+  if (tensor == nullptr) {
+    throw UnsupportedOpError(node.op_type() + " parameter " + Quoted(name) +
+                             " must be a constant initializer (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+  const int32_t type = tensor->data_type();
+  bool is_signed = true;
+  size_t width = 0;
+  switch (type) {
+    case onnx::TensorProto::INT8:
+      width = 1;
+      break;
+    case onnx::TensorProto::INT16:
+      width = 2;
+      break;
+    case onnx::TensorProto::INT32:
+      width = 4;
+      break;
+    case onnx::TensorProto::INT64:
+      width = 8;
+      break;
+    case onnx::TensorProto::UINT8:
+      width = 1;
+      is_signed = false;
+      break;
+    case onnx::TensorProto::UINT16:
+      width = 2;
+      is_signed = false;
+      break;
+    case onnx::TensorProto::UINT32:
+      width = 4;
+      is_signed = false;
+      break;
+    case onnx::TensorProto::UINT64:
+      width = 8;
+      is_signed = false;
+      break;
+    default:
+      throw UnsupportedOpError(node.op_type() + " parameter " + Quoted(name) +
+                               " must have integer dtype (node " +
+                               Quoted(node.output(0)) + ")");
+  }
+  std::vector<int64_t> values;
+  if (!tensor->raw_data().empty()) {
+    const std::string& raw = tensor->raw_data();
+    for (size_t offset = 0; offset + width <= raw.size(); offset += width) {
+      values.push_back(ReadRawInt(raw, offset, width, is_signed));
+    }
+  } else if (type == onnx::TensorProto::INT64) {
+    values.assign(tensor->int64_data().begin(), tensor->int64_data().end());
+  } else if (type == onnx::TensorProto::UINT32 ||
+             type == onnx::TensorProto::UINT64) {
+    for (uint64_t v : tensor->uint64_data()) {
+      values.push_back(static_cast<int64_t>(v));
+    }
+  } else {
+    for (int32_t v : tensor->int32_data()) values.push_back(v);
+  }
+  return values;
+}
+
+std::vector<OptStr> GradConcat(Backward& ctx, const onnx::NodeProto& node,
+                               const std::string& g) {
+  // One Gather per input, each pulling that input's own contiguous slice of g
+  // back out along the concat axis: Split's adjoint, reached the other way.
+  // See _grad_concat in graph_grad.py for why Gather rather than a MatMul.
+  const Shape out_shape = ctx.ShapeOf(node.output(0));
+  const int64_t rank = static_cast<int64_t>(out_shape.size());
+  if (rank == 0) {
+    throw UnsupportedOpError("Concat of a scalar has no axis (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+  const int64_t axis = ((AttrInt(node, "axis", 0) % rank) + rank) % rank;
+  std::vector<OptStr> grads;
+  int64_t offset = 0;
+  for (const std::string& input : node.input()) {
+    const Shape shape = ctx.ShapeOf(input);
+    const int64_t width = shape[static_cast<size_t>(axis)];
+    std::vector<int64_t> indices;
+    for (int64_t i = offset; i < offset + width; ++i) indices.push_back(i);
+    const std::string idx = ctx.b().ConstInt64(indices, "idx");
+    grads.push_back(
+        ctx.b().Op("Gather", {g, idx}, {IntAttr("axis", axis)}, "gather"));
+    offset += width;
+  }
+  return grads;
+}
+
+std::vector<OptStr> GradExpand(Backward& ctx, const onnx::NodeProto& node,
+                               const std::string& g) {
+  // The gradient sums over exactly the axes Expand broadcast. See _grad_expand
+  // in graph_grad.py.
+  if (node.input_size() != 2 || node.input(0).empty() ||
+      node.input(1).empty()) {
+    throw UnsupportedOpError("Expand requires data and shape inputs (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+  const std::string& x = node.input(0);
+  const std::string& shape_name = node.input(1);
+  const Shape target_shape = ConstInts(ctx, shape_name, node);
+  const onnx::TensorProto* shape_tensor = FindInitializer(ctx, shape_name);
+  const Shape shape_tensor_shape(shape_tensor->dims().begin(),
+                                 shape_tensor->dims().end());
+  if (shape_tensor_shape != Shape{static_cast<int64_t>(target_shape.size())}) {
+    throw UnsupportedOpError("Expand shape input must be a 1-D tensor with " +
+                             std::to_string(target_shape.size()) +
+                             " elements, got " + ShapeStr(shape_tensor_shape) +
+                             " (node " + Quoted(node.output(0)) + ")");
+  }
+  if (shape_tensor->data_type() != onnx::TensorProto::INT64) {
+    throw UnsupportedOpError("Expand shape input must have int64 dtype (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+  for (int64_t dim : target_shape) {
+    if (dim < 0) {
+      throw UnsupportedOpError(
+          "Expand target dimensions must be nonnegative, "
+          "got " +
+          ShapeStr(target_shape) + " (node " + Quoted(node.output(0)) + ")");
+    }
+  }
+
+  const Shape x_shape = ctx.ShapeOf(x);
+  const Shape y_shape = ctx.ShapeOf(node.output(0));
+  const size_t rank = std::max(x_shape.size(), target_shape.size());
+  Shape x_broadcast(rank - x_shape.size(), 1);
+  x_broadcast.insert(x_broadcast.end(), x_shape.begin(), x_shape.end());
+  Shape target_broadcast(rank - target_shape.size(), 1);
+  target_broadcast.insert(target_broadcast.end(), target_shape.begin(),
+                          target_shape.end());
+  Shape expected;
+  for (size_t i = 0; i < rank; ++i) {
+    const int64_t x_dim = x_broadcast[i];
+    const int64_t target_dim = target_broadcast[i];
+    if (x_dim != target_dim && x_dim != 1 && target_dim != 1) {
+      throw UnsupportedOpError("Expand data shape " + ShapeStr(x_shape) +
+                               " is incompatible with target shape " +
+                               ShapeStr(target_shape) + " (node " +
+                               Quoted(node.output(0)) + ")");
+    }
+    expected.push_back(x_dim == 1 ? target_dim : x_dim);
+  }
+  if (expected != y_shape) {
+    throw UnsupportedOpError(
+        "Expand inferred output shape " + ShapeStr(y_shape) +
+        " disagrees with broadcast shape " + ShapeStr(expected) + " (node " +
+        Quoted(node.output(0)) + ")");
+  }
+  return {ctx.ReduceTo(g, y_shape, x_shape), std::nullopt};
+}
+
+std::vector<OptStr> GradPad(Backward& ctx, const onnx::NodeProto& node,
+                            const std::string& g) {
+  // Crop g back to the unpadded input with constant-index Gathers, one per
+  // padded axis. See _grad_pad in graph_grad.py.
+  std::string mode = "constant";
+  if (const onnx::AttributeProto* attr = FindAttr(node, "mode")) {
+    mode = attr->s();
+  }
+  if (mode != "constant") {
+    throw UnsupportedOpError("Pad mode " + Quoted(mode) +
+                             " is unsupported (node " + Quoted(node.output(0)) +
+                             ")");
+  }
+  if (node.input_size() < 2 || node.input(1).empty()) {
+    throw UnsupportedOpError("Pad requires constant pads (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+  const std::vector<int64_t> pads = ConstInts(ctx, node.input(1), node);
+  const Shape in_shape = ctx.ShapeOf(node.input(0));
+  const size_t rank = in_shape.size();
+  if (pads.size() != 2 * rank) {
+    throw UnsupportedOpError("Pad requires 2*rank pad values (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+  const std::vector<int64_t> begins(pads.begin(), pads.begin() + rank);
+  const std::vector<int64_t> ends(pads.begin() + rank, pads.end());
+  for (int64_t p : pads) {
+    if (p < 0) {
+      throw UnsupportedOpError("Pad with negative pads is unsupported (node " +
+                               Quoted(node.output(0)) + ")");
+    }
+  }
+  if (node.input_size() > 2 && !node.input(2).empty()) {
+    const onnx::TensorProto* value = FindInitializer(ctx, node.input(2));
+    if (value == nullptr) {
+      throw UnsupportedOpError(
+          "Pad constant_value must be a constant initializer (node " +
+          Quoted(node.output(0)) + ")");
+    }
+    int64_t elements = 1;
+    for (int64_t d : value->dims()) elements *= d;
+    if (elements != 1) {
+      throw UnsupportedOpError("Pad constant_value must be scalar (node " +
+                               Quoted(node.output(0)) + ")");
+    }
+  }
+  const Shape out_shape = ctx.ShapeOf(node.output(0));
+  Shape expected;
+  for (size_t i = 0; i < rank; ++i) {
+    expected.push_back(in_shape[i] + begins[i] + ends[i]);
+  }
+  if (expected != out_shape) {
+    throw UnsupportedOpError("Pad values do not match inferred output shape " +
+                             ShapeStr(out_shape) + " (computed " +
+                             ShapeStr(expected) + ", node " +
+                             Quoted(node.output(0)) + ")");
+  }
+  std::string out = g;
+  for (size_t axis = 0; axis < rank; ++axis) {
+    if (begins[axis] == 0 && ends[axis] == 0) continue;
+    std::vector<int64_t> indices;
+    for (int64_t i = begins[axis]; i < begins[axis] + in_shape[axis]; ++i) {
+      indices.push_back(i);
+    }
+    const std::string idx = ctx.b().ConstInt64(indices, "pad_vjp_idx");
+    out = ctx.b().Op("Gather", {out, idx},
+                     {IntAttr("axis", static_cast<int64_t>(axis))}, "gather");
+  }
+  std::vector<OptStr> grads = {out};
+  grads.resize(node.input_size(), std::nullopt);
+  return grads;
+}
+
+std::vector<OptStr> GradSlice(Backward& ctx, const onnx::NodeProto& node,
+                              const std::string& g) {
+  // The selected values are embedded back into the input by a constant
+  // selection MatMul along each sliced axis. A non-unit positive step is exact
+  // in this form, since the selection matrix simply has its ones at the
+  // strided positions. See _grad_slice in graph_grad.py.
+  const Shape in_shape = ctx.ShapeOf(node.input(0));
+  const int64_t rank = static_cast<int64_t>(in_shape.size());
+  if (rank == 0) {
+    throw UnsupportedOpError("Slice of a scalar is not supported (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+
+  std::vector<int64_t> starts, ends, axes, steps;
+  if (node.input_size() < 3 || node.input(1).empty() || node.input(2).empty()) {
+    starts = AttrInts(node, "starts", {});
+    ends = AttrInts(node, "ends", {});
+    std::vector<int64_t> default_axes, default_steps;
+    for (size_t i = 0; i < starts.size(); ++i) {
+      default_axes.push_back(static_cast<int64_t>(i));
+      default_steps.push_back(1);
+    }
+    axes = AttrInts(node, "axes", default_axes);
+    steps = AttrInts(node, "steps", default_steps);
+  } else {
+    starts = ConstInts(ctx, node.input(1), node);
+    ends = ConstInts(ctx, node.input(2), node);
+    if (node.input_size() > 3 && !node.input(3).empty()) {
+      axes = ConstInts(ctx, node.input(3), node);
+    } else {
+      for (size_t i = 0; i < starts.size(); ++i) {
+        axes.push_back(static_cast<int64_t>(i));
+      }
+    }
+    if (node.input_size() > 4 && !node.input(4).empty()) {
+      steps = ConstInts(ctx, node.input(4), node);
+    } else {
+      steps.assign(starts.size(), 1);
+    }
+  }
+  if (!(starts.size() == ends.size() && ends.size() == axes.size() &&
+        axes.size() == steps.size())) {
+    throw UnsupportedOpError("Slice parameter lengths disagree (node " +
+                             Quoted(node.output(0)) + ")");
+  }
+
+  // Per-axis (start, end, step) after ONNX's positive-step clipping. Axes not
+  // named by the Slice keep their full extent.
+  struct Span {
+    int64_t start;
+    int64_t end;
+    int64_t step;
+  };
+  std::map<int64_t, Span> specs;
+  for (size_t i = 0; i < starts.size(); ++i) {
+    int64_t axis = axes[i] < 0 ? axes[i] + rank : axes[i];
+    if (axis < 0 || axis >= rank || specs.count(axis) != 0) {
+      throw UnsupportedOpError("Slice axes must be unique and in range (node " +
+                               Quoted(node.output(0)) + ")");
+    }
+    if (steps[i] <= 0) {
+      throw UnsupportedOpError("Slice requires positive steps (node " +
+                               Quoted(node.output(0)) + ")");
+    }
+    const int64_t size = in_shape[static_cast<size_t>(axis)];
+    auto clip = [size](int64_t v) {
+      if (v < 0) v += size;
+      return std::max<int64_t>(0, std::min<int64_t>(size, v));
+    };
+    specs[axis] = Span{clip(starts[i]), clip(ends[i]), steps[i]};
+  }
+  auto span_of = [&](int64_t axis) {
+    const auto it = specs.find(axis);
+    if (it != specs.end()) return it->second;
+    return Span{0, in_shape[static_cast<size_t>(axis)], 1};
+  };
+
+  const Shape expected = ctx.ShapeOf(node.output(0));
+  Shape computed;
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    const Span s = span_of(axis);
+    computed.push_back(s.end > s.start ? (s.end - s.start + s.step - 1) / s.step
+                                       : 0);
+  }
+  if (computed != expected) {
+    throw UnsupportedOpError(
+        "Slice parameters do not match inferred output "
+        "shape " +
+        ShapeStr(expected) + " (computed " + ShapeStr(computed) + ", node " +
+        Quoted(node.output(0)) + ")");
+  }
+
+  std::string out = g;
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    const Span s = span_of(axis);
+    const int64_t dim = in_shape[static_cast<size_t>(axis)];
+    std::vector<int64_t> indices;
+    for (int64_t i = s.start; i < s.end; i += s.step) indices.push_back(i);
+    if (static_cast<int64_t>(indices.size()) == dim) continue;
+
+    // Move `axis` last, multiply by the selection matrix, move it back.
+    std::vector<int64_t> perm;
+    for (int64_t i = 0; i < rank; ++i) {
+      if (i != axis) perm.push_back(i);
+    }
+    perm.push_back(axis);
+    std::vector<int64_t> inverse(static_cast<size_t>(rank), 0);
+    for (int64_t i = 0; i < rank; ++i) {
+      inverse[static_cast<size_t>(i)] = static_cast<int64_t>(
+          std::find(perm.begin(), perm.end(), i) - perm.begin());
+    }
+    const int64_t count = static_cast<int64_t>(indices.size());
+    if (axis != rank - 1) out = ctx.b().Transpose(out, perm);
+    std::vector<float> selector(static_cast<size_t>(count * dim), 0.0f);
+    for (int64_t k = 0; k < count; ++k) {
+      selector[static_cast<size_t>(k * dim + indices[static_cast<size_t>(k)])] =
+          1.0f;
+    }
+    const std::string selector_const =
+        ctx.b().Const(selector, {count, dim}, "slice_vjp");
+    out = ctx.b().MatMul(out, selector_const);
+    if (axis != rank - 1) out = ctx.b().Transpose(out, inverse);
+  }
+  std::vector<OptStr> grads = {out};
+  grads.resize(node.input_size(), std::nullopt);
+  return grads;
+}
+
+std::vector<OptStr> GradSqueezeOrUnsqueeze(Backward& ctx,
+                                           const onnx::NodeProto& node,
+                                           const std::string& g) {
+  // Squeeze and Unsqueeze only remove or insert size-1 axes, so the adjoint is
+  // a Reshape back to the input's own shape. The axes operand must still be a
+  // constant, per _grad_squeeze_or_unsqueeze in graph_grad.py.
+  if (node.input_size() > 1 && !node.input(1).empty()) {
+    ConstInts(ctx, node.input(1), node);
+  }
+  const Shape shape = ctx.ShapeOf(node.input(0));
+  const std::string shape_const = ctx.b().ConstInt64(shape, "shape");
+  std::vector<OptStr> grads = {
+      ctx.b().Op("Reshape", {g, shape_const}, "reshape")};
+  grads.resize(node.input_size(), std::nullopt);
+  return grads;
+}
+
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
@@ -2158,10 +2556,12 @@ const std::map<std::string, Rule>& Rules() {
           {"AveragePool", &GradAveragePool},
           {"BatchNormalization", &GradBatchNormalizationTemplated},
           {"Clip", &GradClip},
+          {"Concat", &GradConcat},
           {"Conv", &GradConv},
           {"Div", &GradDivTemplated},
           {"Erf", &GradErfTemplated},
           {"Exp", &GradExpTemplated},
+          {"Expand", &GradExpand},
           {"Gather", &GradGather},
           {"Gemm", &GradGemm},
           {"Identity", &GradIdentity},
@@ -2174,17 +2574,21 @@ const std::map<std::string, Rule>& Rules() {
           {"Min", &GradMin},
           {"Mul", &GradMulTemplated},
           {"Neg", &GradNegTemplated},
+          {"Pad", &GradPad},
           {"ReduceMean", &GradReduce},
           {"ReduceSum", &GradReduce},
           {"Relu", &GradRelu},
           {"Reshape", &GradReshape},
           {"Sigmoid", &GradSigmoidTemplated},
+          {"Slice", &GradSlice},
           {"Softmax", &GradSoftmax},
           {"Sqrt", &GradSqrtTemplated},
+          {"Squeeze", &GradSqueezeOrUnsqueeze},
           {"Sub", &GradSub},
           {"Tanh", &GradTanhTemplated},
           {"Transpose", &GradTranspose},
           {"Where", &GradWhere},
+          {"Unsqueeze", &GradSqueezeOrUnsqueeze},
       };
   return *rules;
 }

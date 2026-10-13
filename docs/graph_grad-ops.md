@@ -35,10 +35,12 @@ templatable but deliberately are not.
 | `AveragePool` | col2im of `g`, scaled by each window's `1/count` | | `_grad_averagepool` | `GradAveragePool` |
 | `BatchNormalization` | `xhat`/`inv`-based; the rule whose hand-written `dvar` factor motivated the whole templating effort | Y | `_grad_batch_normalization_templated` (ref: `_grad_batch_normalization`) | `GradBatchNormalizationTemplated` (ref: `GradBatchNormalization`) |
 | `Clip` | `g` where `lo < x < hi` (strict), `0` elsewhere | | `_grad_clip` | `GradClip` |
+| `Concat` | one `Gather` per input, pulling that input's own contiguous slice of `g` back out along the concat axis (`Split`'s adjoint, reached the other way); every input's offset and width is static | `_grad_concat` | `GradConcat` |
 | `Conv` | `dX`/`dW` as im2col/col2im `MatMul`s (never a `Conv`/`ConvTranspose` of its own), `dB = sum(g)` | | `_grad_conv` | `GradConv` |
 | `Div` | `da = g/b`, `db = -g·y/b` (reuses the forward quotient `y`) | Y | `_grad_div_templated` (ref: `_grad_div`) | `GradDivTemplated` (ref: `GradDiv`) |
 | `Erf` | `dx = g · 2/√π · exp(-x²)` -- exists for GELU | Y | `_grad_erf_templated` (ref: `_grad_erf`) | `GradErfTemplated` (ref: `GradErf`) |
 | `Exp` | `dx = g·y` (reuses the forward output `y`) | Y | `_grad_exp_templated` (ref: `_grad_exp`) | `GradExpTemplated` (ref: `GradExp`) |
+| `Expand` | sum `g` over the axes broadcast from `data` (`ReduceSum` with `keepdims`, then a `Reshape` where needed -- the broadcast-undo convention); constant target shape and static dimensions only, no gradient for `shape` | `_grad_expand` | `GradExpand` |
 | `Gather` | scatter-add into `data` via a one-hot `MatMul`; `indices` gets no gradient | | `_grad_gather` | `GradGather` |
 | `Gemm` | `dA`/`dB`/`dC` from `MatMul`+`Transpose`, honoring `alpha`/`beta`/`transA`/`transB` | | `_grad_gemm` | `GradGemm` |
 | `Identity` | alias -- `g` itself, no node emitted | | `_grad_identity` | `GradIdentity` |
@@ -49,12 +51,16 @@ templatable but deliberately are not.
 | `MaxPool` | col2im, credit split among tied maxima | | `_grad_maxpool` | `GradMaxPool` |
 | `Mul` | `da = g·b`, `db = g·a` | Y | `_grad_mul_templated` (ref: `_grad_mul`) | `GradMulTemplated` (ref: `GradMul`) |
 | `Neg` | `dx = -g` | Y | `_grad_neg_templated` (ref: `_grad_neg`) | `GradNegTemplated` (ref: `GradNeg`) |
+| `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only, a constant scalar `constant_value` gets no gradient | `_grad_pad` | `GradPad` |
 | `ReduceMean` | `g` broadcast back, scaled by `1/N` | | `_grad_reduce` | `GradReduce` |
 | `ReduceSum` | `g` broadcast back, unscaled | | `_grad_reduce` | `GradReduce` |
 | `Relu` | `dx = g · (x > 0)` -- **not** templated; see below | | `_grad_relu` | `GradRelu` |
 | `Reshape` | `g` reshaped back to the input's own shape | | `_grad_reshape` | `GradReshape` |
 | `Sigmoid` | `dx = g·y·(1-y)` (reuses `y`) | Y | `_grad_sigmoid_templated` (ref: `_grad_sigmoid`) | `GradSigmoidTemplated` (ref: `GradSigmoid`) |
+| `Slice` | embed `g` into the selected positions with one constant selection `MatMul` per sliced axis (`Transpose`s around it when the axis is not last); static `starts`/`ends`/`axes`/`steps`, positive steps only | `_grad_slice` | `GradSlice` |
 | `Softmax` | `dx = y·(g - Σ(g·y))` along the softmax axis (reuses `y`) | | `_grad_softmax` | `GradSoftmax` |
+| `Squeeze` | `g` reshaped back to `data`'s own (pre-squeeze) shape; constant axes only | `_grad_squeeze_or_unsqueeze` | `GradSqueezeOrUnsqueeze` |
+| `Unsqueeze` | same as `Squeeze`, the same reshape back; constant axes only | `_grad_squeeze_or_unsqueeze` | `GradSqueezeOrUnsqueeze` |
 | `Sqrt` | `dx = 0.5·g/y` (reuses `y`; singular at `x = 0`) | Y | `_grad_sqrt_templated` (ref: `_grad_sqrt`) | `GradSqrtTemplated` (ref: `GradSqrt`) |
 | `Sub` | `da = g`, `db = -g` -- **not** templated; see below | | `_grad_sub` | `GradSub` |
 | `Tanh` | `dx = g·(1-y²)` (reuses `y`) | Y | `_grad_tanh_templated` (ref: `_grad_tanh`) | `GradTanhTemplated` (ref: `GradTanh`) |
@@ -95,21 +101,15 @@ once ported to C++; the only reason they live here is the missing mirror
 
 | ONNX op | VJP | Python rule |
 |---|---|---|
-| `Concat` | one `Gather` per input, pulling that input's own contiguous slice of `g` back out along the concat axis (`Split`'s adjoint, reached the other way) | `_grad_concat` |
 | `DequantizeLinear` | straight-through: `dx = g` (paired with `QuantizeLinear` below) | `_grad_dequantize_linear` |
 | `DepthToSpace` | reshape-transpose-reshape, the exact inverse of the op's own decomposition -- for `nn.PixelShuffle` exports | `_grad_depth_to_space` |
 | `Elu` | `g` for `x >= 0`, otherwise `g * (y + alpha)` using the forward output; `alpha` defaults to 1 | `_grad_elu` |
-| `Expand` | sum `g` over axes broadcast from `data`; constant target shape and static compatible inferred dimensions only, no gradient for `shape` | `_grad_expand` |
 | `GlobalAveragePool` | broadcast `g` over static spatial dimensions and scale by their reciprocal product; rank >= 3 | `_grad_global_averagepool` |
 | `IsNaN` | no gradient (boolean output) | `_grad_is_nan` |
 | `LeakyRelu` | `g` on `x > 0`, otherwise `alpha * g`; chooses `alpha` at `x = 0` | `_grad_leaky_relu` |
-| `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only | `_grad_pad` |
 | `PRelu` | `dX = g` for `x >= 0`, `slope*g` for `x < 0`; `dSlope = sum(g*x)` over negative inputs, reduced to the scalar slope shape | `_grad_prelu_scalar` |
 | `QuantizeLinear` | straight-through: `dx = g`, no gradient for `scale`/`zero_point` (fake-quantization convention) | `_grad_quantize_linear` |
-| `Slice` | embed `g` into the input positions selected by static `starts`/`ends`/`axes`/positive `steps`, using constant selection `MatMul`s | `_grad_slice` |
 | `Softplus` | `dx = g / (1 + exp(-x))`, the sigmoid derivative written with existing backward ops | `_grad_softplus` |
-| `Squeeze` | `g` reshaped back to `data`'s own (pre-squeeze) shape | `_grad_squeeze_or_unsqueeze` |
-| `Unsqueeze` | same as `Squeeze`, the same reshape either direction | `_grad_squeeze_or_unsqueeze` |
 | `Where` | `g` masked by `Cast(cond)` and routed to whichever of the two data operands was selected; `cond` gets no gradient | `_grad_where` |
 
 `PRelu` currently accepts only a static slope shape containing one element
