@@ -2744,6 +2744,8 @@ std::map<std::string, std::string> BuildBackwardImpl(
   // the time a producer asks for its output gradient the sum is complete.
   for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
     const onnx::NodeProto& node = *it;
+    // A Constant has no inputs, so it passes no gradient on; the rules that use its value read it through the context.
+    if (node.op_type() == "Constant") continue;
     const auto rule = rules.find(node.op_type());
     if (rule == rules.end()) {
       // The name a refusal points at: the node's own name where it has one,

@@ -3393,6 +3393,9 @@ def build_backward(
             )
 
     for node in reversed(nodes):
+        # A Constant has no inputs, so it passes no gradient on; the rules that use its value read it through the context.
+        if node.op_type == "Constant":
+            continue
         multi_rule = _MULTI_OUTPUT_RULES.get(node.op_type)
         if multi_rule is not None:
             # A different dispatch path from the single-output one below:
