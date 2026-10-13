@@ -310,7 +310,8 @@ Shapes PoolShapes() {
 // SupportedOps rather than to catch refusals) would admit a block in the
 // browser that the Python refuses, or the reverse.
 void TheSupportedOpsAreExactlyThePythonRuleTable() {
-  const std::set<std::string> expected = {"Add",
+  const std::set<std::string> expected = {"Abs",
+                                          "Add",
                                           "AveragePool",
                                           "BatchNormalization",
                                           "Clip",
@@ -326,8 +327,10 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
                                           "InstanceNormalization",
                                           "LayerNormalization",
                                           "Log",
+                                          "Max",
                                           "MatMul",
                                           "MaxPool",
+                                          "Min",
                                           "Mul",
                                           "Neg",
                                           "Pad",
@@ -343,7 +346,8 @@ void TheSupportedOpsAreExactlyThePythonRuleTable() {
                                           "Sub",
                                           "Tanh",
                                           "Transpose",
-                                          "Unsqueeze"};
+                                          "Unsqueeze",
+                                          "Where"};
   Check(SupportedOps() == expected,
         "SupportedOps() should equal graph_grad.py's _RULES keys, got {" +
             Join(SupportedOps()) + "}");
@@ -1409,6 +1413,121 @@ void TheFloatTypeOfTheBuilderReachesEveryConstantAndMask() {
 
 }  // namespace
 
+// The output name of every node `b` emitted, in order. The name counter is
+// part of the parity contract, so the emitted names are checked as well as
+// the op types: a reorder that keeps the op sequence but shifts a counter is
+// still a divergence from the Python.
+std::vector<std::string> OutputNames(const GraphBuilder& b) {
+  std::vector<std::string> names;
+  for (const onnx::NodeProto& node : b.nodes()) names.push_back(node.output(0));
+  return names;
+}
+
+// If this fails, Abs's gradient would not be sign(x) * g with sign(0) = 0, or
+// would emit nodes other than graph_grad.py's, in another order.
+void TheAbsRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  const std::vector<onnx::NodeProto> nodes = {Node("Abs", {"X"}, {"Y"})};
+  const Shapes shapes = {{"X", {2, 3}}, {"Y", {2, 3}}};
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+  // (x > 0) and (x < 0) as float masks, subtracted, then multiplied into dY.
+  const std::vector<std::string> expected_ops = {"Greater", "Cast", "Less",
+                                                 "Cast",    "Sub",  "Mul"};
+  const std::vector<std::string> expected_names = {"bw_greater_2", "bw_cast_3",
+                                                   "bw_less_4",    "bw_cast_5",
+                                                   "bw_sub_6",     "bw_mul_7"};
+  Check(OpTypes(b) == expected_ops,
+        "the Abs rule should emit graph_grad.py's nodes in its order");
+  Check(OutputNames(b) == expected_names,
+        "the Abs rule's name counters should match graph_grad.py's");
+  Check(b.initializer().size() == 1 &&
+            FloatData(b.initializer()[0]) == std::vector<float>{0.0f},
+        "the Abs rule should emit one initializer: the zero bound");
+  Check(grads.size() == 1 && grads.at("X") == "bw_mul_7",
+        "dX should be the final Mul");
+}
+
+// The Max and Min rules share one body and differ only in the comparison
+// (Greater for Max, Less for Min). If this fails, a tie would not split 1/2
+// each, or a broadcast would not be undone, or the two rules would drift
+// apart in emission order.
+void CheckMaxMinEmission(const std::string& op, bool is_max) {
+  const std::vector<onnx::NodeProto> nodes = {Node(op, {"A", "B"}, {"Y"})};
+  const Shapes shapes = {{"A", {2, 3}}, {"B", {3}}, {"Y", {2, 3}}};
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A", "B"});
+  const std::string cmp = is_max ? "Greater" : "Less";
+  const std::string n1 = is_max ? "bw_greater_1" : "bw_less_1";
+  const std::string n3 = is_max ? "bw_greater_3" : "bw_less_3";
+  const std::vector<std::string> expected_ops = {
+      cmp,   "Cast", cmp,   "Cast", "Sub",       "Add",
+      "Mul", "Sub",  "Mul", "Mul",  "ReduceSum", "Reshape"};
+  const std::vector<std::string> expected_names = {
+      n1,          "bw_cast_2",     n3,
+      "bw_cast_4", "bw_sub_5",      "bw_add_8",
+      "bw_mul_9",  "bw_sub_10",     "bw_mul_11",
+      "bw_mul_12", "bw_unbcast_14", "bw_unbcast_16"};
+  Check(OpTypes(b) == expected_ops,
+        op + " should emit graph_grad.py's nodes in its order");
+  Check(OutputNames(b) == expected_names,
+        op + "'s name counters should match graph_grad.py's");
+  Check(b.initializer().size() == 4,
+        op + " should emit four initializers: the 1.0 and 0.5 constants, and "
+             "the reduction's axes and shape");
+  Check(grads.at("A") == "bw_mul_11" && grads.at("B") == "bw_unbcast_16",
+        op + "'s dA and dB should be the two final nodes");
+}
+
+void TheMaxAndMinRulesEmitTheSameNodesInTheSameOrderAsThePython() {
+  CheckMaxMinEmission("Max", /*is_max=*/true);
+  CheckMaxMinEmission("Min", /*is_max=*/false);
+}
+
+// If this fails, Where's gradient would be emitted in a different order from
+// graph_grad.py's, or cond would take a gradient of its own.
+void TheWhereRuleEmitsTheSameNodesInTheSameOrderAsThePython() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Where", {"cond", "X", "Z"}, {"Y"})};
+  const Shapes shapes = {
+      {"cond", {2, 3}}, {"X", {3}}, {"Z", {2, 3}}, {"Y", {2, 3}}};
+  GraphBuilder b("bw_");
+  const std::map<std::string, std::string> grads =
+      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"X", "Z"});
+  // The mask from cond, then dX (multiply, reduce over X's broadcast), then
+  // dZ (multiply by the complement); the Python emits them in this order.
+  const std::vector<std::string> expected_ops = {"Cast",      "Sub",     "Mul",
+                                                 "ReduceSum", "Reshape", "Mul"};
+  const std::vector<std::string> expected_names = {
+      "bw_cast_1",    "bw_sub_3",     "bw_mul_4",
+      "bw_unbcast_6", "bw_unbcast_8", "bw_mul_9"};
+  Check(OpTypes(b) == expected_ops,
+        "Where should emit graph_grad.py's nodes in its order");
+  Check(OutputNames(b) == expected_names,
+        "Where's name counters should match graph_grad.py's");
+  Check(b.initializer().size() == 3,
+        "Where should emit three initializers: the 1.0 constant, and the "
+        "reduction's axes and shape");
+  Check(grads.count("cond") == 0,
+        "Where's cond input should have no gradient -- neither a node nor an "
+        "entry");
+  Check(grads.at("X") == "bw_unbcast_8" && grads.at("Z") == "bw_mul_9",
+        "dX and dZ should be the final nodes of their branches");
+}
+
+// Max and Min take the two-input form only: a variadic one has no single
+// selected input to route the gradient to, and guessing one would be wrong.
+void AVariadicMaxIsRefused() {
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Max", {"A", "B", "C"}, {"Y"})};
+  const Shapes shapes = {{"A", {3}}, {"B", {3}}, {"C", {3}}, {"Y", {3}}};
+  GraphBuilder b;
+  CheckThrows<UnsupportedOpError>(
+      [&] { BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A"}); },
+      "two-input", "a Max with three inputs should be refused");
+}
+
 // The constant-parameter initializers the structural rules read (a Slice's
 // starts, a Pad's pads, an Expand's shape), built the way the Python test
 // harness builds them: int64 raw_data, little-endian.
@@ -1690,6 +1809,10 @@ int main() {
   ATargetNoGradientReachesIsReportedRatherThanSilentlyMissing();
   AMissingShapeIsReportedRatherThanAssumed();
   AMultiOutputNodeIsRefused();
+  TheAbsRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  TheMaxAndMinRulesEmitTheSameNodesInTheSameOrderAsThePython();
+  TheWhereRuleEmitsTheSameNodesInTheSameOrderAsThePython();
+  AVariadicMaxIsRefused();
   TheFloatTypeOfTheBuilderReachesEveryConstantAndMask();
   TheSliceRuleEmitsTheSameNodesInTheSameOrderAsThePython();
   TheConcatRuleEmitsTheSameNodesInTheSameOrderAsThePython();

@@ -1644,6 +1644,79 @@ std::vector<OptStr> GradClip(Backward& ctx, const onnx::NodeProto& node,
   return grads;
 }
 
+// Abs: dX = g * sign(X), sign(0) = 0. See _grad_abs in graph_grad.py for the
+// convention at zero and why the sign is built from two strict masks.
+std::vector<OptStr> GradAbs(Backward& ctx, const onnx::NodeProto& node,
+                            const std::string& g) {
+  const std::string& x = node.input(0);
+  const std::string zero = ctx.b().Const(0.0f);
+  const std::string gt = ctx.MaskGreater(x, zero);
+  const std::string lt = ctx.MaskLess(x, zero);
+  const std::string sign = ctx.b().Sub(gt, lt);
+  return {ctx.b().Mul(g, sign)};
+}
+
+// Max and Min on two inputs: the gradient goes to the selected input, split
+// evenly on an exact tie. See _grad_max_min in graph_grad.py.
+std::vector<OptStr> GradMaxMin(Backward& ctx, const onnx::NodeProto& node,
+                               const std::string& g, bool is_max) {
+  if (node.input_size() != 2) {
+    throw UnsupportedOpError(
+        node.op_type() + " with " + std::to_string(node.input_size()) +
+        " inputs is not differentiated here: only the two-input elementwise "
+        "form has a rule (node " +
+        Quoted(node.output(0)) + ")");
+  }
+  const std::string& a = node.input(0);
+  const std::string& b = node.input(1);
+  const Shape out = ctx.ShapeOf(node.output(0));
+  const std::string a_wins =
+      is_max ? ctx.MaskGreater(a, b) : ctx.MaskLess(a, b);
+  const std::string b_wins =
+      is_max ? ctx.MaskGreater(b, a) : ctx.MaskLess(b, a);
+  const std::string diff = ctx.b().Sub(a_wins, b_wins);
+  const std::string one = ctx.b().Const(1.0f);
+  const std::string half = ctx.b().Const(0.5f);
+  const std::string shifted = ctx.b().Add(diff, one);
+  const std::string w_a = ctx.b().Mul(shifted, half);
+  const std::string w_b = ctx.b().Sub(one, w_a);
+  const std::string da_times = ctx.b().Mul(g, w_a);
+  const std::string da = ctx.ReduceTo(da_times, out, ctx.ShapeOf(a));
+  const std::string db_times = ctx.b().Mul(g, w_b);
+  const std::string db = ctx.ReduceTo(db_times, out, ctx.ShapeOf(b));
+  return {da, db};
+}
+
+std::vector<OptStr> GradMax(Backward& ctx, const onnx::NodeProto& node,
+                            const std::string& g) {
+  return GradMaxMin(ctx, node, g, /*is_max=*/true);
+}
+
+std::vector<OptStr> GradMin(Backward& ctx, const onnx::NodeProto& node,
+                            const std::string& g) {
+  return GradMaxMin(ctx, node, g, /*is_max=*/false);
+}
+
+// Where(cond, X, Z): dX and dZ are the incoming gradient split by a float 0/1
+// mask built from cond; cond takes no gradient. See _grad_where in
+// graph_grad.py.
+std::vector<OptStr> GradWhere(Backward& ctx, const onnx::NodeProto& node,
+                              const std::string& g) {
+  const std::string& cond = node.input(0);
+  const std::string& x = node.input(1);
+  const std::string& z = node.input(2);
+  const Shape out = ctx.ShapeOf(node.output(0));
+  const std::string mask = ctx.b().Op(
+      "Cast", {cond}, {IntAttr("to", onnx::TensorProto::FLOAT)}, "cast");
+  const std::string one = ctx.b().Const(1.0f);
+  const std::string not_mask = ctx.b().Sub(one, mask);
+  const std::string dx_times = ctx.b().Mul(g, mask);
+  const std::string dx = ctx.ReduceTo(dx_times, out, ctx.ShapeOf(x));
+  const std::string dz_times = ctx.b().Mul(g, not_mask);
+  const std::string dz = ctx.ReduceTo(dz_times, out, ctx.ShapeOf(z));
+  return {std::nullopt, dx, dz};
+}
+
 std::vector<OptStr> GradGather(Backward& ctx, const onnx::NodeProto& node,
                                const std::string& g) {
   // Gather's gradient: a scatter-add into `data`, `indices` itself untouched
@@ -2478,6 +2551,7 @@ std::vector<OptStr> GradSqueezeOrUnsqueeze(Backward& ctx,
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
+          {"Abs", &GradAbs},
           {"Add", &GradAddTemplated},
           {"AveragePool", &GradAveragePool},
           {"BatchNormalization", &GradBatchNormalizationTemplated},
@@ -2494,8 +2568,10 @@ const std::map<std::string, Rule>& Rules() {
           {"InstanceNormalization", &GradInstanceNormalization},
           {"LayerNormalization", &GradLayerNormalization},
           {"Log", &GradLogTemplated},
+          {"Max", &GradMax},
           {"MatMul", &GradMatMul},
           {"MaxPool", &GradMaxPool},
+          {"Min", &GradMin},
           {"Mul", &GradMulTemplated},
           {"Neg", &GradNegTemplated},
           {"Pad", &GradPad},
@@ -2511,6 +2587,7 @@ const std::map<std::string, Rule>& Rules() {
           {"Sub", &GradSub},
           {"Tanh", &GradTanhTemplated},
           {"Transpose", &GradTranspose},
+          {"Where", &GradWhere},
           {"Unsqueeze", &GradSqueezeOrUnsqueeze},
       };
   return *rules;

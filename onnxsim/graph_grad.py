@@ -2155,6 +2155,81 @@ def _grad_clip(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[st
     return [ctx.b.mul(g, mask)] + rest
 
 
+def _grad_abs(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    """``Y = Abs(X)``: ``dX = g * sign(X)``, with the convention ``sign(0) = 0``.
+
+    ``|x|`` has a corner at zero and no derivative there. The convention is
+    that the gradient at exactly zero is 0, which is also the midpoint of the
+    subdifferential ``[-1, 1]`` -- the symmetric choice, not one side's slope.
+    The sign is built as ``(x > 0) - (x < 0)`` from the same float masks
+    :func:`_grad_clip` uses. That is exactly 0 at zero, and it needs nothing
+    outside :data:`BACKWARD_OPS`.
+    """
+    x = node.input[0]
+    zero = ctx.b.const(0.0)
+    gt = ctx.mask_greater(x, zero)
+    lt = ctx.mask_less(x, zero)
+    sign = ctx.b.sub(gt, lt)
+    return [ctx.b.mul(g, sign)]
+
+
+def _grad_max_min(
+    ctx: _Backward, node: onnx.NodeProto, g: str, *, is_max: bool
+) -> List[Optional[str]]:
+    """``Y = Max(A, B)`` or ``Y = Min(A, B)`` on two inputs, elementwise: the
+    gradient goes to whichever input was selected.
+
+    Both are piecewise linear, so at an exact tie (``A == B``) neither input's
+    slope alone is right. The convention is an even split: each input takes
+    half of ``g`` on a tie, and all of it where it strictly wins. Each input's
+    share is ``w_A = 0.5 * (1 + a_wins - b_wins)`` with ``a_wins``/``b_wins``
+    the strict float masks for "this input is the selected one" (``>`` for
+    Max, ``<`` for Min), and ``w_B = 1 - w_A``. Every value involved is
+    exactly 0, 0.5 or 1, so the split is exact in float32.
+
+    The split is the one a central finite difference returns at a tie, since
+    the two one-sided slopes average to it. That is what lets the
+    finite-difference tests confirm the convention rather than only assert it.
+
+    Only the two-input form has a rule. A variadic Max/Min has no single
+    "selected input" to route the gradient to, so it is refused.
+
+    Broadcasting: each share has the output's shape, and :meth:`reduce_to`
+    undoes the broadcast for each input the way the other elementwise rules do.
+    """
+    if len(node.input) != 2:
+        raise UnsupportedOpError(
+            f"{node.op_type} with {len(node.input)} inputs is not differentiated "
+            "here: only the two-input elementwise form has a rule (node "
+            f"{node.output[0]!r})"
+        )
+    a, b = node.input
+    out = ctx.shape(node.output[0])
+    if is_max:
+        a_wins = ctx.mask_greater(a, b)
+        b_wins = ctx.mask_greater(b, a)
+    else:
+        a_wins = ctx.mask_less(a, b)
+        b_wins = ctx.mask_less(b, a)
+    diff = ctx.b.sub(a_wins, b_wins)
+    one = ctx.b.const(1.0)
+    half = ctx.b.const(0.5)
+    shifted = ctx.b.add(diff, one)
+    w_a = ctx.b.mul(shifted, half)
+    w_b = ctx.b.sub(one, w_a)
+    da = ctx.reduce_to(ctx.b.mul(g, w_a), out, ctx.shape(a))
+    db = ctx.reduce_to(ctx.b.mul(g, w_b), out, ctx.shape(b))
+    return [da, db]
+
+
+def _grad_max(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    return _grad_max_min(ctx, node, g, is_max=True)
+
+
+def _grad_min(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+    return _grad_max_min(ctx, node, g, is_max=False)
+
+
 def _grad_where(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     """``Y = Where(cond, X, Z)`` selects ``X`` where ``cond`` is true and
     ``Z`` otherwise, elementwise, with all three inputs broadcasting together
@@ -2822,6 +2897,7 @@ def _grad_div_templated(
 
 
 _RULES: Dict[str, Rule] = {
+    "Abs": _grad_abs,
     "Add": _grad_add_templated,
     "AveragePool": _grad_averagepool,
     "BatchNormalization": _grad_batch_normalization_templated,
@@ -2838,8 +2914,10 @@ _RULES: Dict[str, Rule] = {
     "InstanceNormalization": _grad_instance_normalization,
     "LayerNormalization": _grad_layer_normalization,
     "Log": _grad_log_templated,
+    "Max": _grad_max,
     "MatMul": _grad_matmul,
     "MaxPool": _grad_maxpool,
+    "Min": _grad_min,
     "Mul": _grad_mul_templated,
     "Neg": _grad_neg_templated,
     "Pad": _grad_pad,
@@ -2855,6 +2933,7 @@ _RULES: Dict[str, Rule] = {
     "Sub": _grad_sub,
     "Tanh": _grad_tanh_templated,
     "Transpose": _grad_transpose,
+    "Where": _grad_where,
     "Unsqueeze": _grad_squeeze_or_unsqueeze,
 }
 
@@ -2866,7 +2945,7 @@ _RULES: Dict[str, Rule] = {
 #: :data:`SUPPORTED_OPS` that ``tests/test_qat_parity.py`` checks against
 #: ``qat_entry.cpp``'s hardcoded C++ rule table. Unlike
 #: :data:`_MULTI_OUTPUT_RULES`, every rule here is an ordinary
-#: single-``g`` :data:`Rule` -- ``Where``/``IsNaN`` (numerical-stability
+#: single-``g`` :data:`Rule` -- ``IsNaN`` (numerical-stability
 #: masking in wav2vec2's own attention output, see
 #: ``docs/axera-audio-speech-op-coverage.md``), and ``DepthToSpace``
 #: (`nn.PixelShuffle`'s ONNX form -- the sub-pixel convolution upsampler
@@ -2920,7 +2999,6 @@ _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "PRelu": _grad_prelu_scalar,
     "QuantizeLinear": _grad_quantize_linear,
     "Softplus": _grad_softplus,
-    "Where": _grad_where,
 }
 
 # The op types :func:`build_backward` can differentiate. Callers that pick
@@ -2953,7 +3031,7 @@ def supported_ops() -> frozenset:
     unioned with every op type currently registered via
     :func:`register_gradient`, every op type in :data:`_MULTI_OUTPUT_RULES`
     (``Split`` today), and every op type in :data:`_PYTHON_ONLY_RULES`
-    (``IsNaN``/``Where`` today). This is the set :func:`build_backward`
+    (``IsNaN``, ``Concat``, ``Squeeze``, ... today). This is the set :func:`build_backward`
     (called the ordinary way, with ``rules=None``) can actually
     differentiate right now."""
     return (
