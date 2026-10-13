@@ -179,14 +179,8 @@ std::optional<Shape> Gemm(const Shape& a, const Shape& b, bool trans_a,
 // attribute is absent, and it defaults per spatial axis: stride 1, dilation 1,
 // pad 0. ceil_mode defaults to false.
 //
-// KNOWN DEVIATION FROM ONNX (kept so behavior is unchanged): `pads` is read as
-// interleaved [begin_0, end_0, begin_1, end_1, ...]. The ONNX spec gives
-// [begin_0, begin_1, ..., end_0, end_1, ...]. The two agree whenever begin ==
-// end on every axis, which covers all symmetric padding. They disagree on
-// asymmetric padding, where the output size comes out wrong (for example
-// pads=[0,0,1,1] on a 5x5 input). Fixing this changes existing behavior, so it
-// is left for a deliberate follow-up.
-//
+// `pads` is read in the ONNX layout: [begin_0, ..., begin_{n-1}, end_0, ...,
+// end_{n-1}].
 // KNOWN GAP: the `auto_pad` string attribute is not modelled. SAME_UPPER and
 // SAME_LOWER are treated as zero padding, so their output sizes are wrong.
 struct WindowAttrs {
