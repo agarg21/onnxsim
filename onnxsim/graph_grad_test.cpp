@@ -1337,6 +1337,52 @@ void AMultiOutputNodeIsRefused() {
       "single-output", "a multi-output node should be refused");
 }
 
+
+// A float64 forward needs float64 constants and masks next to it: with
+// SetFloatType(DOUBLE) every floating-point initializer a rule builds is
+// DOUBLE, every mask Cast goes to DOUBLE, and a mean's 1/N is the double
+// 1/N, not float(1/N) widened. The default stays FLOAT.
+void TheFloatTypeOfTheBuilderReachesEveryConstantAndMask() {
+  for (int32_t type : {onnx::TensorProto::FLOAT, onnx::TensorProto::DOUBLE}) {
+    GraphBuilder b("t_");
+    b.SetFloatType(type);
+    Check(b.float_type() == type, "SetFloatType is remembered");
+    const std::vector<onnx::NodeProto> slice{
+        Node("Relu", {"A"}, {"R"}),
+        Node("Clip", {"R", "lo", "hi"}, {"C"}),
+        Node("ReduceMean", {"C", "ax0"}, {"Y"}, {IntAttr("keepdims", 0)}),
+    };
+    const Shapes shapes{{"A", {3}}, {"R", {3}}, {"C", {3}}, {"lo", {}}, {"hi", {}}, {"Y", {}}};
+    const std::string seed = b.Const(1.0f, "seed");
+    const auto grads = BuildBackward(b, slice, shapes, {{"Y", seed}}, {"A"});
+    Check(grads.count("A") == 1, "the gradient of A is returned");
+    bool saw_mean = false;
+    for (const onnx::TensorProto& t : b.initializer()) {
+      if (t.data_type() == onnx::TensorProto::INT64) continue;
+      Check(t.data_type() == type, "initializer " + t.name() + " has the builder's float type");
+      if (t.name().find("bcast") == std::string::npos) continue;
+      saw_mean = true;
+      if (type == onnx::TensorProto::DOUBLE) {
+        double v = 0;
+        Check(t.raw_data().size() == 3 * sizeof(double), "a double per element");
+        std::memcpy(&v, t.raw_data().data(), sizeof(v));
+        Check(v == 1.0 / 3.0, "the mean's 1/N is the double 1/3");
+      }
+    }
+    Check(saw_mean, "the mean rule built its broadcast constant");
+    bool saw_cast = false;
+    for (const onnx::NodeProto& n : b.nodes()) {
+      if (n.op_type() != "Cast") continue;
+      saw_cast = true;
+      Check(n.attribute(0).i() == type, "the mask Cast goes to the builder's float type");
+    }
+    Check(saw_cast, "Relu and Clip built masks");
+  }
+  GraphBuilder b;
+  CheckThrows<std::invalid_argument>([&] { b.SetFloatType(onnx::TensorProto::INT32); }, "FLOAT or DOUBLE",
+                                     "an integer type is not a float type");
+}
+
 }  // namespace
 
 int main() {
@@ -1370,6 +1416,7 @@ int main() {
   ATargetNoGradientReachesIsReportedRatherThanSilentlyMissing();
   AMissingShapeIsReportedRatherThanAssumed();
   AMultiOutputNodeIsRefused();
+  TheFloatTypeOfTheBuilderReachesEveryConstantAndMask();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

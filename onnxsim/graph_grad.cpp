@@ -217,13 +217,13 @@ class Backward {
   // tensor name rather than GraphBuilder::GreaterMask's float.
   std::string MaskGreater(const std::string& x, const std::string& bound) {
     const std::string gt = b_.Op("Greater", {x, bound}, "greater");
-    return b_.Op("Cast", {gt}, {IntAttr("to", onnx::TensorProto::FLOAT)},
+    return b_.Op("Cast", {gt}, {IntAttr("to", b_.float_type())},
                  "cast");
   }
 
   std::string MaskLess(const std::string& x, const std::string& bound) {
     const std::string lt = b_.Op("Less", {x, bound}, "less");
-    return b_.Op("Cast", {lt}, {IntAttr("to", onnx::TensorProto::FLOAT)},
+    return b_.Op("Cast", {lt}, {IntAttr("to", b_.float_type())},
                  "cast");
   }
 
@@ -1341,15 +1341,10 @@ std::vector<OptStr> GradReduce(Backward& ctx, const onnx::NodeProto& node,
     fill = 1.0 / count;
   }
   Shape ones_shape = in_shape;
-  int64_t elements = 1;
   for (size_t i = 0; i < ones_shape.size(); ++i) {
     if (axes.count(static_cast<int64_t>(i)) == 0) ones_shape[i] = 1;
-    elements *= ones_shape[i];
   }
-  const std::string ones =
-      ctx.b().Const(std::vector<float>(static_cast<size_t>(elements),
-                                       static_cast<float>(fill)),
-                    ones_shape, "bcast");
+  const std::string ones = ctx.b().ConstFill(fill, ones_shape, "bcast");
   std::vector<OptStr> grads{ctx.b().Mul(grad, ones)};
   grads.insert(grads.end(), rest.begin(), rest.end());
   return grads;
@@ -1694,7 +1689,7 @@ std::vector<OptStr> GradGather(Backward& ctx, const onnx::NodeProto& node,
   const std::string flat_idx =
       ctx.b().Op("Reshape", {indices, flat_shape}, "reshape");
   const std::string idx_f = ctx.b().Op(
-      "Cast", {flat_idx}, {IntAttr("to", onnx::TensorProto::FLOAT)}, "cast");
+      "Cast", {flat_idx}, {IntAttr("to", ctx.b().float_type())}, "cast");
   const std::string zero = ctx.b().Const(0.0f);
   const std::string is_negative = ctx.MaskLess(idx_f, zero);
   const std::string count_const = ctx.b().Const(static_cast<float>(count));
