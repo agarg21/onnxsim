@@ -222,7 +222,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/graph_grad_model.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
 
 if (ONNXSIM_BUILTIN_REMOTE_EXECUTOR)
   target_sources(onnxsim PRIVATE onnxsim/remote_executor.cpp)
@@ -712,6 +712,14 @@ if (ONNXSIM_TESTS)
   target_link_libraries(graph_grad_test onnxsim)
   onnxsim_add_ort_rpath(graph_grad_test)
   add_test(NAME graph_grad_test COMMAND graph_grad_test)
+
+  # graph_grad_model.{h,cpp}: the gradient of a whole model (slice, shapes,
+  # seed, zero gradients, inlining, unique names). Compiled into the `onnxsim`
+  # library like graph_grad.cpp; this test gets it from there.
+  add_executable(graph_grad_model_test onnxsim/graph_grad_model_test.cpp)
+  target_link_libraries(graph_grad_model_test onnxsim)
+  onnxsim_add_ort_rpath(graph_grad_model_test)
+  add_test(NAME graph_grad_model_test COMMAND graph_grad_model_test)
 
   # BuildBackwardWithTemplatedRules, graph_grad.cpp's onnxscript-templated
   # rules (see that file's "Templated rules" section), now wired into

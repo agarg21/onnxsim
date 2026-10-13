@@ -17,6 +17,7 @@
 
 #include "custom_optimizer_passes.h"
 #include "function_rewriter.h"
+#include "graph_grad_model.h"
 #include "model_info.h"
 #include "onnx/defs/parser.h"
 #include "onnx/proto_utils.h"
@@ -787,6 +788,55 @@ OnnxsimStatus onnxsim_import_gguf(const char* in_path, void** out_data,
     return ONNXSIM_ERROR;
   } catch (...) {
     SetError(out_error, "unknown error while importing the gguf file");
+    return ONNXSIM_ERROR;
+  }
+}
+
+OnnxsimStatus onnxsim_gradient_model(const void* model_data, size_t model_size,
+                                     const char* loss, const char* const* wrt,
+                                     size_t num_wrt, const char* prefix,
+                                     void** out_data, size_t* out_size,
+                                     char** out_error) {
+  try {
+    if (model_data == nullptr || loss == nullptr ||
+        (num_wrt != 0 && wrt == nullptr)) {
+      SetError(out_error,
+               "onnxsim_gradient_model: model, loss and wrt must not be NULL");
+      return ONNXSIM_ERROR;
+    }
+    onnx::ModelProto forward;
+    if (!forward.ParseFromArray(model_data, static_cast<int>(model_size))) {
+      SetError(
+          out_error,
+          "onnxsim_gradient_model: the model is not a serialized ModelProto");
+      return ONNXSIM_ERROR;
+    }
+    std::vector<std::string> targets;
+    for (size_t k = 0; k < num_wrt; ++k) {
+      if (wrt[k] == nullptr) {
+        SetError(out_error, "onnxsim_gradient_model: a wrt name is NULL");
+        return ONNXSIM_ERROR;
+      }
+      targets.emplace_back(wrt[k]);
+    }
+    const onnx::ModelProto gradient = BuildGradientModel(
+        forward, loss, targets, prefix != nullptr ? prefix : "grad_");
+    std::string bytes;
+    if (!gradient.SerializeToString(&bytes)) {
+      SetError(out_error, "failed to serialize the gradient model");
+      return ONNXSIM_ERROR;
+    }
+    if (out_data != nullptr && out_size != nullptr &&
+        !CopyToBuffer(bytes, out_data, out_size)) {
+      SetError(out_error, "out of memory while returning the gradient model");
+      return ONNXSIM_ERROR;
+    }
+    return ONNXSIM_OK;
+  } catch (const std::exception& e) {
+    SetError(out_error, e.what());
+    return ONNXSIM_ERROR;
+  } catch (...) {
+    SetError(out_error, "unknown error while building the gradient model");
     return ONNXSIM_ERROR;
   }
 }
