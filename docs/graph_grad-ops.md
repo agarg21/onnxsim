@@ -31,6 +31,7 @@ templatable but deliberately are not.
 
 | ONNX op | VJP | Templated? | Python rule | C++ rule |
 |---|---|:-:|---|---|
+| `Abs` | `dx = g * sign(x)`, with `sign(0) = 0` (the masks `(x > 0) - (x < 0)`) | | `_grad_abs` | `GradAbs` |
 | `Add` | `da = db = g`, broadcast-reduced | Y | `_grad_add_templated` (ref: `_grad_add`) | `GradAddTemplated` (ref: `GradAdd`) |
 | `AveragePool` | col2im of `g`, scaled by each window's `1/count` | | `_grad_averagepool` | `GradAveragePool` |
 | `BatchNormalization` | `xhat`/`inv`-based; the rule whose hand-written `dvar` factor motivated the whole templating effort | Y | `_grad_batch_normalization_templated` (ref: `_grad_batch_normalization`) | `GradBatchNormalizationTemplated` (ref: `GradBatchNormalization`) |
@@ -48,7 +49,9 @@ templatable but deliberately are not.
 | `LayerNormalization` | `xhat`-based `dx`/`dscale`/`dbias` | | `_grad_layer_normalization` | `GradLayerNormalization` |
 | `Log` | `dx = g/x` (singular at `x = 0`, genuinely) | Y | `_grad_log_templated` (ref: `_grad_log`) | `GradLogTemplated` (ref: `GradLog`) |
 | `MatMul` | `dA = g @ Bᵀ`, `dB = Aᵀ @ g` | | `_grad_matmul` | `GradMatMul` |
+| `Max` | two inputs only: `g` to the selected input, `1/2` each on an exact tie; broadcasting undone by `reduce_to`; a variadic `Max` is refused | | `_grad_max` | `GradMax` |
 | `MaxPool` | col2im, credit split among tied maxima | | `_grad_maxpool` | `GradMaxPool` |
+| `Min` | two inputs only: `g` to the selected input, `1/2` each on an exact tie; broadcasting undone by `reduce_to`; a variadic `Min` is refused | | `_grad_min` | `GradMin` |
 | `Mul` | `da = g·b`, `db = g·a` | Y | `_grad_mul_templated` (ref: `_grad_mul`) | `GradMulTemplated` (ref: `GradMul`) |
 | `Neg` | `dx = -g` | Y | `_grad_neg_templated` (ref: `_grad_neg`) | `GradNegTemplated` (ref: `GradNeg`) |
 | `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only, a constant scalar `constant_value` gets no gradient | `_grad_pad` | `GradPad` |
