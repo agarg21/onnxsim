@@ -1066,6 +1066,71 @@ _CASES = {
         """,
         None,
     ),
+    "abs": (
+        """
+        g (float[3,4] X) => (float[3,4] Y) {
+          Y = Abs(X)
+        }
+        """,
+        None,
+    ),
+    # Exact zeros, every third element. A central difference across |x| at 0
+    # is (|h| - |-h|) / 2h = 0, so the finite difference itself lands on the
+    # convention sign(0) = 0 that _grad_abs documents.
+    "abs_at_zero": (
+        """
+        g (float[3,4] X) => (float[3,4] Y) {
+          Y = Abs(X)
+        }
+        """,
+        {
+            "X": lambda rng, shape: np.where(
+                np.arange(12).reshape(shape) % 3 == 0, 0.0, rng.standard_normal(shape)
+            )
+        },
+    ),
+    # Broadcasting: B is narrower than the output, so its gradient has to be
+    # summed back down over the broadcast axis.
+    "max": (
+        """
+        g (float[3,4] A, float[4] B) => (float[3,4] Y) {
+          Y = Max(A, B)
+        }
+        """,
+        None,
+    ),
+    "min": (
+        """
+        g (float[3,4] A, float[4] B) => (float[3,4] Y) {
+          Y = Min(A, B)
+        }
+        """,
+        None,
+    ),
+    # Exact ties against a constant: A == C at four of the six positions (the
+    # other two are strict wins, so both kinds are in the one case). A central
+    # difference across a kink is the average of the two one-sided slopes,
+    # which is exactly the even split (1/2 each) that _grad_max_min documents.
+    "max_ties": (
+        """
+        g (float[2,3] A) => (float[2,3] Y)
+        <float[2,3] C = {0.5, -1.0, 2.0, 0.5, -1.0, 2.0}>
+        {
+          Y = Max(A, C)
+        }
+        """,
+        {"A": lambda rng, shape: np.array([[0.5, 3.0, 2.0], [0.5, -1.0, 4.0]])},
+    ),
+    "min_ties": (
+        """
+        g (float[2,3] A) => (float[2,3] Y)
+        <float[2,3] C = {0.5, -1.0, 2.0, 0.5, -1.0, 2.0}>
+        {
+          Y = Min(A, C)
+        }
+        """,
+        {"A": lambda rng, shape: np.array([[0.5, -3.0, 2.0], [0.5, -1.0, -4.0]])},
+    ),
     # Found real and load-bearing, not theoretical: a real NVIDIA Parakeet
     # decoder export (docs/axera-audio-speech-op-coverage.md's LSTM/GRU
     # section) has a bare `Squeeze` between its two LSTM layers that
@@ -1127,6 +1192,197 @@ def test_rule_matches_finite_differences(case, seed):
     # cheap at these sizes.
     body, overrides = _CASES[case]
     _check(_model(body), overrides=overrides, seed=seed)
+
+
+def _exact_gradients(body, feeds, seed, targets):
+    """The emitted backward's gradients for ``targets``, as onnxruntime
+    computes them -- compared against hand-derived arrays, not a finite
+    difference, so the expected values can be exact."""
+    backward = _backward_model(_model(body), targets)
+    session = ort.InferenceSession(
+        backward.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    return session.run([f"grad_{t}" for t in targets], dict(feeds, dY=seed))
+
+
+# Every value below is a small integer or a half, so the float32 products and
+# sums are exact and the comparisons are exact too.
+_MINMAX_BODY = """
+    g (float[2,3] A, float[3] B) => (float[2,3] Y) {{
+      Y = {op}(A, B)
+    }}
+    """
+_MINMAX_A = np.array([[1.0, 3.0, 2.0], [0.0, -1.0, 4.0]], dtype=np.float32)
+_MINMAX_B = np.array([2.0, 3.0, -5.0], dtype=np.float32)
+_MINMAX_SEED = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+
+
+def test_abs_gradient_is_the_sign_of_the_input_with_zero_at_zero():
+    body = """
+        g (float[4] X) => (float[4] Y) {
+          Y = Abs(X)
+        }
+        """
+    x = np.array([-2.0, 0.0, 3.0, -0.5], dtype=np.float32)
+    seed = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    (dx,) = _exact_gradients(body, {"X": x}, seed, ["X"])
+    # dX = seed * sign(X): the 0 at x = 0 is the convention, not a slope.
+    np.testing.assert_array_equal(dx, [-1.0, 0.0, 3.0, -4.0])
+
+
+def test_max_routes_the_gradient_to_the_larger_input_and_splits_ties():
+    # A = [[1, 3, 2], [0, -1, 4]] against a broadcast B = [2, 3, -5]:
+    #   (0,0) B wins; (0,1) tie; (0,2) A wins; (1,0) B wins; (1,1) B wins;
+    #   (1,2) A wins. So A's share is [[0, 1/2, 1], [0, 0, 1]] of the seed,
+    # and B's share is the complement, summed over the broadcast axis:
+    #   dA = [[0, 1, 3], [0, 0, 6]];  dB = [1 + 4, 1 + 5, 0] = [5, 6, 0].
+    da, db = _exact_gradients(
+        _MINMAX_BODY.format(op="Max"),
+        {"A": _MINMAX_A, "B": _MINMAX_B},
+        _MINMAX_SEED,
+        ["A", "B"],
+    )
+    np.testing.assert_array_equal(da, [[0.0, 1.0, 3.0], [0.0, 0.0, 6.0]])
+    np.testing.assert_array_equal(db, [5.0, 6.0, 0.0])
+
+
+def test_min_routes_the_gradient_to_the_smaller_input_and_splits_ties():
+    # The same inputs under Min: (0,0) A wins; (0,1) tie; (0,2) B wins;
+    # (1,0) A wins; (1,1) A wins; (1,2) B wins.
+    #   dA = [[1, 1, 0], [4, 5, 0]];  dB = [0 + 0, 1 + 0, 3 + 6] = [0, 1, 9].
+    da, db = _exact_gradients(
+        _MINMAX_BODY.format(op="Min"),
+        {"A": _MINMAX_A, "B": _MINMAX_B},
+        _MINMAX_SEED,
+        ["A", "B"],
+    )
+    np.testing.assert_array_equal(da, [[1.0, 1.0, 0.0], [4.0, 5.0, 0.0]])
+    np.testing.assert_array_equal(db, [0.0, 1.0, 9.0])
+
+
+def test_where_routes_the_gradient_by_condition_and_never_to_the_condition():
+    body = """
+        g (float[3] X, float[2,3] Z) => (float[2,3] Out)
+        <bool[2,3] cond = {1, 0, 1, 0, 0, 1}>
+        {
+          Out = Where(cond, X, Z)
+        }
+        """
+    x = np.array([10.0, 20.0, 30.0], dtype=np.float32)
+    z = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+    seed = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+    dx, dz = _exact_gradients(body, {"X": x, "Z": z}, seed, ["X", "Z"])
+    # cond = [[1, 0, 1], [0, 0, 1]]: X takes seed where cond is true, summed
+    # over the broadcast axis: [1 + 0, 0 + 0, 3 + 6] = [1, 0, 9].
+    # Z takes the complement: [[0, 2, 0], [4, 5, 0]].
+    np.testing.assert_array_equal(dx, [1.0, 0.0, 9.0])
+    np.testing.assert_array_equal(dz, [[0.0, 2.0, 0.0], [4.0, 5.0, 0.0]])
+
+
+def test_a_variadic_max_is_refused_rather_than_guessed():
+    # Only the two-input form has a single "selected input" to route to.
+    body = """
+        g (float[3] A, float[3] B, float[3] C) => (float[3] Y) {
+          Y = Max(A, B, C)
+        }
+        """
+    model = _model(body)
+    with pytest.raises(graph_grad.UnsupportedOpError, match="two-input"):
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder("bw_"),
+            list(model.graph.node),
+            _static_shapes(model),
+            {"Y": "dY"},
+            ["A"],
+        )
+
+
+@pytest.mark.parametrize(
+    "op, expected",
+    [
+        # Max: the selected-A mask is Greater(A, B) then Greater(B, A).
+        ("Max", ["Greater", "Cast", "Greater", "Cast"]),
+        # Min: the same shape with Less, so the two rules differ only there.
+        ("Min", ["Less", "Cast", "Less", "Cast"]),
+    ],
+)
+def test_the_minmax_rules_emit_a_fixed_node_sequence_and_names(op, expected):
+    """The exact emitted sequence, names included, for the rules whose C++
+    port (``GradMaxMin``) pins the same list in ``graph_grad_test.cpp``. A
+    reorder on either side is a parity break, and this is what says so."""
+    model = _model(_MINMAX_BODY.format(op=op))
+    b = qat_graph.GraphBuilder("bw_")
+    grads = graph_grad.build_backward(
+        b, list(model.graph.node), _static_shapes(model), {"Y": "dY"}, ["A", "B"]
+    )
+    assert [n.op_type for n in b.nodes] == expected + [
+        "Sub",
+        "Add",
+        "Mul",
+        "Sub",
+        "Mul",
+        "Mul",
+        "ReduceSum",
+        "Reshape",
+    ]
+    assert [n.output[0] for n in b.nodes] == [
+        "bw_greater_1" if op == "Max" else "bw_less_1",
+        "bw_cast_2",
+        "bw_greater_3" if op == "Max" else "bw_less_3",
+        "bw_cast_4",
+        "bw_sub_5",
+        "bw_add_8",
+        "bw_mul_9",
+        "bw_sub_10",
+        "bw_mul_11",
+        "bw_mul_12",
+        "bw_unbcast_14",
+        "bw_unbcast_16",
+    ]
+    assert grads == {"A": "bw_mul_11", "B": "bw_unbcast_16"}
+    assert len(b.initializer) == 4
+
+
+def test_the_new_rules_are_in_the_python_rule_table_and_the_cpp_port_agrees():
+    """Parity of the rule table and emittable-op set, checked without building
+    the C++ port: the Python tables against the fixture, and the C++ source's
+    own ``Rules()`` and ``BackwardOps()`` against the same Python sets.
+
+    graph_grad_test.cpp and qat_graph_parity_test.cpp check the C++ side the
+    other way round, when the C++ is built; this is the check that runs with
+    only Python."""
+    import os
+    import re
+
+    new = {"Abs", "Max", "Min", "Where"}
+    assert new <= graph_grad.SUPPORTED_OPS
+    assert new <= graph_grad.supported_ops()
+    assert not (new & set(graph_grad._PYTHON_ONLY_RULES))
+
+    root = os.path.join(os.path.dirname(__file__), "..", "onnxsim")
+    fixture = open(os.path.join(root, "qat_parity_fixtures.txt")).read()
+    pinned = {
+        line.split(" ", 1)[0]: line.split(" ", 1)[1].split(",")
+        for line in fixture.splitlines()
+        if line.startswith(("rules ", "backward_ops "))
+    }
+    assert pinned["rules"] == sorted(graph_grad.SUPPORTED_OPS)
+    assert pinned["backward_ops"] == sorted(graph_grad.BACKWARD_OPS)
+
+    cpp = open(os.path.join(root, "graph_grad.cpp")).read()
+
+    def cpp_block(opener, closer):
+        start = cpp.index(opener)
+        return cpp[start : cpp.index(closer, start)]
+
+    rules_block = cpp_block("Rules() {", "return *rules;")
+    cpp_rules = set(re.findall(r'\{"(\w+)", &Grad\w+\}', rules_block))
+    assert cpp_rules == set(graph_grad.SUPPORTED_OPS)
+    assert new <= cpp_rules
+
+    allow_block = cpp_block("BackwardOps() {", "return *ops;")
+    cpp_backward = set(re.findall(r'"(\w+)"', allow_block))
+    assert cpp_backward == set(graph_grad.BACKWARD_OPS)
 
 
 @pytest.mark.parametrize(
