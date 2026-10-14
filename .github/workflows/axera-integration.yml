@@ -28,7 +28,7 @@ name: Axera Integration
 
 on:
   schedule:
-    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
+    - cron: "0 7 * * *" # Daily 07:00 UTC (nightly)
   workflow_dispatch:
     inputs:
       convert_models:
@@ -39,8 +39,6 @@ on:
     paths:
       - ".github/workflows/axera-integration.yml"
       - "scripts/axera/**"
-      - "scripts/common/**"
-      - "scripts/regression/model_zoo.py"
       - "tests/test_pulsar2_compat.py"
       - "tests/test_pulsar2_simulator.py"
       - "tests/test_pulsar2_hf_to_axmodel.py"
