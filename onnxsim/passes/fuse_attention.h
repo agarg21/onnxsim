@@ -66,7 +66,8 @@
 // is shape-equivalent to the direct form via shape inference rather than by
 // decoding the two Reshapes' (possibly dynamic) target-shape computations.
 // Only self-attention (Q, K, V all reading the *same* source activation) with
-// no attention mask, no past/present KV cache, and a Softmax over the last
+// no attention mask (masked/KV-cache variants go to MatchCausalAttention
+// below), and a Softmax over the last
 // axis (`axis=-1` or the input's last dimension index -- both are safe here
 // regardless of the pre-/post-opset-13 Softmax axis-semantics split, since
 // the matched score tensor is always exactly rank 4 by construction, and
@@ -75,6 +76,19 @@
 // is handled. Q and K must have the same per-head size (required for the
 // Q@K^T dot product to be well-formed); V's hidden size may differ, per
 // `Attention`'s own documented `qkv_hidden_sizes` semantics.
+//
+// Masked and KV-cache attention -- a constant additive mask between the
+// scaled Q@K^T and the Softmax (`Add(scores, mask)`), with K/V possibly
+// `Concat`-ed onto a cached past -- is handled by a separate matcher,
+// MatchCausalAttention, which emits the standard `ai.onnx` `Attention`
+// (opset 23, not com.microsoft) on the rank-4 Q/K^T/V values directly. It
+// requires static shapes, opset >= 23, and a mask that is a constant
+// [1,1,Sq,Skv] float tensor; it sets `is_causal=1` only for a square,
+// exactly lower-triangular mask, and otherwise passes the mask through
+// unchanged as `attn_mask`; a KV-cache step with no mask at all (its all-zero
+// mask was folded away) is also handled. It never uses `is_causal` when Sq !=
+// Skv, because `Attention`'s causal alignment for a non-square mask depends on
+// the `past_key` length, which this pass does not model.
 
 #include <cmath>
 #include <cstdint>
@@ -85,6 +99,7 @@
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
 #include "passes/endian_read.h"
+#include "passes/quantize_conv_common.h"  // ReadFloatTensorFlat
 #include "passes/quantize_matmul_common.h"
 
 namespace ONNX_NAMESPACE {
@@ -682,6 +697,272 @@ inline std::vector<float> ReadAttentionBiasVector(const Tensor& t) {
   return t.floats();
 }
 
+// True iff `d` (row-major [s, s]) is exactly the square additive causal
+// pattern: 0 on and below the diagonal, -inf strictly above it.
+inline bool IsSquareLowerTriangularCausal(const std::vector<float>& d,
+                                          int64_t s) {
+  for (int64_t i = 0; i < s; ++i) {
+    for (int64_t j = 0; j < s; ++j) {
+      const float v = d[static_cast<size_t>(i * s + j)];
+      if (j <= i) {
+        if (v != 0.0f) {
+          return false;
+        }
+      } else if (!std::isinf(v) || v >= 0.0f) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// True iff `v` is HF's repeat_kv wrapping, Reshape(Expand(...)), optionally
+// behind a Transpose. Those blocks belong to fuse_gqa.h's GroupQueryAttention
+// fusion; the causal path below declines them so existing GQA behaviour is
+// unchanged.
+inline bool LooksRepeatKVWrapped(Value* v) {
+  if (CheckKind(v, kTranspose)) {
+    v = v->node()->input(0);
+  }
+  return CheckKind(v, kReshape) && CheckKind(v->node()->input(0), "Expand");
+}
+
+// True iff `v` is a Concat (optionally behind a Transpose) -- a KV-cache
+// append, i.e. cached past K/V joined with the new step's K/V.
+inline bool FromConcat(Value* v) {
+  if (CheckKind(v, kTranspose)) {
+    v = v->node()->input(0);
+  }
+  return CheckKind(v, "Concat");
+}
+
+struct CausalAttentionMatch {
+  Value* q = nullptr;      // [B, H, Sq, D]
+  Value* k_t = nullptr;    // [B, H, D, Skv]: K^T, as the QK^T MatMul takes it
+  Value* v = nullptr;      // [B, H, Skv, Dv]
+  Value* mask = nullptr;   // constant float32 [1, 1, Sq, Skv]; null if none
+  bool is_causal = false;  // mask is the square lower-triangular pattern
+  double scale = 0.0;
+  // Every node strictly between the ctx Reshape (anchor, not included) and
+  // the scaled QK^T, innermost first, so destroying them in this order always
+  // has a zero-use output. Q/K/V's own producers are NOT included: they are
+  // still consumed by the emitted Attention node.
+  std::vector<Node*> dead_chain;
+};
+
+// Anchors on the same ctx Reshape as MatchAttention, but accepts a constant
+// additive mask between the scaled QK^T and the Softmax. Unlike
+// MatchAttention it does not need the Q/K/V projections or head-split chains
+// to be recognisable: it consumes the rank-4 Q, K^T and V values directly,
+// which is all `Attention` (ai.onnx, opset 23) needs for 4-D inputs.
+inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
+  if (!CheckKind(n, kReshape) || n->inputs().size() != 2 ||
+      n->outputs().size() != 1) {
+    return false;
+  }
+  Value* transposed_back = n->input(0);
+  if (!CheckKind(transposed_back, kTranspose) ||
+      transposed_back->uses().size() != 1) {
+    return false;
+  }
+  Node* tr_back = transposed_back->node();
+  std::vector<int64_t> perm_back;
+  if (!GetValueFromAttr(tr_back, kperm, perm_back) ||
+      perm_back != std::vector<int64_t>{0, 2, 1, 3}) {
+    return false;
+  }
+  Value* v_matmul_out = tr_back->input(0);
+  if (!CheckKind(v_matmul_out, kMatMul) || v_matmul_out->uses().size() != 1) {
+    return false;
+  }
+  Node* v_mm = v_matmul_out->node();
+  if (v_mm->inputs().size() != 2) {
+    return false;
+  }
+  Value* softmax_out = nullptr;
+  Value* v_t = nullptr;
+  for (int i = 0; i < 2; ++i) {
+    if (CheckKind(v_mm->input(i), kSoftmax)) {
+      softmax_out = v_mm->input(i);
+      v_t = v_mm->input(1 - i);
+    }
+  }
+  if (softmax_out == nullptr || softmax_out->uses().size() != 1) {
+    return false;
+  }
+  Node* softmax = softmax_out->node();
+  if (softmax->inputs().size() != 1) {
+    return false;
+  }
+  const int64_t sm_axis =
+      GetValueFromAttrWithDefault(softmax, kaxis, int64_t(-1));
+  if (sm_axis != -1 && sm_axis != 3) {
+    return false;
+  }
+
+  // Softmax input: either Add(scores, mask) with exactly one constant operand
+  // (the mask) and one single-use scores operand, or -- when the mask was
+  // all-zero and constant folding already removed the Add -- the scores
+  // directly. The unmasked form is only accepted for a KV-cache step, i.e.
+  // when K or V is a Concat of cached and new values (see below), so that
+  // plain unmasked attention keeps MatchAttention's existing handling.
+  Value* masked = softmax->input(0);
+  Node* mask_add = nullptr;
+  Value* scores = nullptr;
+  if (CheckKind(masked, kAdd)) {
+    if (masked->uses().size() != 1 || masked->node()->inputs().size() != 2) {
+      return false;
+    }
+    mask_add = masked->node();
+    for (int i = 0; i < 2; ++i) {
+      if (FetchConstantTensor(mask_add->input(1 - i)) != nullptr) {
+        m.mask = mask_add->input(1 - i);
+        scores = mask_add->input(i);
+        break;
+      }
+    }
+    if (scores == nullptr || scores->uses().size() != 1) {
+      return false;
+    }
+  } else {
+    scores = masked;
+    if (scores->uses().size() != 1) {
+      return false;
+    }
+  }
+
+  Value* q_side = nullptr;
+  Value* k_side = nullptr;
+  std::vector<Node*> scale_chain;
+  if (!MatchScaledQKMatMul(scores, q_side, k_side, m.scale, scale_chain)) {
+    return false;
+  }
+
+  // Rank-4, statically shaped operands: Q [B,H,Sq,D], K^T [B,H,D,Skv],
+  // V [B,H,Skv,Dv]. Required to derive Sq/Skv and to know that the mask
+  // broadcasts exactly over [B,H,Sq,Skv].
+  if (!q_side->has_sizes() || !k_side->has_sizes() || !v_t->has_sizes()) {
+    return false;
+  }
+  if (q_side->sizes().size() != 4 || k_side->sizes().size() != 4 ||
+      v_t->sizes().size() != 4) {
+    return false;
+  }
+  const auto& qs = q_side->sizes();
+  const auto& ks = k_side->sizes();
+  const auto& vs = v_t->sizes();
+  for (const Dimension* d : {&qs[0], &qs[1], &qs[2], &qs[3], &ks[0], &ks[1],
+                             &ks[2], &ks[3], &vs[0], &vs[1], &vs[2], &vs[3]}) {
+    if (!d->is_int || d->dim <= 0) {
+      return false;
+    }
+  }
+  const int64_t B = qs[0].dim, H = qs[1].dim, Sq = qs[2].dim, D = qs[3].dim;
+  const int64_t Skv = ks[3].dim;
+  if (ks[0].dim != B || ks[1].dim != H || ks[2].dim != D || vs[0].dim != B ||
+      vs[1].dim != H || vs[2].dim != Skv) {
+    return false;
+  }
+
+  // Declined here (not guessed): these are GQA's own inputs, handled by
+  // fuse_gqa.h, which must keep its existing behaviour.
+  if (LooksRepeatKVWrapped(k_side) || LooksRepeatKVWrapped(v_t)) {
+    return false;
+  }
+  if (mask_add == nullptr && !FromConcat(k_side) && !FromConcat(v_t)) {
+    return false;  // Unmasked and not a KV-cache step: not this matcher's job.
+  }
+
+  if (mask_add != nullptr) {
+    // The mask must be a constant float32 [1, 1, Sq, Skv] tensor with no NaNs.
+    // Anything else (runtime padding masks, [S,S]/[B,1,1,S] shapes, ...) is
+    // not handled here.
+    const Tensor* mt = FetchConstantTensor(m.mask);
+    if (mt == nullptr || mt->elem_type() != TensorProto_DataType_FLOAT) {
+      return false;
+    }
+    const auto& msz = mt->sizes();
+    if (msz.size() != 4 || msz[0] != 1 || msz[1] != 1 || msz[2] != Sq ||
+        msz[3] != Skv) {
+      return false;
+    }
+    const std::vector<float> mask_data = ReadFloatTensorFlat(*mt);
+    if (static_cast<int64_t>(mask_data.size()) != Sq * Skv) {
+      return false;
+    }
+    for (float f : mask_data) {
+      if (std::isnan(f)) {
+        return false;
+      }
+    }
+    // is_causal is only sound for a square mask (its alignment for Sq != Skv
+    // is tied to the past_key length, which is not modelled here).
+    m.is_causal = Sq == Skv && IsSquareLowerTriangularCausal(mask_data, Sq);
+  }
+
+  m.q = q_side;
+  m.k_t = k_side;
+  m.v = v_t;
+  m.dead_chain.push_back(tr_back);
+  m.dead_chain.push_back(v_mm);
+  m.dead_chain.push_back(softmax);
+  if (mask_add != nullptr) {
+    m.dead_chain.push_back(mask_add);
+  }
+  for (Node* nd : scale_chain) m.dead_chain.push_back(nd);
+  return true;
+}
+
+// Emits Attention(Q, Transpose(K^T), V[, attn_mask], is_causal|scale) on the
+// rank-4 operands, then restores ctx's [B,S,H*Dv] layout the same way the
+// original Transpose+Reshape did. Returns false only if the rewrite of `n`'s
+// uses fails; the caller treats the graph as unchanged in that case.
+inline bool EmitCausalAttention(Node* n, Graph& graph,
+                                const CausalAttentionMatch& m,
+                                NodeDestroyType& destroy_current) {
+  // Attention consumes K as [B, H, Skv, D]; we only have K^T [B, H, D, Skv].
+  Node* k_tr = graph.create(Symbol("Transpose"), 1);
+  k_tr->addInput(m.k_t);
+  k_tr->is_(kperm, std::vector<int64_t>{0, 1, 3, 2});
+  k_tr->insertBefore(n);
+
+  Node* attn = graph.create(Symbol("Attention"), 1);
+  attn->addInput(m.q);
+  attn->addInput(k_tr->output());
+  attn->addInput(m.v);
+  if (m.mask != nullptr && !m.is_causal) {
+    attn->addInput(m.mask);
+  } else if (m.is_causal) {
+    attn->i_(Symbol("is_causal"), 1);
+  }
+  attn->f_(Symbol("scale"), static_cast<float>(m.scale));
+  attn->insertBefore(n);
+
+  // Attention's output is [B, H, Sq, Dv]: back to [B, Sq, H, Dv] and then to
+  // whatever shape `n` produced (its own target shape input, as the
+  // MatchAttention path does).
+  Node* tr_out = graph.create(Symbol("Transpose"), 1);
+  tr_out->addInput(attn->output());
+  tr_out->is_(kperm, std::vector<int64_t>{0, 2, 1, 3});
+  tr_out->insertBefore(n);
+
+  Node* reshape_out = graph.create(Symbol("Reshape"), 1);
+  reshape_out->addInput(tr_out->output());
+  reshape_out->addInput(n->input(1));
+  reshape_out->insertBefore(n);
+  reshape_out->output()->copyMetadata(n->output());
+
+  if (!tryReplacingAllUsesWith(n, reshape_out)) {
+    return false;
+  }
+  n->removeInput(0);
+  for (Node* dead : m.dead_chain) {
+    dead->destroy();
+  }
+  destroy_current = NodeDestroyType::DestroyOne;
+  return true;
+}
+
 struct FuseAttention final : public PredicateBasedPass {
   explicit FuseAttention()
       : PredicateBasedPass(PassType::Fuse, PassEfficiency::Complete,
@@ -690,7 +971,15 @@ struct FuseAttention final : public PredicateBasedPass {
 
   bool patternMatchPredicate(Node* n) override {
     AttentionMatch m;
-    return MatchAttention(n, m);
+    if (MatchAttention(n, m)) {
+      return true;
+    }
+    // ai.onnx Attention exists only from opset 23.
+    if (getOpsetVersion(*n->owningGraph()) < 23) {
+      return false;
+    }
+    CausalAttentionMatch cm;
+    return MatchCausalAttention(n, cm);
   }
 
   bool runTransform(Node* n, Graph& graph,
@@ -698,7 +987,14 @@ struct FuseAttention final : public PredicateBasedPass {
     destroy_current = NodeDestroyType::DestroyZero;
     AttentionMatch m;
     if (!MatchAttention(n, m)) {
-      return false;
+      if (getOpsetVersion(*n->owningGraph()) < 23) {
+        return false;
+      }
+      CausalAttentionMatch cm;
+      if (!MatchCausalAttention(n, cm)) {
+        return false;
+      }
+      return EmitCausalAttention(n, graph, cm, destroy_current);
     }
     ONNX_ASSERT(!m.dead_chain.empty());
 
