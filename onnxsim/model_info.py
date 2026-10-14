@@ -398,6 +398,264 @@ def _attention_traffic(
     return total
 
 
+# Per-kernel traffic model (``kernel_traffic_breakdown`` / ``ModelInfo(kernel_model=True)``).
+# A kernel is either one node or a maximal chain of elementwise nodes that a
+# backend fuses into one loop: its traffic is only its external inputs (read
+# once) and external outputs (written once), so the intermediates inside the
+# chain cost nothing. View ops move no bytes. Softmax- and norm-like ops read
+# their input twice (a statistics pass, then the normalizing pass).
+_KERNEL_VIEW_OPS = {
+    "Reshape",
+    "Squeeze",
+    "Unsqueeze",
+    "Flatten",
+    "Identity",
+    "Shape",
+    "Constant",
+}
+_KERNEL_ELEMENTWISE_OPS = {
+    "Abs",
+    "Add",
+    "And",
+    "Cast",
+    "Ceil",
+    "Clip",
+    "Cos",
+    "Div",
+    "Elu",
+    "Equal",
+    "Erf",
+    "Exp",
+    "Floor",
+    "Gelu",
+    "Greater",
+    "GreaterOrEqual",
+    "HardSigmoid",
+    "HardSwish",
+    "LeakyRelu",
+    "Less",
+    "LessOrEqual",
+    "Log",
+    "Max",
+    "Min",
+    "Mul",
+    "Neg",
+    "Not",
+    "Or",
+    "Pow",
+    "Reciprocal",
+    "Relu",
+    "Round",
+    "Sigmoid",
+    "Sin",
+    "Sqrt",
+    "Sub",
+    "Tanh",
+    "Where",
+}
+_KERNEL_MULTIPASS_OPS = {
+    "Softmax",
+    "LogSoftmax",
+    "LayerNormalization",
+    "RMSNormalization",
+    "GroupNormalization",
+}
+
+
+def _is_std_domain(node: onnx.NodeProto) -> bool:
+    return node.domain in ("", "ai.onnx")
+
+
+def _is_kernel_elementwise(node: onnx.NodeProto) -> bool:
+    return _is_std_domain(node) and node.op_type in _KERNEL_ELEMENTWISE_OPS
+
+
+def _kernel_groups(
+    graph: onnx.GraphProto, consumers: Dict[str, List[int]]
+) -> List[List[int]]:
+    """Kernel groups of ``graph``'s nodes as lists of node indices (in node order).
+
+    Two elementwise nodes join when one consumes the other's output and that
+    output has no other consumer and is not a graph output. Everything else is
+    its own group.
+    """
+    producer: Dict[str, int] = {}
+    for i, node in enumerate(graph.node):
+        for out in node.output:
+            if out:
+                producer[out] = i
+    graph_outputs = {o.name for o in graph.output}
+    parent = list(range(len(graph.node)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, node in enumerate(graph.node):
+        if not _is_kernel_elementwise(node):
+            continue
+        for name in node.input:
+            p = producer.get(name)
+            if p is None or p == i or not _is_kernel_elementwise(graph.node[p]):
+                continue
+            if len(consumers.get(name, [])) == 1 and name not in graph_outputs:
+                parent[find(p)] = find(i)
+
+    groups: Dict[int, List[int]] = {}
+    order: List[int] = []
+    for i, node in enumerate(graph.node):
+        key = find(i) if _is_kernel_elementwise(node) else -(i + 1)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(i)
+    return [groups[k] for k in order]
+
+
+def _kernel_traffic(
+    graph: onnx.GraphProto,
+    inherited_shapes: ShapeMap,
+    inherited_dtypes: DTypeMap,
+    attention_tiled: bool = True,
+    breakdown: Optional[Dict[str, Macs]] = None,
+) -> Macs:
+    """Total bytes moved by ``graph``'s kernels, control-flow bodies included.
+
+    When ``breakdown`` is given it is filled with one entry per kernel, keyed by
+    its op types joined with '+' (for example ``"Add+Mul+Sigmoid"``).
+    """
+    shapes = _collect_shapes(graph, inherited_shapes)
+    dtypes = _collect_dtypes(graph, inherited_dtypes)
+    consumers: Dict[str, List[int]] = defaultdict(list)
+    for i, node in enumerate(graph.node):
+        for name in node.input:
+            if name:
+                consumers[name].append(i)
+    graph_outputs = {o.name for o in graph.output}
+
+    def nbytes(name: str) -> Macs:
+        value = _tensor_bytes(name, shapes, dtypes) if name else None
+        return 0 if value is None else value
+
+    total: Macs = 0
+    for group in _kernel_groups(graph, consumers):
+        members = [graph.node[i] for i in group]
+        if len(members) == 1 and not _is_kernel_elementwise(members[0]):
+            node = members[0]
+            if _is_std_domain(node) and node.op_type in _KERNEL_VIEW_OPS:
+                traffic: Macs = 0
+            else:
+                traffic = _node_memory_access(
+                    node, shapes, dtypes, attention_tiled=attention_tiled
+                )
+                if _is_std_domain(node) and node.op_type in _KERNEL_MULTIPASS_OPS:
+                    traffic = traffic + nbytes(node.input[0]) if node.input else traffic
+            for attr in node.attribute:
+                bodies = ([attr.g] if attr.HasField("g") else []) + list(attr.graphs)
+                for body in bodies:
+                    traffic = traffic + _kernel_traffic(
+                        body, shapes, dtypes, attention_tiled, breakdown
+                    )
+            key = node.op_type
+        else:
+            produced = {o for n in members for o in n.output if o}
+            member_set = set(group)
+            traffic = 0
+            seen: Set[str] = set()
+            for n in members:
+                for name in n.input:
+                    if name and name not in produced and name not in seen:
+                        seen.add(name)
+                        traffic = traffic + nbytes(name)
+            for o in sorted(produced):
+                leaves = any(c not in member_set for c in consumers.get(o, []))
+                if leaves or o in graph_outputs:
+                    traffic = traffic + nbytes(o)
+            key = "+".join(n.op_type for n in members)
+        total = total + traffic
+        if breakdown is not None:
+            breakdown[key] = breakdown.get(key, 0) + traffic
+    return total
+
+
+def _inline_local_function_calls(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Copy of ``model`` with every call to one of its model-local functions
+    replaced by the function body (recursively), so the kernel model sees the
+    primitive ops a function is lowered to. Internal names of each call are
+    prefixed to stay unique. Control-flow subgraphs are left as they are.
+    """
+    funcs = {(f.domain, f.name): f for f in model.functions}
+    if not funcs:
+        return model
+    out = copy.deepcopy(model)
+    calls = [0]
+
+    def expand(nodes):
+        result = []
+        for node in nodes:
+            func = funcs.get((node.domain, node.op_type))
+            if func is None:
+                result.append(node)
+                continue
+            calls[0] += 1
+            prefix = f"__inl{calls[0]}_"
+            rename = dict(zip(func.input, node.input))
+            rename.update(zip(func.output, node.output))
+            body = []
+            for inner in func.node:
+                clone = onnx.NodeProto()
+                clone.CopyFrom(inner)
+                for seq in (clone.input, clone.output):
+                    for i, name in enumerate(list(seq)):
+                        if name:
+                            seq[i] = rename.get(name, prefix + name)
+                body.append(clone)
+            result.extend(expand(body))
+        return result
+
+    del out.graph.node[:]
+    out.graph.node.extend(expand(list(model.graph.node)))
+    del out.functions[:]
+    return out
+
+
+def kernel_traffic_breakdown(
+    model: onnx.ModelProto,
+    attention_tiled: bool = True,
+    decompose_functions: bool = False,
+) -> Dict[str, Macs]:
+    """Bytes moved per kernel, under the per-kernel traffic model.
+
+    Keys are kernel labels: a single op type, or the op types of a fused
+    elementwise chain joined with '+'. The values sum to the kernel-model
+    ``mem_access`` of ``ModelInfo(model, kernel_model=True)``.
+    """
+    breakdown: Dict[str, Macs] = {}
+    _kernel_traffic(
+        _kernel_graph(model, decompose_functions).graph,
+        {},
+        {},
+        attention_tiled=attention_tiled,
+        breakdown=breakdown,
+    )
+    return breakdown
+
+
+def _kernel_graph(model: onnx.ModelProto, decompose: bool) -> onnx.ModelProto:
+    """The shape-inferred graph the kernel model runs on. With ``decompose``,
+    schema functions (Softmax, ...) and local functions are lowered to their
+    primitive ops first, so each primitive is its own kernel."""
+    if decompose:
+        expanded = ModelInfo._expanded_macs_model(model)
+        source = expanded if expanded is not None else model
+        return ModelInfo._infer_shapes(
+            _inline_local_function_calls(copy.deepcopy(source))
+        )
+    return ModelInfo._infer_shapes(copy.deepcopy(model))
+
+
 def _attr_int(node: onnx.NodeProto, name: str, default: int) -> int:
     for attr in node.attribute:
         if attr.name == name:
@@ -755,7 +1013,13 @@ class ModelInfo:
         op_nums["Constant"] += len(graph.initializer)
         return op_nums, macs, mem_access
 
-    def __init__(self, model: onnx.ModelProto, attention_tiled: bool = True):
+    def __init__(
+        self,
+        model: onnx.ModelProto,
+        attention_tiled: bool = True,
+        kernel_model: bool = False,
+        decompose_functions: bool = False,
+    ):
         # Delegate the counting to the single C++ implementation, which returns
         # op counts, model size, and the compute/memory metrics as polynomials;
         # _cpp_metrics rebuilds the symbolic ones into the same sympy expressions
@@ -790,13 +1054,27 @@ class ModelInfo:
         # are added here on the same (expanded when present) graph they were
         # counted on. The default (tiled) keeps the C++ numbers untouched.
         self.attention_tiled = attention_tiled
+        self.kernel_model = kernel_model
         if not attention_tiled:
             inferred = (
                 expanded
                 if expanded is not None
                 else ModelInfo._infer_shapes(copy.deepcopy(model))
             )
+        if kernel_model:
+            # Per-kernel traffic (fused elementwise chains, views, multi-pass
+            # ops) replaces the per-node total. It runs on the original op types
+            # (not the function-expanded graph) and already includes the attention
+            # score traffic of a materializing kernel, so the add-on is skipped.
+            mem_access = _kernel_traffic(
+                _kernel_graph(model, decompose_functions).graph,
+                {},
+                {},
+                attention_tiled=attention_tiled,
+            )
+        elif not attention_tiled:
             mem_access = mem_access + _attention_traffic(inferred.graph, {}, {})
+        if not attention_tiled:
             footprint = self._peak_memory_footprint(
                 inferred.graph, attention_tiled=False
             )
