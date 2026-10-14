@@ -459,10 +459,6 @@ _KERNEL_MULTIPASS_OPS = {
     "LayerNormalization",
     "RMSNormalization",
     "GroupNormalization",
-    "ReduceMax",
-    "ReduceMean",
-    "ReduceMin",
-    "ReduceSum",
 }
 
 
@@ -584,8 +580,51 @@ def _kernel_traffic(
     return total
 
 
+def _inline_local_function_calls(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Copy of ``model`` with every call to one of its model-local functions
+    replaced by the function body (recursively), so the kernel model sees the
+    primitive ops a function is lowered to. Internal names of each call are
+    prefixed to stay unique. Control-flow subgraphs are left as they are.
+    """
+    funcs = {(f.domain, f.name): f for f in model.functions}
+    if not funcs:
+        return model
+    out = copy.deepcopy(model)
+    calls = [0]
+
+    def expand(nodes):
+        result = []
+        for node in nodes:
+            func = funcs.get((node.domain, node.op_type))
+            if func is None:
+                result.append(node)
+                continue
+            calls[0] += 1
+            prefix = f"__inl{calls[0]}_"
+            rename = dict(zip(func.input, node.input))
+            rename.update(zip(func.output, node.output))
+            body = []
+            for inner in func.node:
+                clone = onnx.NodeProto()
+                clone.CopyFrom(inner)
+                for seq in (clone.input, clone.output):
+                    for i, name in enumerate(list(seq)):
+                        if name:
+                            seq[i] = rename.get(name, prefix + name)
+                body.append(clone)
+            result.extend(expand(body))
+        return result
+
+    del out.graph.node[:]
+    out.graph.node.extend(expand(list(model.graph.node)))
+    del out.functions[:]
+    return out
+
+
 def kernel_traffic_breakdown(
-    model: onnx.ModelProto, attention_tiled: bool = True
+    model: onnx.ModelProto,
+    attention_tiled: bool = True,
+    decompose_functions: bool = False,
 ) -> Dict[str, Macs]:
     """Bytes moved per kernel, under the per-kernel traffic model.
 
@@ -595,13 +634,26 @@ def kernel_traffic_breakdown(
     """
     breakdown: Dict[str, Macs] = {}
     _kernel_traffic(
-        ModelInfo._infer_shapes(copy.deepcopy(model)).graph,
+        _kernel_graph(model, decompose_functions).graph,
         {},
         {},
         attention_tiled=attention_tiled,
         breakdown=breakdown,
     )
     return breakdown
+
+
+def _kernel_graph(model: onnx.ModelProto, decompose: bool) -> onnx.ModelProto:
+    """The shape-inferred graph the kernel model runs on. With ``decompose``,
+    schema functions (Softmax, ...) and local functions are lowered to their
+    primitive ops first, so each primitive is its own kernel."""
+    if decompose:
+        expanded = ModelInfo._expanded_macs_model(model)
+        source = expanded if expanded is not None else model
+        return ModelInfo._infer_shapes(
+            _inline_local_function_calls(copy.deepcopy(source))
+        )
+    return ModelInfo._infer_shapes(copy.deepcopy(model))
 
 
 def _attr_int(node: onnx.NodeProto, name: str, default: int) -> int:
@@ -966,6 +1018,7 @@ class ModelInfo:
         model: onnx.ModelProto,
         attention_tiled: bool = True,
         kernel_model: bool = False,
+        decompose_functions: bool = False,
     ):
         # Delegate the counting to the single C++ implementation, which returns
         # op counts, model size, and the compute/memory metrics as polynomials;
@@ -1014,7 +1067,7 @@ class ModelInfo:
             # (not the function-expanded graph) and already includes the attention
             # score traffic of a materializing kernel, so the add-on is skipped.
             mem_access = _kernel_traffic(
-                ModelInfo._infer_shapes(copy.deepcopy(model)).graph,
+                _kernel_graph(model, decompose_functions).graph,
                 {},
                 {},
                 attention_tiled=attention_tiled,

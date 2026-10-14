@@ -81,3 +81,20 @@ def test_default_model_keeps_node_level_numbers():
     assert default.kernel_model is False
     assert default.mem_access == 5 * N * BYTES  # Add: 3 streams, Sigmoid: 2
     assert ModelInfo(model, kernel_model=True).mem_access == 3 * N * BYTES
+
+
+def test_reduction_reads_its_input_once():
+    model = _model("y = ReduceSum<keepdims = 1>(a)", f"float[{N}] a", "float[1] y")
+    breakdown = kernel_traffic_breakdown(model)
+    assert breakdown["ReduceSum"] == N * BYTES + BYTES  # one read, one-element out
+
+
+def test_decomposed_softmax_costs_more_than_native_kernel():
+    # Lowered to ReduceMax, Sub+Exp, ReduceSum, Div: each primitive is its own
+    # kernel (or a fused elementwise chain), and the intermediates are written.
+    model = _model("y = Softmax<axis = -1>(a)", f"float[{N}] a", f"float[{N}] y")
+    native = sum(kernel_traffic_breakdown(model).values())
+    decomposed = kernel_traffic_breakdown(model, decompose_functions=True)
+    assert {"ReduceMax", "Sub+Exp", "ReduceSum", "Div"} <= set(decomposed)
+    assert sum(decomposed.values()) > native
+    assert native == 3 * N * BYTES
