@@ -4,7 +4,6 @@
 
 """Per-kernel traffic model: fused elementwise chains, views and multi-pass ops."""
 
-import onnx
 from onnx import parser
 
 from onnxsim.model_info import ModelInfo, kernel_traffic_breakdown
@@ -58,7 +57,7 @@ def test_reshape_moves_no_bytes():
     model = _model(
         "shp = Constant<value_ints = [4, 16]>()\nr = Reshape(a, shp)\ny = Relu(r)",
         f"float[{N}] a",
-        f"float[4, 16] y",
+        "float[4, 16] y",
     )
     breakdown = kernel_traffic_breakdown(model)
     assert breakdown.get("Reshape", 0) == 0
