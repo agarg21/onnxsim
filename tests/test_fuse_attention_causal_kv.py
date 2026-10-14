@@ -183,8 +183,12 @@ def _causal_kv_model(
     inits.append(_f32(float(D) ** 0.5, "divisor"))
     body += "scores = Div(qk, divisor)\n"
 
-    if mask in ("static_causal", "decode_bottom_right", "near_causal",
-                "constant_padding"):
+    if mask in (
+        "static_causal",
+        "decode_bottom_right",
+        "near_causal",
+        "constant_padding",
+    ):
         inits.append(_f32(_mask_array(mask, Sq, Skv, P), "mask"))
         body += "masked = Add(scores, mask)\n"
     elif mask == "static_range_causal":
@@ -316,7 +320,11 @@ def test_dynamic_length_causal_mask_declines_but_stays_correct():
     assert ok
     assert _std_attention_nodes(simplified) == []
     for seq in (3, 5, 7):
-        _check_equal(model, simplified, _feeds(102 + seq, Sq=seq, Skv=seq, x_seq=seq, mask="dynamic_causal"))
+        _check_equal(
+            model,
+            simplified,
+            _feeds(102 + seq, Sq=seq, Skv=seq, x_seq=seq, mask="dynamic_causal"),
+        )
 
 
 # --------------------------------------------------------------------------- #
