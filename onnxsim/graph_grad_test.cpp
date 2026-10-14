@@ -1855,6 +1855,26 @@ void ASqueezeWithNonConstantAxesIsRefused() {
       "a Squeeze with a runtime axes input should be refused");
 }
 
+// A Constant node is a constant too: its value is read where an initializer
+// would be, so a Squeeze whose axes come from one builds the same Reshape as
+// one whose axes are an initializer.
+void AConstantNodeIsReadLikeAnInitializer() {
+  onnx::AttributeProto value;
+  value.set_name("value");
+  value.set_type(onnx::AttributeProto::TENSOR);
+  *value.mutable_t() = Int64Init("", {1});
+  const std::vector<onnx::NodeProto> nodes = {
+      Node("Constant", {}, {"axes"}, {value}),
+      Node("Squeeze", {"A", "axes"}, {"Y"})};
+  const Shapes shapes = {{"A", {2, 1, 4}}, {"Y", {2, 4}}};
+  GraphBuilder b;  // no initializer: "axes" is the Constant node's output
+  BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A"});
+  Check(OpTypes(b) == std::vector<std::string>({"Reshape"}),
+        "a Squeeze with Constant-node axes should emit one Reshape");
+  Check(Int64Data(b.initializer()[0]) == std::vector<int64_t>({2, 1, 4}),
+        "the Constant-node Squeeze should reshape back to its data's shape");
+}
+
 // A Slice step that is not positive is outside the rule's contract, both for
 // the reason a negative step is ruled out in graph_grad.py and because a zero
 // step has no selection at all.
@@ -1929,6 +1949,7 @@ int main() {
   TheExpandRuleEmitsTheSameNodesInTheSameOrderAsThePython();
   TheSqueezeAndUnsqueezeRulesReshapeBackToTheInputShape();
   ASqueezeWithNonConstantAxesIsRefused();
+  AConstantNodeIsReadLikeAnInitializer();
   ASliceWithANonPositiveStepIsRefused();
   APadWithAnUnsupportedModeIsRefused();
 
