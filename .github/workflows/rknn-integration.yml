@@ -78,6 +78,11 @@ jobs:
           python -m pip install --upgrade pip
           # rknn-toolkit2 brings its own onnxruntime/numpy/torch.
           python -m pip install rknn-toolkit2
+          # onnxsim/__init__.py eagerly imports deepseek_fp8 / fp6_llm, which
+          # import ml_dtypes, but ml_dtypes isn't a declared dependency and
+          # rknn-toolkit2 doesn't pull it in. Pin <0.6: 0.6+ requires numpy>=2,
+          # while rknn-toolkit2 keeps numpy 1.26 (same pin as backend-integration).
+          python -m pip install "ml_dtypes<0.6"
           python -m pip install wheelhouse/*.whl
       # Run from runner.temp, not the checkout: the repo root contains the
       # `onnxsim/` source dir (no compiled extension), which would shadow the
