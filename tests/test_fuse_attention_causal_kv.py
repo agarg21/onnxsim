@@ -200,6 +200,26 @@ def _causal_kv_model(
         body += "seq_len_dyn = Gather<axis = 0>(x_shape, one_i)\n"
         body += _range_causal_mask_text("seq_len_dyn")
         body += "masked = Add(scores, mask4)\n"
+    elif mask in ("where_fill_true", "where_fill_false", "where_padding"):
+        # torch's masked_fill exports as Where over a constant bool mask.
+        # Both operand orders are emitted; the attend mask is the square
+        # lower-triangle (causal) or a padded last key column.
+        i = np.arange(Sq)[:, None]
+        j = np.arange(Skv)[None, :]
+        if mask == "where_padding":
+            masked_out = np.broadcast_to(j == Skv - 1, (Sq, Skv))
+        else:
+            masked_out = j > i  # strictly above the diagonal
+        if mask == "where_fill_false":
+            cond = ~masked_out  # True where attended
+        else:
+            cond = masked_out  # True where filled
+        inits.append(onnx.numpy_helper.from_array(cond.astype(bool), "mask_cond"))
+        inits.append(_f32(-np.inf, "neg_inf"))
+        if mask == "where_fill_false":
+            body += "masked = Where(mask_cond, scores, neg_inf)\n"
+        else:
+            body += "masked = Where(mask_cond, neg_inf, scores)\n"
     elif mask == "runtime_padding":
         inputs.append(f"float[{B},1,1,{Skv}] pad")
         body += "masked = Add(scores, pad)\n"
@@ -404,3 +424,32 @@ def test_causal_mask_declines_below_opset_23():
     assert ok
     assert _std_attention_nodes(simplified) == []
     _check_equal(model, simplified, _feeds(130))
+
+
+@pytest.mark.parametrize("mask", ["where_fill_true", "where_fill_false"])
+def test_where_causal_mask_fuses_with_is_causal(mask):
+    # torch.masked_fill(~tril, -inf) exports as Where(cond, -inf, scores);
+    # the other operand order is Where(cond, scores, -inf). Both are the
+    # causal pattern, so they fuse to is_causal=1 with no mask input.
+    model = _causal_kv_model(mask=mask)
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    nodes = _std_attention_nodes(simplified)
+    assert len(nodes) == 1
+    assert _attr_int(nodes[0], "is_causal") == 1
+    assert len(nodes[0].input) == 3
+    assert not any(n.op_type in ("Where", "Softmax") for n in simplified.graph.node)
+    _check_equal(model, simplified, _feeds(110))
+
+
+def test_where_padding_mask_fuses_as_attn_mask_not_is_causal():
+    # A non-causal bool mask (last key column filled) must become an explicit
+    # attn_mask: it is not the lower-triangular pattern, so is_causal stays 0.
+    model = _causal_kv_model(mask="where_padding")
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    nodes = _std_attention_nodes(simplified)
+    assert len(nodes) == 1
+    assert _attr_int(nodes[0], "is_causal") == 0
+    assert len(nodes[0].input) == 4
+    _check_equal(model, simplified, _feeds(111))
