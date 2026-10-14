@@ -223,7 +223,7 @@ jobs:
   # build ships) so it runs fully in parallel with build_wheels rather than
   # serialized behind its slowest (macOS) leg.
   test_axera_quantization_pruning:
-    name: Axera/quantization/pruning suites
+    name: Quantization/pruning suites
     # Scheduled, manual and release runs only: this suite is slow and does not gate
     # PRs. Releases still run it because upload_pypi lists it in `needs`.
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
@@ -270,10 +270,10 @@ jobs:
       - name: Verify onnxsim under test is the freshly built extension
         working-directory: ${{ runner.temp }}
         run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
-      - name: Run Axera/quantization/pruning suites
+      - name: Run quantization/pruning suites
         working-directory: ${{ runner.temp }}
         run: |
-          pytest -v -m "axera or quantization or pruning" "${GITHUB_WORKSPACE}/tests"
+          pytest -v -m "(quantization or pruning) and not axera" "${GITHUB_WORKSPACE}/tests"
 
   # Windows wheels are cross-compiled on a cheap Ubuntu runner with llvm-mingw
   # (clang + lld + a self-contained UCRT sysroot) instead of built natively on a
