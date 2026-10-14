@@ -142,20 +142,24 @@ class Backward {
 
   GraphBuilder& b() { return b_; }
 
-  // The "value" tensor of every Constant node of the forward graph, by output name. The first Constant of a name wins, as the first
-  // initializer does. Called once by BuildBackwardImpl, before any rule runs.
+  // The "value" tensor of every Constant node of the forward graph, by output
+  // name. The first Constant of a name wins, as the first initializer does.
+  // Called once by BuildBackwardImpl, before any rule runs.
   void AddConstants(const std::vector<onnx::NodeProto>& nodes) {
     for (const onnx::NodeProto& node : nodes) {
       if (node.op_type() != "Constant" || node.output_size() == 0) continue;
       for (const onnx::AttributeProto& attr : node.attribute()) {
-        if (attr.name() == "value" && attr.type() == onnx::AttributeProto::TENSOR) {
+        if (attr.name() == "value" &&
+            attr.type() == onnx::AttributeProto::TENSOR) {
           constants_.emplace(node.output(0), &attr.t());
           break;
         }
       }
     }
   }
-  const std::map<std::string, const onnx::TensorProto*>& constants() const { return constants_; }
+  const std::map<std::string, const onnx::TensorProto*>& constants() const {
+    return constants_;
+  }
 
   const Shape& ShapeOf(const std::string& name) const {
     const auto it = shapes_.find(name);
@@ -2254,7 +2258,8 @@ std::vector<OptStr> GradDivTemplated(Backward& ctx, const onnx::NodeProto& node,
 // rules needs a runtime Shape/Gather.
 // ---------------------------------------------------------------------------
 
-// The tensor a shape, axes, pads or index operand names: an initializer, or the value of a Constant node.
+// The tensor a shape, axes, pads or index operand names: an initializer, or the
+// value of a Constant node.
 const onnx::TensorProto* FindConstantTensor(Backward& ctx,
                                             const std::string& name) {
   for (const onnx::TensorProto& tensor : ctx.b().initializer()) {
@@ -2285,9 +2290,10 @@ std::vector<int64_t> ConstInts(Backward& ctx, const std::string& name,
                                const onnx::NodeProto& node) {
   const onnx::TensorProto* tensor = FindConstantTensor(ctx, name);
   if (tensor == nullptr) {
-    throw UnsupportedOpError(node.op_type() + " parameter " + Quoted(name) +
-                             " must be a constant initializer or a Constant node (node " +
-                             Quoted(node.output(0)) + ")");
+    throw UnsupportedOpError(
+        node.op_type() + " parameter " + Quoted(name) +
+        " must be a constant initializer or a Constant node (node " +
+        Quoted(node.output(0)) + ")");
   }
   const int32_t type = tensor->data_type();
   bool is_signed = true;
@@ -2471,7 +2477,8 @@ std::vector<OptStr> GradPad(Backward& ctx, const onnx::NodeProto& node,
     const onnx::TensorProto* value = FindConstantTensor(ctx, node.input(2));
     if (value == nullptr) {
       throw UnsupportedOpError(
-          "Pad constant_value must be a constant initializer or a Constant node (node " +
+          "Pad constant_value must be a constant initializer or a Constant "
+          "node (node " +
           Quoted(node.output(0)) + ")");
     }
     int64_t elements = 1;
@@ -2744,7 +2751,8 @@ std::map<std::string, std::string> BuildBackwardImpl(
   // the time a producer asks for its output gradient the sum is complete.
   for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
     const onnx::NodeProto& node = *it;
-    // A Constant has no inputs, so it passes no gradient on; the rules that use its value read it through the context.
+    // A Constant has no inputs, so it passes no gradient on; the rules that use
+    // its value read it through the context.
     if (node.op_type() == "Constant") continue;
     const auto rule = rules.find(node.op_type());
     if (rule == rules.end()) {
