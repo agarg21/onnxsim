@@ -33,13 +33,16 @@ C = H * D
 class _ManualCausal(nn.Module):
     """Hand-written causal attention: scores.masked_fill(~tril, -inf)."""
 
-    def __init__(self, seq):
+    def __init__(self, seq, diagonal=0):
         super().__init__()
         self.q = nn.Linear(C, C)
         self.k = nn.Linear(C, C)
         self.v = nn.Linear(C, C)
         self.o = nn.Linear(C, C)
-        self.register_buffer("mask", torch.tril(torch.ones(seq, seq, dtype=torch.bool)))
+        # diagonal=1 also attends the superdiagonal: not the causal pattern.
+        self.register_buffer(
+            "mask", torch.tril(torch.ones(seq, seq, dtype=torch.bool), diagonal)
+        )
 
     def forward(self, x):
         B, S, _ = x.shape
@@ -141,14 +144,41 @@ def test_sdpa_causal_export_is_already_attention_and_stays_correct(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="dynamic-length causal mask (constant buffer sliced by Shape(x)) "
-    "is not recognised yet; fuse_attention needs static Q/K/V sizes",
-)
-def test_masked_fill_causal_export_with_dynamic_seq_fuses(tmp_path, seq8_input):
+def test_masked_fill_causal_export_with_dynamic_seq_fuses(tmp_path):
+    # The sequence length is a runtime dimension (dynamic_shapes on the input),
+    # so the mask is a Slice of the 8x8 buffer by Shape(x). The matcher accepts
+    # it because the slice length is the attention's own sequence length.
+    torch.manual_seed(0)
     module = _ManualCausal(8).eval()
-    raw = _export(module, seq8_input, tmp_path / "manual_dynamic.onnx", dynamic=True)
+    seq0 = torch.randn(1, 8, C)
+    raw = _export(module, seq0, tmp_path / "manual_dynamic.onnx", dynamic=True)
     simplified, ok = onnxsim.simplify(raw)
     assert ok
-    assert len(_attention_nodes(simplified)) == 1
+    nodes = _attention_nodes(simplified)
+    assert len(nodes) == 1
+    assert _attr_int(nodes[0], "is_causal") == 1
+    assert len(nodes[0].input) == 3
+    assert not any(n.op_type == "Softmax" for n in simplified.graph.node)
+    # The buffer has 8 rows, so valid lengths are 1..8; torch is the reference.
+    for seq in (1, 3, 5, 8):
+        x = torch.randn(1, seq, C)
+        with torch.no_grad():
+            expected = module(x).numpy()
+        np.testing.assert_allclose(_run_ort(simplified, x.numpy()), expected, atol=1e-5)
+
+
+def test_non_causal_dynamic_mask_export_never_becomes_is_causal(tmp_path):
+    # Same dynamic-length export, but the buffer attends the superdiagonal too.
+    # It must not fuse to is_causal=1; whatever it becomes must stay correct.
+    torch.manual_seed(0)
+    module = _ManualCausal(8, diagonal=1).eval()
+    seq0 = torch.randn(1, 8, C)
+    raw = _export(module, seq0, tmp_path / "noncausal_dynamic.onnx", dynamic=True)
+    simplified, ok = onnxsim.simplify(raw)
+    assert ok
+    assert all(_attr_int(n, "is_causal") == 0 for n in _attention_nodes(simplified))
+    for seq in (1, 3, 5, 8):
+        x = torch.randn(1, seq, C)
+        with torch.no_grad():
+            expected = module(x).numpy()
+        np.testing.assert_allclose(_run_ort(simplified, x.numpy()), expected, atol=1e-5)
