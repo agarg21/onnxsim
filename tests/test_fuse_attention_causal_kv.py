@@ -14,7 +14,6 @@ Declining is always an acceptable outcome for the numerical checks; the
 per-case fusion assertions document the intended coverage.
 """
 
-import collections
 
 import numpy as np
 import onnx
