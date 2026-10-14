@@ -207,7 +207,12 @@ def _brief(model):
     )
 
 
-def assert_same_graph(q, m, exact=True, msg=""):
+# Float constants and outputs default to tolerant comparison. Quark's calibrated
+# scales are computed in float32 through BLAS/SIMD kernels whose rounding depends
+# on the host CPU, so the same run can differ by 1 ULP between runners (a
+# 0x3c35f9fb vs 0x3c35f9fc scale failed the bit-exact check on CI). Five
+# significant digits / 1e-5 still catches any real structural or method change.
+def assert_same_graph(q, m, exact=False, msg=""):
     qo, qs = _signatures(q, exact)
     mo, ms = _signatures(m, exact)
     assert mo == qo, f"{msg}: opset_import"
@@ -215,7 +220,7 @@ def assert_same_graph(q, m, exact=True, msg=""):
     assert ms == qs, f"{msg}: wiring / attributes / constants"
 
 
-def assert_same_outputs(q, m, shape, exact=True, msg=""):
+def assert_same_outputs(q, m, shape, exact=False, msg=""):
     x = np.random.default_rng(7).standard_normal(shape).astype(np.float32)
     want, got = _outputs(q, x), _outputs(m, x)
     # (a model ONNX Runtime refuses to load must be refused in both cases)
