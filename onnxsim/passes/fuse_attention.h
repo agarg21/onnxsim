@@ -92,12 +92,14 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "onnxoptimizer/passes/tensor_util.h"  // ParseTensorData<bool>
 #include "passes/endian_read.h"
 #include "passes/quantize_conv_common.h"  // ReadFloatTensorFlat
 #include "passes/quantize_matmul_common.h"
@@ -716,6 +718,16 @@ inline bool IsSquareLowerTriangularCausal(const std::vector<float>& d,
   return true;
 }
 
+// True iff `t` is a constant float32 scalar equal to -infinity: the fill value
+// of torch's masked_fill, which is what a Where-shaped causal mask carries.
+inline bool IsScalarNegInf(const Tensor* t) {
+  if (t == nullptr || t->elem_type() != TensorProto_DataType_FLOAT) {
+    return false;
+  }
+  const std::vector<float> v = ReadFloatTensorFlat(*t);
+  return v.size() == 1 && std::isinf(v[0]) && v[0] < 0.0f;
+}
+
 // True iff `v` is HF's repeat_kv wrapping, Reshape(Expand(...)), optionally
 // behind a Transpose. Those blocks belong to fuse_gqa.h's GroupQueryAttention
 // fusion; the causal path below declines them so existing GQA behaviour is
@@ -737,10 +749,15 @@ inline bool FromConcat(Value* v) {
 }
 
 struct CausalAttentionMatch {
-  Value* q = nullptr;      // [B, H, Sq, D]
-  Value* k_t = nullptr;    // [B, H, D, Skv]: K^T, as the QK^T MatMul takes it
-  Value* v = nullptr;      // [B, H, Skv, Dv]
-  Value* mask = nullptr;   // constant float32 [1, 1, Sq, Skv]; null if none
+  Value* q = nullptr;     // [B, H, Sq, D]
+  Value* k_t = nullptr;   // [B, H, D, Skv]: K^T, as the QK^T MatMul takes it
+  Value* v = nullptr;     // [B, H, Skv, Dv]
+  Value* mask = nullptr;  // constant float32 [1, 1, Sq, Skv]; null if none
+  // Set instead of `mask` when the additive mask came from a constant bool
+  // Where(cond, -inf, scores) (torch's masked_fill): the float mask is built
+  // at emit time, with sizes [1, 1, Sq, Skv].
+  std::vector<float> derived_mask;
+  std::vector<int64_t> derived_mask_sizes;  // {1, 1, Sq, Skv}
   bool is_causal = false;  // mask is the square lower-triangular pattern
   double scale = 0.0;
   // Every node strictly between the ctx Reshape (anchor, not included) and
@@ -808,6 +825,8 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   // plain unmasked attention keeps MatchAttention's existing handling.
   Value* masked = softmax->input(0);
   Node* mask_add = nullptr;
+  Node* where_node = nullptr;  // torch masked_fill: Where(cond, -inf, scores)
+  bool fill_when_cond_true = false;
   Value* scores = nullptr;
   if (CheckKind(masked, kAdd)) {
     if (masked->uses().size() != 1 || masked->node()->inputs().size() != 2) {
@@ -822,6 +841,29 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
       }
     }
     if (scores == nullptr || scores->uses().size() != 1) {
+      return false;
+    }
+  } else if (CheckKind(masked, "Where")) {
+    if (masked->uses().size() != 1 || masked->node()->inputs().size() != 3) {
+      return false;
+    }
+    where_node = masked->node();
+    // Where(cond, -inf, scores) fills where cond is true; Where(cond, scores,
+    // -inf) fills where it is false. Either way the additive mask is -inf
+    // exactly on the filled positions, and `scores` is the untouched operand.
+    if (IsScalarNegInf(FetchConstantTensor(where_node->input(1))) &&
+        FetchConstantTensor(where_node->input(2)) == nullptr) {
+      fill_when_cond_true = true;
+      scores = where_node->input(2);
+    } else if (IsScalarNegInf(FetchConstantTensor(where_node->input(2))) &&
+               FetchConstantTensor(where_node->input(1)) == nullptr) {
+      fill_when_cond_true = false;
+      scores = where_node->input(1);
+    } else {
+      return false;
+    }
+    if (FetchConstantTensor(where_node->input(0)) == nullptr ||
+        scores->uses().size() != 1) {
       return false;
     }
   } else {
@@ -869,24 +911,55 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   if (LooksRepeatKVWrapped(k_side) || LooksRepeatKVWrapped(v_t)) {
     return false;
   }
-  if (mask_add == nullptr && !FromConcat(k_side) && !FromConcat(v_t)) {
+  if (mask_add == nullptr && where_node == nullptr && !FromConcat(k_side) &&
+      !FromConcat(v_t)) {
     return false;  // Unmasked and not a KV-cache step: not this matcher's job.
   }
 
-  if (mask_add != nullptr) {
-    // The mask must be a constant float32 [1, 1, Sq, Skv] tensor with no NaNs.
-    // Anything else (runtime padding masks, [S,S]/[B,1,1,S] shapes, ...) is
-    // not handled here.
-    const Tensor* mt = FetchConstantTensor(m.mask);
-    if (mt == nullptr || mt->elem_type() != TensorProto_DataType_FLOAT) {
-      return false;
+  if (mask_add != nullptr || where_node != nullptr) {
+    std::vector<float> mask_data;
+    if (mask_add != nullptr) {
+      // The mask must be a constant float32 [1, 1, Sq, Skv] tensor with no
+      // NaNs. Anything else (runtime padding masks, [S,S]/[B,1,1,S] shapes,
+      // ...) is not handled here.
+      const Tensor* mt = FetchConstantTensor(m.mask);
+      if (mt == nullptr || mt->elem_type() != TensorProto_DataType_FLOAT) {
+        return false;
+      }
+      const auto& msz = mt->sizes();
+      if (msz.size() != 4 || msz[0] != 1 || msz[1] != 1 || msz[2] != Sq ||
+          msz[3] != Skv) {
+        return false;
+      }
+      mask_data = ReadFloatTensorFlat(*mt);
+    } else {
+      // A constant bool condition over [..., Sq, Skv] with all leading dims 1
+      // (what a causal `tril` or padding mask exports to after folding).
+      const Tensor* ct = FetchConstantTensor(where_node->input(0));
+      if (ct == nullptr || ct->elem_type() != TensorProto_DataType_BOOL) {
+        return false;
+      }
+      const auto& csz = ct->sizes();
+      if (csz.size() < 2 || csz[csz.size() - 2] != Sq || csz.back() != Skv) {
+        return false;
+      }
+      for (size_t i = 0; i + 2 < csz.size(); ++i) {
+        if (csz[i] != 1) {
+          return false;
+        }
+      }
+      const auto cond = ParseTensorData<bool>(ct);
+      if (static_cast<int64_t>(cond.size()) != Sq * Skv) {
+        return false;
+      }
+      const float neg_inf = -std::numeric_limits<float>::infinity();
+      mask_data.resize(cond.size());
+      for (size_t i = 0; i < cond.size(); ++i) {
+        mask_data[i] = (static_cast<bool>(cond[i]) == fill_when_cond_true)
+                           ? neg_inf
+                           : 0.0f;
+      }
     }
-    const auto& msz = mt->sizes();
-    if (msz.size() != 4 || msz[0] != 1 || msz[1] != 1 || msz[2] != Sq ||
-        msz[3] != Skv) {
-      return false;
-    }
-    const std::vector<float> mask_data = ReadFloatTensorFlat(*mt);
     if (static_cast<int64_t>(mask_data.size()) != Sq * Skv) {
       return false;
     }
@@ -898,6 +971,10 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
     // is_causal is only sound for a square mask (its alignment for Sq != Skv
     // is tied to the past_key length, which is not modelled here).
     m.is_causal = Sq == Skv && IsSquareLowerTriangularCausal(mask_data, Sq);
+    if (mask_add == nullptr) {
+      m.derived_mask = std::move(mask_data);
+      m.derived_mask_sizes = {1, 1, Sq, Skv};
+    }
   }
 
   m.q = q_side;
@@ -908,6 +985,9 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   m.dead_chain.push_back(softmax);
   if (mask_add != nullptr) {
     m.dead_chain.push_back(mask_add);
+  }
+  if (where_node != nullptr) {
+    m.dead_chain.push_back(where_node);
   }
   for (Node* nd : scale_chain) m.dead_chain.push_back(nd);
   return true;
@@ -930,10 +1010,18 @@ inline bool EmitCausalAttention(Node* n, Graph& graph,
   attn->addInput(m.q);
   attn->addInput(k_tr->output());
   attn->addInput(m.v);
-  if (m.mask != nullptr && !m.is_causal) {
-    attn->addInput(m.mask);
-  } else if (m.is_causal) {
+  if (m.is_causal) {
     attn->i_(Symbol("is_causal"), 1);
+  } else if (m.mask != nullptr || !m.derived_mask.empty()) {
+    Value* mask_v = m.mask;
+    if (mask_v == nullptr) {
+      Tensor mt;
+      mt.elem_type() = TensorProto_DataType_FLOAT;
+      mt.sizes() = m.derived_mask_sizes;
+      mt.floats() = m.derived_mask;
+      mask_v = graph.addInitializerAndCreateValue(mt);
+    }
+    attn->addInput(mask_v);
   }
   attn->f_(Symbol("scale"), static_cast<float>(m.scale));
   attn->insertBefore(n);
