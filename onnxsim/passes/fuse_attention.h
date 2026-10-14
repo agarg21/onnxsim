@@ -758,6 +758,39 @@ inline bool SameSeqDim(const Dimension& a, const Dimension& b) {
          !a.param.empty() && a.param == b.param;
 }
 
+// Integer values of an int64 vector that is constant at match time: an
+// initializer or Constant tensor, or a Concat/Unsqueeze of such (torch emits
+// `[0, 0]` as a Concat of scalars until the simplifier folds it). Returns false
+// for anything dynamic, such as a KV-cache start offset.
+inline bool ConstantInt64Vector(Value* v, std::vector<int64_t>& out,
+                                int depth = 0) {
+  if (depth > 8) {
+    return false;
+  }
+  if (const Tensor* t = FetchConstantTensor(v)) {
+    if (t->elem_type() != TensorProto_DataType_INT64) {
+      return false;
+    }
+    out = ParseTensorData<int64_t>(t);
+    return true;
+  }
+  if (CheckKind(v, "Unsqueeze") || CheckKind(v, "Identity")) {
+    return ConstantInt64Vector(v->node()->input(0), out, depth + 1);
+  }
+  if (CheckKind(v, "Concat")) {
+    out.clear();
+    for (Value* in : v->node()->inputs()) {
+      std::vector<int64_t> part;
+      if (!ConstantInt64Vector(in, part, depth + 1)) {
+        return false;
+      }
+      out.insert(out.end(), part.begin(), part.end());
+    }
+    return true;
+  }
+  return false;
+}
+
 // torch's dynamic-length causal mask: masked_fill(~tril[:S, :S], -inf) with the
 // constant buffer sliced by the attention's own length S. `cond` must be
 //   Slice(M, starts=0, ends=Concat(E, E), axes=[0,1], steps=1)
@@ -786,32 +819,31 @@ inline bool MatchDynamicCausalSlice(Value* cond, const Dimension& seq,
   }
   const int64_t N = dsz[0];
 
-  const Tensor* starts = FetchConstantTensor(sl->input(1));
-  if (starts == nullptr) {
+  std::vector<int64_t> starts;
+  if (!ConstantInt64Vector(sl->input(1), starts)) {
     return false;
   }
-  for (int64_t s : ParseTensorData<int64_t>(starts)) {
+  for (int64_t s : starts) {
     if (s != 0) {
       return false;
     }
   }
   if (n_in >= 4) {
-    const Tensor* axes = FetchConstantTensor(sl->input(3));
-    if (axes == nullptr) {
+    std::vector<int64_t> ax;
+    if (!ConstantInt64Vector(sl->input(3), ax)) {
       return false;
     }
-    const std::vector<int64_t> ax = ParseTensorData<int64_t>(axes);
     if (ax != std::vector<int64_t>{0, 1} &&
         ax != std::vector<int64_t>{-2, -1}) {
       return false;
     }
   }
   if (n_in == 5) {
-    const Tensor* steps = FetchConstantTensor(sl->input(4));
-    if (steps == nullptr) {
+    std::vector<int64_t> steps;
+    if (!ConstantInt64Vector(sl->input(4), steps)) {
       return false;
     }
-    for (int64_t s : ParseTensorData<int64_t>(steps)) {
+    for (int64_t s : steps) {
       if (s != 1) {
         return false;
       }
@@ -871,6 +903,10 @@ struct CausalAttentionMatch {
   // Where(cond, -inf, scores) (torch's masked_fill): the float mask is built
   // at emit time, with sizes [1, 1, Sq, Skv].
   std::vector<float> derived_mask;
+  // Set instead when the mask is a runtime bool tensor: the emitted op adds
+  // Where(runtime_cond, -inf, 0) (or the swapped fill) as attn_mask.
+  Value* runtime_cond = nullptr;
+  bool runtime_fill_when_cond_true = false;
   std::vector<int64_t> derived_mask_sizes;  // {1, 1, Sq, Skv}
   bool is_causal = false;  // mask is the square lower-triangular pattern
   double scale = 0.0;
@@ -1008,27 +1044,6 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   const auto& qs = q_side->sizes();
   const auto& ks = k_side->sizes();
   const auto& vs = v_t->sizes();
-  // B, H, D and Dv must be static. The sequence lengths may be symbolic (the
-  // dynamic-length causal mask below): then Q's and K^T's must share one name,
-  // and V's must match K's.
-  for (const Dimension* d : {&qs[0], &qs[1], &qs[3], &ks[0], &ks[1], &ks[2],
-                             &vs[0], &vs[1], &vs[3]}) {
-    if (!d->is_int || d->dim <= 0) {
-      return false;
-    }
-  }
-  const int64_t B = qs[0].dim, H = qs[1].dim, D = qs[3].dim;
-  const bool sym_seq = !qs[2].is_int || !ks[3].is_int;
-  if (!SameSeqDim(qs[2], ks[3]) && sym_seq) {
-    return false;
-  }
-  if (!SameSeqDim(vs[2], ks[3]) || ks[0].dim != B || ks[1].dim != H ||
-      ks[2].dim != D || vs[0].dim != B || vs[1].dim != H) {
-    return false;
-  }
-  const int64_t Sq = qs[2].is_int ? qs[2].dim : -1;
-  const int64_t Skv = ks[3].is_int ? ks[3].dim : -1;
-
   // Declined here (not guessed): these are GQA's own inputs, handled by
   // fuse_gqa.h, which must keep its existing behaviour.
   if (LooksRepeatKVWrapped(k_side) || LooksRepeatKVWrapped(v_t)) {
@@ -1039,76 +1054,97 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
     return false;  // Unmasked and not a KV-cache step: not this matcher's job.
   }
 
-  if (where_node != nullptr && mask_add == nullptr &&
-      FetchConstantTensor(where_node->input(0)) == nullptr) {
-    // Dynamic-length causal mask: the only mask form accepted with symbolic
-    // sequence lengths. It always comes out as is_causal (no mask input).
-    if (!sym_seq || !MatchDynamicCausalSlice(where_node->input(0), qs[2],
-                                             fill_when_cond_true)) {
+  // A runtime bool condition (not a constant) is handled without static sizes:
+  // either it is the square dynamic-length causal slice (is_causal), or it is
+  // emitted as an additive attn_mask computed in the graph. For a valid model
+  // the broadcast of the mask and the MatMul with V already force the operand
+  // sizes to agree at run time, so symbolic sequence lengths are fine there.
+  const bool runtime_cond =
+      where_node != nullptr && mask_add == nullptr &&
+      FetchConstantTensor(where_node->input(0)) == nullptr;
+  if (runtime_cond) {
+    if (SameSeqDim(qs[2], ks[3]) &&
+        MatchDynamicCausalSlice(where_node->input(0), qs[2],
+                                fill_when_cond_true)) {
+      m.is_causal = true;
+    } else {
+      m.runtime_cond = where_node->input(0);
+      m.runtime_fill_when_cond_true = fill_when_cond_true;
+    }
+  } else {
+    // Static masks (constant additive or constant bool) and unmasked KV-cache
+    // steps need every size to be a static int.
+    for (const Dimension* d :
+         {&qs[0], &qs[1], &qs[2], &qs[3], &ks[0], &ks[1], &ks[2], &ks[3],
+          &vs[0], &vs[1], &vs[2], &vs[3]}) {
+      if (!d->is_int || d->dim <= 0) {
+        return false;
+      }
+    }
+    const int64_t B = qs[0].dim, H = qs[1].dim, Sq = qs[2].dim, D = qs[3].dim;
+    const int64_t Skv = ks[3].dim;
+    if (ks[0].dim != B || ks[1].dim != H || ks[2].dim != D || vs[0].dim != B ||
+        vs[1].dim != H || vs[2].dim != Skv) {
       return false;
     }
-    m.is_causal = true;
-  } else if (mask_add != nullptr || where_node != nullptr) {
-    if (sym_seq) {
-      return false;  // Static masks need static sequence lengths.
-    }
-    std::vector<float> mask_data;
-    if (mask_add != nullptr) {
-      // The mask must be a constant float32 [1, 1, Sq, Skv] tensor with no
-      // NaNs. Anything else (runtime padding masks, [S,S]/[B,1,1,S] shapes,
-      // ...) is not handled here.
-      const Tensor* mt = FetchConstantTensor(m.mask);
-      if (mt == nullptr || mt->elem_type() != TensorProto_DataType_FLOAT) {
+    if (mask_add != nullptr || where_node != nullptr) {
+      std::vector<float> mask_data;
+      if (mask_add != nullptr) {
+        // The mask must be a constant float32 [1, 1, Sq, Skv] tensor with no
+        // NaNs. Anything else ([S,S]/[B,1,1,S] shapes, ...) is not handled.
+        const Tensor* mt = FetchConstantTensor(m.mask);
+        if (mt == nullptr || mt->elem_type() != TensorProto_DataType_FLOAT) {
+          return false;
+        }
+        const auto& msz = mt->sizes();
+        if (msz.size() != 4 || msz[0] != 1 || msz[1] != 1 || msz[2] != Sq ||
+            msz[3] != Skv) {
+          return false;
+        }
+        mask_data = ReadFloatTensorFlat(*mt);
+      } else {
+        // A constant bool condition over [..., Sq, Skv] with all leading dims
+        // 1 (what a causal `tril` or padding mask exports to after folding).
+        const Tensor* ct = FetchConstantTensor(where_node->input(0));
+        if (ct == nullptr || ct->elem_type() != TensorProto_DataType_BOOL) {
+          return false;
+        }
+        const auto& csz = ct->sizes();
+        if (csz.size() < 2 || csz[csz.size() - 2] != Sq || csz.back() != Skv) {
+          return false;
+        }
+        for (size_t i = 0; i + 2 < csz.size(); ++i) {
+          if (csz[i] != 1) {
+            return false;
+          }
+        }
+        const auto cond = ParseTensorData<bool>(ct);
+        if (static_cast<int64_t>(cond.size()) != Sq * Skv) {
+          return false;
+        }
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        mask_data.resize(cond.size());
+        for (size_t i = 0; i < cond.size(); ++i) {
+          mask_data[i] = (static_cast<bool>(cond[i]) == fill_when_cond_true)
+                             ? neg_inf
+                             : 0.0f;
+        }
+      }
+      if (static_cast<int64_t>(mask_data.size()) != Sq * Skv) {
         return false;
       }
-      const auto& msz = mt->sizes();
-      if (msz.size() != 4 || msz[0] != 1 || msz[1] != 1 || msz[2] != Sq ||
-          msz[3] != Skv) {
-        return false;
-      }
-      mask_data = ReadFloatTensorFlat(*mt);
-    } else {
-      // A constant bool condition over [..., Sq, Skv] with all leading dims 1
-      // (what a causal `tril` or padding mask exports to after folding).
-      const Tensor* ct = FetchConstantTensor(where_node->input(0));
-      if (ct == nullptr || ct->elem_type() != TensorProto_DataType_BOOL) {
-        return false;
-      }
-      const auto& csz = ct->sizes();
-      if (csz.size() < 2 || csz[csz.size() - 2] != Sq || csz.back() != Skv) {
-        return false;
-      }
-      for (size_t i = 0; i + 2 < csz.size(); ++i) {
-        if (csz[i] != 1) {
+      for (float f : mask_data) {
+        if (std::isnan(f)) {
           return false;
         }
       }
-      const auto cond = ParseTensorData<bool>(ct);
-      if (static_cast<int64_t>(cond.size()) != Sq * Skv) {
-        return false;
+      // is_causal is only sound for a square mask (its alignment for Sq != Skv
+      // is tied to the past_key length, which is not modelled here).
+      m.is_causal = Sq == Skv && IsSquareLowerTriangularCausal(mask_data, Sq);
+      if (mask_add == nullptr) {
+        m.derived_mask = std::move(mask_data);
+        m.derived_mask_sizes = {1, 1, Sq, Skv};
       }
-      const float neg_inf = -std::numeric_limits<float>::infinity();
-      mask_data.resize(cond.size());
-      for (size_t i = 0; i < cond.size(); ++i) {
-        mask_data[i] = (static_cast<bool>(cond[i]) == fill_when_cond_true)
-                           ? neg_inf
-                           : 0.0f;
-      }
-    }
-    if (static_cast<int64_t>(mask_data.size()) != Sq * Skv) {
-      return false;
-    }
-    for (float f : mask_data) {
-      if (std::isnan(f)) {
-        return false;
-      }
-    }
-    // is_causal is only sound for a square mask (its alignment for Sq != Skv
-    // is tied to the past_key length, which is not modelled here).
-    m.is_causal = Sq == Skv && IsSquareLowerTriangularCausal(mask_data, Sq);
-    if (mask_add == nullptr) {
-      m.derived_mask = std::move(mask_data);
-      m.derived_mask_sizes = {1, 1, Sq, Skv};
     }
   }
 
@@ -1147,6 +1183,24 @@ inline bool EmitCausalAttention(Node* n, Graph& graph,
   attn->addInput(m.v);
   if (m.is_causal) {
     attn->i_(Symbol("is_causal"), 1);
+  } else if (m.runtime_cond != nullptr) {
+    // Additive float mask from the runtime bool condition: -inf where the
+    // condition says "fill", 0 elsewhere. Built next to the Attention node.
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    auto make_scalar = [&](float value) {
+      Tensor t;
+      t.elem_type() = TensorProto_DataType_FLOAT;
+      t.floats() = {value};
+      return graph.addInitializerAndCreateValue(t);
+    };
+    Value* neg_v = make_scalar(neg_inf);
+    Value* zero_v = make_scalar(0.0f);
+    Node* additive = graph.create(Symbol("Where"), 1);
+    additive->addInput(m.runtime_cond);
+    additive->addInput(m.runtime_fill_when_cond_true ? neg_v : zero_v);
+    additive->addInput(m.runtime_fill_when_cond_true ? zero_v : neg_v);
+    additive->insertBefore(n);
+    attn->addInput(additive->output());
   } else if (m.mask != nullptr || !m.derived_mask.empty()) {
     Value* mask_v = m.mask;
     if (mask_v == nullptr) {
