@@ -277,12 +277,92 @@ def _tensor_bytes(name: str, shapes: ShapeMap, dtypes: DTypeMap) -> Optional[Mac
     return _prod(shape) * esize
 
 
-def _node_memory_access(
+# (domain, op_type) of the attention ops whose score matrix a materializing kernel
+# would hold: ai.onnx Attention (opset 23+) and the com.microsoft contrib ops.
+_ATTENTION_OPS = {
+    ("", "Attention"),
+    ("ai.onnx", "Attention"),
+    ("com.microsoft", "Attention"),
+    ("com.microsoft", "MultiHeadAttention"),
+    ("com.microsoft", "GroupQueryAttention"),
+}
+
+
+def _attention_score_bytes(
     node: onnx.NodeProto, shapes: ShapeMap, dtypes: DTypeMap
+) -> Optional[Macs]:
+    """Bytes of the S x S score matrix (``batch * heads * Sq * Skv`` elements at
+    the query's element size) that a *materializing* attention kernel holds for
+    this node, or None when ``node`` is not an attention op or its shapes are
+    unknown.
+
+    Head/sequence dims follow ``_attention_macs`` for ``Attention``. The
+    com.microsoft ops take a 3D ``(batch, seq, hidden)`` query with the head
+    count in ``num_heads``; their key is ``(batch, kv_seq, hidden)`` or, for
+    ``MultiHeadAttention``, BNSH ``(batch, heads, kv_seq, head)``. Past KV cache
+    is not included in ``Skv``.
+    """
+    if (node.domain, node.op_type) not in _ATTENTION_OPS:
+        return None
+    q = shapes.get(node.input[0]) if node.input else None
+    if not _known(q) or len(q) < 3:
+        return None
+    esize = dtypes.get(node.input[0])
+    if esize is None:
+        return None
+
+    if node.op_type == "Attention" and node.domain in ("", "ai.onnx"):
+        k = shapes.get(node.input[1]) if len(node.input) > 1 else None
+        if not _known(k):
+            return None
+        if len(q) == 4 and len(k) == 4:
+            batch, heads, sq, skv = q[0], q[1], q[2], k[2]
+        elif len(q) == 3 and len(k) == 3:
+            heads = _attr_int(node, "q_num_heads", 0)
+            if heads <= 0:
+                return None
+            batch, sq, skv = q[0], q[1], k[1]
+        else:
+            return None
+    else:
+        heads = _attr_int(node, "num_heads", 0)
+        if heads <= 0 or len(q) != 3:
+            return None
+        batch, sq = q[0], q[1]
+        if node.op_type == "Attention":  # com.microsoft self-attention
+            skv = sq
+        else:
+            k = shapes.get(node.input[1]) if len(node.input) > 1 else None
+            if not _known(k) or len(k) not in (3, 4):
+                return None
+            skv = k[2] if len(k) == 4 else k[1]
+    return _prod([batch, heads, sq, skv]) * esize
+
+
+def _attention_score_traffic(
+    node: onnx.NodeProto, shapes: ShapeMap, dtypes: DTypeMap
+) -> Macs:
+    """Extra bytes a materializing attention kernel moves for ``node``: the score
+    matrix is written once and read once. Zero for non-attention ops and for
+    attention whose score size is unknown.
+    """
+    score = _attention_score_bytes(node, shapes, dtypes)
+    return 0 if score is None else 2 * score
+
+
+def _node_memory_access(
+    node: onnx.NodeProto,
+    shapes: ShapeMap,
+    dtypes: DTypeMap,
+    attention_tiled: bool = True,
 ) -> Macs:
     """Bytes a node moves in a forward pass: every input read plus every output
     written. Weights read from memory count as reads. Tensors with unknown size
     contribute 0 (best-effort, matching the MAC counters).
+
+    With ``attention_tiled=False`` an attention node also moves its S x S score
+    matrix (see ``_attention_score_traffic``); the default tiled/flash-style
+    kernel keeps only the O(S*d) inputs and outputs.
     """
     total: Macs = 0
     for name in list(node.input) + list(node.output):
@@ -291,6 +371,30 @@ def _node_memory_access(
         nbytes = _tensor_bytes(name, shapes, dtypes)
         if nbytes is not None:
             total += nbytes
+    if not attention_tiled:
+        total += _attention_score_traffic(node, shapes, dtypes)
+    return total
+
+
+def _attention_traffic(
+    graph: onnx.GraphProto, inherited_shapes: ShapeMap, inherited_dtypes: DTypeMap
+) -> Macs:
+    """Total extra score-matrix traffic of materialized attention over ``graph``
+    and its control-flow subgraphs. Only the attention nodes contribute; this is
+    the amount ``ModelInfo`` adds to a tiled-kernel ``mem_access`` total.
+    """
+    shapes = _collect_shapes(graph, inherited_shapes)
+    dtypes = _collect_dtypes(graph, inherited_dtypes)
+    total: Macs = 0
+    for node in graph.node:
+        total += _attention_score_traffic(node, shapes, dtypes)
+        for attr in node.attribute:
+            sub_graphs = []
+            if attr.HasField("g"):
+                sub_graphs.append(attr.g)
+            sub_graphs.extend(attr.graphs)
+            for sub_graph in sub_graphs:
+                total += _attention_traffic(sub_graph, shapes, dtypes)
     return total
 
 
@@ -588,6 +692,15 @@ class ModelInfo:
          (FLOP per byte), the roofline ratio.
        Tensors whose shape or element size is unknown contribute 0, so these are
        best-effort lower bounds; with dynamic dims they may be symbolic too.
+
+    ``attention_tiled`` (default True) declares whether attention ops (Attention,
+    com.microsoft Attention / MultiHeadAttention / GroupQueryAttention) run on a
+    tiled, flash-style kernel. Tiled attention moves only its inputs and outputs
+    (O(S*d)). ``attention_tiled=False`` models a materializing kernel instead: each
+    attention node also writes and reads its S x S score matrix
+    (``batch * heads * Sq * Skv`` elements at the activation dtype's size), which
+    is added to ``mem_access`` and counted as transient workspace in
+    ``memory_footprint``. Unfused graphs have no such node, so they are unaffected.
     """
 
     def get_info(
@@ -595,6 +708,7 @@ class ModelInfo:
         graph: onnx.GraphProto,
         inherited_shapes: Optional[ShapeMap] = None,
         inherited_dtypes: Optional[DTypeMap] = None,
+        attention_tiled: bool = True,
     ) -> Tuple[Dict[str, int], Macs, Macs]:
         if inherited_shapes is None:
             inherited_shapes = {}
@@ -617,7 +731,9 @@ class ModelInfo:
                         f"'{node.name}' ({e}); it is excluded from the total.",
                         stacklevel=2,
                     )
-            mem_access += _node_memory_access(node, shapes, dtypes)
+            mem_access += _node_memory_access(
+                node, shapes, dtypes, attention_tiled=attention_tiled
+            )
             for attr in node.attribute:
                 sub_graphs = []
                 if attr.HasField("g"):
@@ -625,7 +741,7 @@ class ModelInfo:
                 sub_graphs.extend(attr.graphs)
                 for sub_graph in sub_graphs:
                     sub_op_nums, sub_macs, sub_mem = self.get_info(
-                        sub_graph, shapes, dtypes
+                        sub_graph, shapes, dtypes, attention_tiled
                     )
                     op_nums = defaultdict(
                         int,
@@ -639,7 +755,7 @@ class ModelInfo:
         op_nums["Constant"] += len(graph.initializer)
         return op_nums, macs, mem_access
 
-    def __init__(self, model: onnx.ModelProto):
+    def __init__(self, model: onnx.ModelProto, attention_tiled: bool = True):
         # Delegate the counting to the single C++ implementation, which returns
         # op counts, model size, and the compute/memory metrics as polynomials;
         # _cpp_metrics rebuilds the symbolic ones into the same sympy expressions
@@ -665,6 +781,24 @@ class ModelInfo:
         if expanded is not None:
             _, _, macs, mem_access, footprint = _cpp_metrics(
                 expanded, run_shape_inference=False
+            )
+        # ``attention_tiled`` says whether attention runs on a tiled (flash-style)
+        # kernel, which keeps only its O(S*d) inputs and outputs. When it does not
+        # (materializing kernel), each attention node also writes and reads its
+        # S x S score matrix, and that matrix is a transient workspace while the
+        # node runs. The C++ totals above know nothing of this, so the extra terms
+        # are added here on the same (expanded when present) graph they were
+        # counted on. The default (tiled) keeps the C++ numbers untouched.
+        self.attention_tiled = attention_tiled
+        if not attention_tiled:
+            inferred = (
+                expanded
+                if expanded is not None
+                else ModelInfo._infer_shapes(copy.deepcopy(model))
+            )
+            mem_access = mem_access + _attention_traffic(inferred.graph, {}, {})
+            footprint = self._peak_memory_footprint(
+                inferred.graph, attention_tiled=False
             )
         self.macs = macs
         self.mem_access = mem_access
@@ -735,6 +869,7 @@ class ModelInfo:
         graph: onnx.GraphProto,
         inherited_shapes: Optional[ShapeMap] = None,
         inherited_dtypes: Optional[DTypeMap] = None,
+        attention_tiled: bool = True,
     ) -> Macs:
         """Peak bytes resident during a forward pass of ``graph``.
 
@@ -746,6 +881,9 @@ class ModelInfo:
         subgraphs add their own recursive peak on top of the live set at the
         owning node (a conservative bound, since captured tensors are counted in
         both). Unknown-size tensors contribute 0.
+
+        With ``attention_tiled=False`` an attention node's S x S score matrix is
+        added on top of the live set at that node, as its transient workspace.
         """
         shapes = _collect_shapes(graph, inherited_shapes or {})
         dtypes = _collect_dtypes(graph, inherited_dtypes or {})
@@ -784,6 +922,10 @@ class ModelInfo:
                 if name and name not in weight_names:
                     live.add(name)
             current = live_bytes(live)
+            if not attention_tiled:
+                score = _attention_score_bytes(node, shapes, dtypes)
+                if score is not None:
+                    current = current + score
             # Nested subgraphs run while this node's live set is held.
             for attr in node.attribute:
                 sub_graphs = []
@@ -791,7 +933,9 @@ class ModelInfo:
                     sub_graphs.append(attr.g)
                 sub_graphs.extend(attr.graphs)
                 for sub_graph in sub_graphs:
-                    sub_peak = self._peak_memory_footprint(sub_graph, shapes, dtypes)
+                    sub_peak = self._peak_memory_footprint(
+                        sub_graph, shapes, dtypes, attention_tiled
+                    )
                     current = current + sub_peak
             peak = _max_macs(peak, current)
             for name in [n for n in live if last_use.get(n) == i]:
