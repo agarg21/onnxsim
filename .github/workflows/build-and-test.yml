@@ -224,6 +224,9 @@ jobs:
   # serialized behind its slowest (macOS) leg.
   test_axera_quantization_pruning:
     name: Axera/quantization/pruning suites
+    # Scheduled, manual and release runs only: this suite is slow and does not gate
+    # PRs. Releases still run it because upload_pypi lists it in `needs`.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}
     runs-on: ubuntu-24.04
     env:
       CMAKE_GENERATOR: Ninja
