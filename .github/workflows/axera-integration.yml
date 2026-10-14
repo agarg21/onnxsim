@@ -39,8 +39,6 @@ on:
     paths:
       - ".github/workflows/axera-integration.yml"
       - "scripts/axera/**"
-      - "scripts/common/**"
-      - "scripts/regression/model_zoo.py"
       - "tests/test_pulsar2_compat.py"
       - "tests/test_pulsar2_simulator.py"
       - "tests/test_pulsar2_hf_to_axmodel.py"
