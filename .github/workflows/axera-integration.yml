@@ -28,7 +28,7 @@ name: Axera Integration
 
 on:
   schedule:
-    - cron: "0 7 * * *" # Daily 07:00 UTC (nightly)
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
   workflow_dispatch:
     inputs:
       convert_models:
