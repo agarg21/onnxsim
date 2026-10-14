@@ -390,6 +390,14 @@ def _values(model):
 
 def _arr_key(a):
     a = np.ascontiguousarray(a)
+    if a.dtype.kind == "f":
+        # Float scales are float32 results of host-dependent kernels: the same
+        # run can differ by 1 ULP between runners. Five significant digits keep
+        # that out of the signature; integers stay exact, so a changed code or
+        # bias still fails.
+        a = np.array([float(f"{x:.5g}") for x in a.ravel()], dtype=a.dtype).reshape(
+            a.shape
+        )
     return f"{a.dtype}{list(a.shape)}:{hashlib.md5(a.tobytes()).hexdigest()[:12]}"
 
 

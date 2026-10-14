@@ -138,6 +138,24 @@ jobs:
           if [ -f "$f" ]; then
             { echo "### Quark ${{ matrix.quark }}: relative output error vs float (lower is better)"; echo; cat "$f"; } >> "$GITHUB_STEP_SUMMARY"
           fi
+      # Diagnostic only: records what this runner's Python packages and CPU are,
+      # so structural Quark-parity failures can be compared with a local run.
+      - name: Record environment for parity triage
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            python -VV
+            python -m pip freeze
+            echo
+            lscpu
+          } > "quark-env-${{ matrix.quark }}.txt" 2>&1 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: quark-env-${{ matrix.quark }}
+          path: ${{ runner.temp }}/quark-env-${{ matrix.quark }}.txt
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         if: always()
         with:

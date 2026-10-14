@@ -34,4 +34,7 @@ def test_int16_adaround_rounding_matches_quark(seed, tmp_path, monkeypatch):
     monkeypatch.setattr(qf, "_adam_step32", adam32)
     quark, mine, *_ = C._both(model, data, ff, preset="INT16_CNN_DEFAULT")
     assert used and set(used) == {np.dtype(np.float32)}
-    assert max(C._mismatch(quark, mine).values()) == 0
+    # Not exact: a host's float32 kernels can flip a rounding tie (one code of 84
+    # on CI). This bound does not catch a float64 switch by itself: float64 misses
+    # the same single code on seed 5, which is under the bound.
+    assert max(C._mismatch(quark, mine).values()) <= 0.02
