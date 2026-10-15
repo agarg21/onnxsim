@@ -365,9 +365,11 @@ def _node_memory_access(
     kernel keeps only the O(S*d) inputs and outputs.
     """
     total: Macs = 0
-    # A Gather reads only the rows it selects, and those rows are exactly its
-    # output. Charging its whole data table would bill every row of the table.
-    is_gather = _is_std_domain(node) and node.op_type == "Gather" and node.input
+    # A Gather or GatherND reads only the rows it selects, and those rows are
+    # exactly its output. Charging its whole data table would bill every row.
+    is_gather = (
+        _is_std_domain(node) and node.op_type in ("Gather", "GatherND") and node.input
+    )
     for k, name in enumerate(list(node.input) + list(node.output)):
         if not name:  # optional/omitted operand
             continue
