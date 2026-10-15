@@ -908,6 +908,10 @@ struct CausalAttentionMatch {
   // Where(runtime_cond, -inf, 0) (or the swapped fill) as attn_mask.
   Value* runtime_cond = nullptr;
   bool runtime_fill_when_cond_true = false;
+  // Set when the runtime additive mask does not cover the whole [Sq, Skv]
+  // block (say [1, 1, 1, Skv]): the emitter Expands it to
+  // [mask batch, mask heads, Sq, Skv], taking Sq and Skv from score_shape_src.
+  bool expand_mask = false;
   std::vector<int64_t> derived_mask_sizes;  // {1, 1, Sq, Skv}
   bool is_causal = false;  // mask is the square lower-triangular pattern
   double scale = 0.0;
@@ -1124,9 +1128,11 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
       return false;
     }
     const auto& ms = m.mask->sizes();
-    if (ms.size() != 4 || !SameSeqDim(ms[2], qs[2]) ||
-        !SameSeqDim(ms[3], ks[3])) {
+    if (ms.size() != 4) {
       return false;
+    }
+    if (!SameSeqDim(ms[2], qs[2]) || !SameSeqDim(ms[3], ks[3])) {
+      m.expand_mask = true;
     }
   } else {
     // Static masks (constant additive or constant bool) and unmasked KV-cache
@@ -1225,6 +1231,46 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
 // rank-4 operands, then restores ctx's [B,S,H*Dv] layout the same way the
 // original Transpose+Reshape did. Returns false only if the rewrite of `n`'s
 // uses fails; the caller treats the graph as unchanged in that case.
+// Expand(mask, Concat(Shape(mask)[0:2], Shape(q)[2:3], Shape(k_t)[3:4]))
+// inserted before `before`: the mask keeps its own batch and head dims and
+// takes the query and key lengths, so ORT's Attention gets a full [.., Sq, Skv]
+// block. Shapes come from q and k_t, which the emitted Attention keeps (the
+// scores' producers are removed by the rewrite).
+inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
+                                 Value* q, Value* k_t) {
+  auto make_ints = [&](std::vector<int64_t> v) {
+    Tensor t;
+    t.elem_type() = TensorProto_DataType_INT64;
+    t.sizes() = {static_cast<int64_t>(v.size())};
+    t.int64s() = std::move(v);
+    return graph.addInitializerAndCreateValue(t);
+  };
+  auto insert = [&](Symbol kind, std::vector<Value*> inputs) {
+    Node* nd = graph.create(kind, 1);
+    for (Value* in : inputs) {
+      nd->addInput(in);
+    }
+    nd->insertBefore(before);
+    return nd;
+  };
+  Node* mask_shape = insert(Symbol("Shape"), {mask});
+  Node* q_shape = insert(Symbol("Shape"), {q});
+  Node* kt_shape = insert(Symbol("Shape"), {k_t});
+  Node* mask_bh = insert(Symbol("Slice"),
+                         {mask_shape->output(), make_ints({0}),
+                          make_ints({2}), make_ints({0})});
+  Node* sq = insert(Symbol("Slice"), {q_shape->output(), make_ints({2}),
+                                      make_ints({3}), make_ints({0})});
+  Node* skv = insert(Symbol("Slice"), {kt_shape->output(), make_ints({3}),
+                                       make_ints({4}), make_ints({0})});
+  Node* lengths = insert(Symbol("Concat"), {sq->output(), skv->output()});
+  lengths->i_(Symbol("axis"), 0);
+  Node* target = insert(Symbol("Concat"), {mask_bh->output(), lengths->output()});
+  target->i_(Symbol("axis"), 0);
+  Node* expanded = insert(Symbol("Expand"), {mask, target->output()});
+  return expanded->output();
+}
+
 inline bool EmitCausalAttention(Node* n, Graph& graph,
                                 const CausalAttentionMatch& m,
                                 NodeDestroyType& destroy_current) {
@@ -1260,6 +1306,9 @@ inline bool EmitCausalAttention(Node* n, Graph& graph,
     attn->addInput(additive->output());
   } else if (m.mask != nullptr || !m.derived_mask.empty()) {
     Value* mask_v = m.mask;
+    if (m.expand_mask) {
+      mask_v = ExpandMaskToScores(graph, n, m.mask, m.q, m.k_t);
+    }
     if (mask_v == nullptr) {
       Tensor mt;
       mt.elem_type() = TensorProto_DataType_FLOAT;

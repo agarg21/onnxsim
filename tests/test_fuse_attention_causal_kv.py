@@ -329,14 +329,18 @@ def test_static_causal_mask_built_from_range_fuses_with_is_causal():
 # --------------------------------------------------------------------------- #
 # (b) causal mask built from a dynamic-length subgraph
 # --------------------------------------------------------------------------- #
-def test_dynamic_length_causal_mask_declines_but_stays_correct():
-    # S comes from Shape(x) at runtime, so the mask shape is not statically
-    # provable. The pass must decline (not guess a static S) and the graph
+def test_dynamic_length_causal_mask_fuses_as_attn_mask_and_stays_correct():
+    # S comes from Shape(x) at runtime, so the mask is computed in the graph and
+    # not statically provable. It is never is_causal; it is passed as attn_mask
+    # (Expanded to the scores' block when it does not cover it), and the graph
     # must stay correct for every sequence length it is run with.
     model = _causal_kv_model(mask="dynamic_causal")
     simplified, ok = onnxsim.simplify(model)
     assert ok
-    assert _std_attention_nodes(simplified) == []
+    nodes = _std_attention_nodes(simplified)
+    assert len(nodes) == 1
+    assert _attr_int(nodes[0], "is_causal") == 0
+    assert len(nodes[0].input) == 4
     for seq in (3, 5, 7):
         _check_equal(
             model,
@@ -379,13 +383,17 @@ def test_kv_cache_decode_bottom_right_mask_fuses_without_is_causal(Sq, Skv, n_in
 # --------------------------------------------------------------------------- #
 # (d) padding masks
 # --------------------------------------------------------------------------- #
-def test_runtime_padding_mask_declines_but_stays_correct():
-    # Padding mask is a runtime graph input, not a constant: nothing to verify
-    # against, so the block must stay unfused and correct.
+def test_runtime_padding_mask_fuses_as_attn_mask_and_stays_correct():
+    # Padding mask is a runtime graph input, not a constant: it is passed as
+    # attn_mask (Expanded when it does not cover the scores' block), with no
+    # causal semantics assumed.
     model = _causal_kv_model(mask="runtime_padding")
     simplified, ok = onnxsim.simplify(model)
     assert ok
-    assert _std_attention_nodes(simplified) == []
+    nodes = _std_attention_nodes(simplified)
+    assert len(nodes) == 1
+    assert _attr_int(nodes[0], "is_causal") == 0
+    assert len(nodes[0].input) == 4
     _check_equal(model, simplified, _feeds(120, mask="runtime_padding"))
 
 
