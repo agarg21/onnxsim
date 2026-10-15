@@ -978,6 +978,7 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   Node* mask_add = nullptr;
   Node* where_node = nullptr;  // torch masked_fill: Where(cond, -inf, scores)
   bool fill_when_cond_true = false;
+  bool runtime_add = false;  // Add whose mask operand is computed at run time
   Value* scores = nullptr;
   if (CheckKind(masked, kAdd)) {
     if (masked->uses().size() != 1 || masked->node()->inputs().size() != 2) {
@@ -990,6 +991,22 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
         scores = mask_add->input(i);
         break;
       }
+    }
+    if (scores == nullptr) {
+      // Runtime additive mask (computed in the graph, any shape broadcastable
+      // to [B, H, Sq, Skv]): the scores operand is the one produced by the
+      // QK^T MatMul or its scale. The scale chain and MatMul checks below
+      // verify it, so the matched Q/K are exactly that side's, and Add's
+      // commutativity makes the other operand the additive mask either way.
+      for (int i = 0; i < 2 && scores == nullptr; ++i) {
+        Value* cand = mask_add->input(i);
+        if (CheckKind(cand, kMatMul) || CheckKind(cand, kDiv) ||
+            CheckKind(cand, kMul)) {
+          scores = cand;
+          m.mask = mask_add->input(1 - i);
+        }
+      }
+      runtime_add = scores != nullptr;
     }
     if (scores == nullptr || scores->uses().size() != 1) {
       return false;
@@ -1072,6 +1089,9 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
       m.runtime_cond = where_node->input(0);
       m.runtime_fill_when_cond_true = fill_when_cond_true;
     }
+  } else if (runtime_add) {
+    // The mask is only added to the scores, so any shape that broadcasts to
+    // [B, H, Sq, Skv] is valid as attn_mask: no static sizes are needed.
   } else {
     // Static masks (constant additive or constant bool) and unmasked KV-cache
     // steps need every size to be a static int.
