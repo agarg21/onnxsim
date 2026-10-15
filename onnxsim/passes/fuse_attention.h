@@ -923,6 +923,25 @@ struct CausalAttentionMatch {
 // MatchAttention it does not need the Q/K/V projections or head-split chains
 // to be recognisable: it consumes the rank-4 Q, K^T and V values directly,
 // which is all `Attention` (ai.onnx, opset 23) needs for 4-D inputs.
+// Whether `v` is computed from a graph input (a run-time value), as opposed to
+// only from initializers and constants that folding would remove. The walk is
+// bounded so a large mask subgraph cannot make the matcher slow.
+inline bool DependsOnGraphInput(Value* v, int& budget) {
+  if (v == nullptr || --budget < 0) {
+    return false;
+  }
+  Node* producer = v->node();
+  if (producer->kind() == kParam) {
+    return FetchConstantTensor(v) == nullptr;
+  }
+  for (Value* in : producer->inputs()) {
+    if (DependsOnGraphInput(in, budget)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   if (!CheckKind(n, kReshape) || n->inputs().size() != 2 ||
       n->outputs().size() != 1) {
@@ -1005,6 +1024,13 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
           scores = cand;
           m.mask = mask_add->input(1 - i);
         }
+      }
+      // A mask that folding can remove stays on the static path (where a
+      // causal one gets is_causal); only a mask that needs the run time is
+      // emitted as attn_mask.
+      int budget = 64;
+      if (scores != nullptr && !DependsOnGraphInput(m.mask, budget)) {
+        scores = nullptr;
       }
       runtime_add = scores != nullptr;
     }
@@ -1090,8 +1116,18 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
       m.runtime_fill_when_cond_true = fill_when_cond_true;
     }
   } else if (runtime_add) {
-    // The mask is only added to the scores, so any shape that broadcasts to
-    // [B, H, Sq, Skv] is valid as attn_mask: no static sizes are needed.
+    // Batch and head dims may broadcast, but ORT's Attention needs the mask to
+    // cover the whole [Sq, Skv] block: a mask that broadcasts over Sq or Skv
+    // (say [1, 1, 1, Skv]) would need an Expand, which costs a full score-sized
+    // tensor, so it declines. No static sizes are needed otherwise.
+    if (!m.mask->has_sizes()) {
+      return false;
+    }
+    const auto& ms = m.mask->sizes();
+    if (ms.size() != 4 || !SameSeqDim(ms[2], qs[2]) ||
+        !SameSeqDim(ms[3], ks[3])) {
+      return false;
+    }
   } else {
     // Static masks (constant additive or constant bool) and unmasked KV-cache
     // steps need every size to be a static int.
