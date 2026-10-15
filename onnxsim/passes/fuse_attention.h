@@ -96,6 +96,7 @@
 #include <string>
 #include <vector>
 
+#include "attention_fusion_backend.h"
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
@@ -1246,10 +1247,19 @@ struct FuseAttention final : public PredicateBasedPass {
                            PassOptimizationType::Compute) {}
   std::string getPassName() const override { return "fuse_attention"; }
 
+  // Which forms the attention_fusion_backend option allows (see
+  // attention_fusion_backend.h). With the default kAuto both are tried, in the
+  // same order as before the option existed.
   bool patternMatchPredicate(Node* n) override {
+    const onnxsim::AttentionFusionBackend backend =
+        onnxsim::GetAttentionFusionBackend();
     AttentionMatch m;
-    if (MatchAttention(n, m)) {
+    if (onnxsim::AttentionBackendAllowsMicrosoftForm(backend) &&
+        MatchAttention(n, m)) {
       return true;
+    }
+    if (!onnxsim::AttentionBackendAllowsOnnxCausalForm(backend)) {
+      return false;
     }
     // ai.onnx Attention exists only from opset 23.
     if (getOpsetVersion(*n->owningGraph()) < 23) {
@@ -1262,8 +1272,14 @@ struct FuseAttention final : public PredicateBasedPass {
   bool runTransform(Node* n, Graph& graph,
                     NodeDestroyType& destroy_current) override {
     destroy_current = NodeDestroyType::DestroyZero;
+    const onnxsim::AttentionFusionBackend backend =
+        onnxsim::GetAttentionFusionBackend();
     AttentionMatch m;
-    if (!MatchAttention(n, m)) {
+    if (!(onnxsim::AttentionBackendAllowsMicrosoftForm(backend) &&
+          MatchAttention(n, m))) {
+      if (!onnxsim::AttentionBackendAllowsOnnxCausalForm(backend)) {
+        return false;
+      }
       if (getOpsetVersion(*n->owningGraph()) < 23) {
         return false;
       }

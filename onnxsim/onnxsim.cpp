@@ -25,6 +25,7 @@
 // core/common/endian.h (which neither ships).
 #include "onnxruntime_cxx_api.h"
 #endif
+#include "attention_fusion_backend.h"
 #include "bev_custom_op_schemas.h"
 #include "constant_folding.h"
 #include "contrib_schemas.h"
@@ -481,6 +482,16 @@ static onnx::ModelProto SimplifyImpl(
           ? onnxsim::ParseGemmFusionBackend(
                 std::getenv("ONNXSIM_GEMM_FUSION_BACKEND"))
           : onnxsim::GemmFusionBackend::kOrtCpu);
+
+  // Which attention Attention form fuse_attention may emit -- see
+  // attention_fusion_backend.h. Same pattern as the gemm backend above:
+  // read from ONNXSIM_ATTENTION_FUSION_BACKEND, set unconditionally so this
+  // call never inherits a prior call's setting.
+  onnxsim::SetAttentionFusionBackend(
+      std::getenv("ONNXSIM_ATTENTION_FUSION_BACKEND")
+          ? onnxsim::ParseAttentionFusionBackend(
+                std::getenv("ONNXSIM_ATTENTION_FUSION_BACKEND"))
+          : onnxsim::AttentionFusionBackend::kAuto);
 
   // Optionally profile every fixed-point function. Turned on by pointing
   // ``ONNXSIM_PROFILE`` at an output file (``ONNXSIM_PROFILE=1`` uses the
