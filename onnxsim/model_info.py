@@ -648,11 +648,14 @@ def _kernel_graph(model: onnx.ModelProto, decompose: bool) -> onnx.ModelProto:
     schema functions (Softmax, ...) and local functions are lowered to their
     primitive ops first, so each primitive is its own kernel."""
     if decompose:
-        expanded = ModelInfo._expanded_macs_model(model)
-        source = expanded if expanded is not None else model
-        return ModelInfo._infer_shapes(
-            _inline_local_function_calls(copy.deepcopy(source))
-        )
+        # Inline local functions, lower schema functions (this includes ones
+        # inside local bodies, e.g. a LayerNormalization in an outlined block),
+        # then inline the functions the lowering produced.
+        inlined = _inline_local_function_calls(copy.deepcopy(model))
+        expanded = ModelInfo._expanded_macs_model(inlined)
+        if expanded is not None:
+            inlined = _inline_local_function_calls(expanded)
+        return ModelInfo._infer_shapes(inlined)
     return ModelInfo._infer_shapes(copy.deepcopy(model))
 
 
