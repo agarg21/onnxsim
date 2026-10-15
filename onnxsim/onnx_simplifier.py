@@ -9027,6 +9027,15 @@ def simplify(
             ``perform_optimization`` is ``False``. An unknown name raises, since -- unlike a typo in
             ``skipped_optimizers``, which just means nothing new is skipped -- a typo here means the
             pass you asked for silently never runs.
+            One opt-in pass worth knowing: ``"fuse_skip_layer_norm"`` fuses a residual ``Add`` that
+            feeds a last-axis ``LayerNormalization`` (opset >= 17) into one
+            ``com.microsoft::SkipLayerNormalization`` node, removing the round trip of the Add output
+            through memory. It matches ``Add(x, skip)`` with both operands non-constant (or
+            ``Add(Add(x, skip), bias)`` with a constant ``[C]`` bias), where the Add output has no
+            other consumer and is not a graph output; anything else is left unchanged. It is off by
+            default, so ``simplify(model)`` output is unchanged; the fused graph needs a runtime that
+            implements ``SkipLayerNormalization`` (e.g. ONNX Runtime). Equivalent CLI:
+            ``onnxsim a.onnx b.onnx --enable-optimization fuse_skip_layer_norm``.
     :param custom_rewriter: An optional callable ``ModelProto -> Optional[ModelProto]`` run as an extra
             stage inside onnxsim's simplification fixed point, interleaved with the built-in optimizer,
             shape inference and constant folding so a rewrite can unlock further simplification and vice
