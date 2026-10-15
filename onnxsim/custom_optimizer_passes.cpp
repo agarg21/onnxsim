@@ -66,6 +66,7 @@
 #include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
+#include "passes/fuse_skip_layer_norm.h"
 #include "passes/fuse_split_gather_concat.h"
 #include "passes/gemm_transa_to_transpose.h"
 #include "passes/gguf_legacy_quant.h"
@@ -227,6 +228,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseLpNormalization>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::FuseSkipLayerNorm>(registry);
     RegisterOrReplace<p::FuseSplitGatherConcat>(registry);
     RegisterOrReplace<p::GemmTransAToTranspose>(registry);
     RegisterOrReplace<p::GgufQ2K>(registry);
