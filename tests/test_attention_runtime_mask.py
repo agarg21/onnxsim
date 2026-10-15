@@ -102,12 +102,12 @@ def test_runtime_mask_with_dynamic_sequence_length_matches_torch(tmp_path):
         np.testing.assert_allclose(_run(sim, feeds), ref, rtol=1e-4, atol=1e-5)
 
 
-def test_runtime_mask_broadcasting_over_the_query_axis_declines_and_stays_correct(
+def test_runtime_mask_broadcasting_over_the_query_axis_is_expanded_and_fuses(
     tmp_path,
 ):
-    # [1, 1, 1, S] covers only one query row: ORT's Attention cannot take it,
-    # and an Expand would materialize a full score-sized tensor, so it stays
-    # unfused. The graph must still be correct.
+    # [1, 1, 1, S] covers only one query row. The matcher Expands it to the
+    # scores' [1, 1, Sq, Skv] block (an Sq x Skv tensor, as the unfused Add
+    # already materializes), so Attention takes it and stays correct.
     torch.manual_seed(0)
     S = 6
     module = _MaskedAttention().eval()
@@ -117,7 +117,31 @@ def test_runtime_mask_broadcasting_over_the_query_axis_declines_and_stays_correc
         ref = module(x, mask).numpy()
     sim, ok = onnxsim.simplify(_export(module, (x, mask), tmp_path / "b.onnx"))
     assert ok
-    assert "Attention" not in _ops(sim)
+    assert "Attention" in _ops(sim)
+    assert "Softmax" not in _ops(sim)
     np.testing.assert_allclose(
         _run(sim, {"x": x.numpy(), "mask": mask.numpy()}), ref, rtol=1e-4, atol=1e-5
     )
+
+
+def test_runtime_mask_expanded_with_dynamic_length_matches_torch(tmp_path):
+    torch.manual_seed(0)
+    module = _MaskedAttention().eval()
+    S0 = 6
+    x = torch.randn(1, S0, C)
+    mask = torch.randn(1, 1, 1, S0)
+    seq = torch.export.Dim("seq", min=2, max=32)
+    dyn = ({1: seq}, {3: seq})
+    sim, ok = onnxsim.simplify(
+        _export(module, (x, mask), tmp_path / "bd.onnx", dynamic=dyn)
+    )
+    assert ok
+    assert "Attention" in _ops(sim)
+    for S in (3, 9):
+        x = torch.randn(1, S, C)
+        mask = torch.randn(1, 1, 1, S)
+        with torch.no_grad():
+            ref = module(x, mask).numpy()
+        np.testing.assert_allclose(
+            _run(sim, {"x": x.numpy(), "mask": mask.numpy()}), ref, rtol=1e-4, atol=1e-5
+        )
