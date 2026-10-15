@@ -11,31 +11,46 @@ node, so the per-kernel traffic model (``kernel_traffic_breakdown`` with
 ``decompose_functions=False``) charges only its boundary tensors, and the sum
 drops out of the total.
 
+The gate is the traffic model itself: each pair is outlined on its own, the
+model's total before and after is compared, and only pairs whose measured
+saving reaches the threshold are kept together.
+
 The saving is only real if the runtime runs the call as one kernel. Runtimes
 that inline model-local functions back to primitive ops (ORT does) keep the
 sum in memory again, so ``decompose_functions=True`` costs the same as the
-original graph. The gate here therefore uses the advisor's per-candidate
-``bytes_saved`` estimate; callers that need the saving must also have a fused
-kernel for the function body (see ``fuse_skip_layer_norm``).
+original graph. The gate does not check for a fused target kernel; that is the
+caller's responsibility (see ``fuse_skip_layer_norm``).
 """
 
 import copy
-from typing import Dict, List, Set
+from dataclasses import dataclass
+from typing import Dict, List, Sequence, Set, Tuple
 
 import onnx
 from onnx import helper
 
 from onnxsim.model_info import (
-    _collect_dtypes,
-    _collect_shapes,
     _is_std_domain,
-    _tensor_bytes,
+    kernel_traffic_breakdown,
 )
 
-__all__ = ["LOCAL_DOMAIN", "outline_residual_add_norm"]
+__all__ = ["LOCAL_DOMAIN", "OutlineResult", "outline_residual_add_norm"]
 
 LOCAL_DOMAIN = "onnxsim.local"
 _NORM = "LayerNormalization"
+
+
+@dataclass(frozen=True)
+class OutlineResult:
+    """``model``: the outlined copy. ``saved_bytes``: the traffic model's measured
+    saving for each outlined pair, in graph order."""
+
+    model: onnx.ModelProto
+    saved_bytes: Tuple[int, ...]
+
+    @property
+    def count(self) -> int:
+        return len(self.saved_bytes)
 
 
 def _has_subgraph(node: onnx.NodeProto) -> bool:
@@ -75,7 +90,7 @@ def _build_function(
         helper.make_node(_NORM, body_norm_inputs, body_outputs, name="norm"),
     ]
     body[1].attribute.extend(copy.deepcopy(list(norm.attribute)))
-    func = helper.make_function(
+    return helper.make_function(
         LOCAL_DOMAIN,
         name,
         inputs,
@@ -83,31 +98,14 @@ def _build_function(
         body,
         [helper.make_opsetid("", opset)],
     )
-    return func
 
 
-def outline_residual_add_norm(
-    model: onnx.ModelProto,
-    min_bytes_saved: int = 0,
-) -> "tuple[onnx.ModelProto, int]":
-    """Copy of ``model`` with each eligible ``Add -> LayerNormalization`` pair
-    replaced by a call to a new model-local function. Returns the new model and
-    the number of pairs outlined.
-
-    A pair is eligible when the Add has two non-empty inputs, its output feeds
-    only the norm and is not a graph output, neither node has a subgraph, and
-    the predicted saving (``2 * size(sum)``, as in ``fusion_advisor``) is at
-    least ``min_bytes_saved``. Shapes come from shape inference; a pair whose
-    sum size is unknown is skipped.
-    """
-    out = copy.deepcopy(model)
-    opset = _default_opset(out)
-    inferred = onnx.shape_inference.infer_shapes(out, data_prop=True)
-    shapes = _collect_shapes(inferred.graph, {})
-    dtypes = _collect_dtypes(inferred.graph, {})
-    graph = out.graph
+def _eligible_pairs(model: onnx.ModelProto) -> List[Tuple[int, int]]:
+    """Structural matches ``(add_index, norm_index)``: the Add has two non-empty
+    inputs and its only use is the norm, which is not a graph output; neither
+    node has a subgraph."""
+    graph = model.graph
     graph_outputs = {o.name for o in graph.output}
-
     producer: Dict[str, int] = {}
     consumers: Dict[str, List[int]] = {}
     for i, node in enumerate(graph.node):
@@ -118,7 +116,7 @@ def outline_residual_add_norm(
             if name:
                 producer[name] = i
 
-    pairs = []  # (add_index, norm_index)
+    pairs: List[Tuple[int, int]] = []
     used: Set[int] = set()
     for i, norm in enumerate(graph.node):
         if not (_is_std_domain(norm) and norm.op_type == _NORM and norm.input):
@@ -139,15 +137,21 @@ def outline_residual_add_norm(
             continue
         if consumers.get(x, []) != [i] or x in graph_outputs:
             continue
-        size = _tensor_bytes(x, shapes, dtypes)
-        if size is None or 2 * size < min_bytes_saved:
-            continue
         pairs.append((j, i))
         used.update((j, i))
+    return pairs
 
+
+def _outline(
+    model: onnx.ModelProto, pairs: Sequence[Tuple[int, int]]
+) -> onnx.ModelProto:
+    """Copy of ``model`` with each ``(add, norm)`` pair replaced by a call to a
+    new model-local function. ``pairs`` must come from ``_eligible_pairs``."""
+    out = copy.deepcopy(model)
     if not pairs:
-        return out, 0
-
+        return out
+    opset = _default_opset(out)
+    graph = out.graph
     by_norm = {i: j for j, i in pairs}
     removed = {j for j, _ in pairs}
     new_nodes = []
@@ -164,14 +168,15 @@ def outline_residual_add_norm(
         call_inputs = [add.input[0], add.input[1], node.input[1]]
         if len(node.input) > 2 and node.input[2]:
             call_inputs.append(node.input[2])
-        call = helper.make_node(
-            name,
-            call_inputs,
-            [o for o in node.output if o],
-            name=f"{name}_call",
-            domain=LOCAL_DOMAIN,
+        new_nodes.append(
+            helper.make_node(
+                name,
+                call_inputs,
+                [o for o in node.output if o],
+                name=f"{name}_call",
+                domain=LOCAL_DOMAIN,
+            )
         )
-        new_nodes.append(call)
 
     dropped = {graph.node[j].output[0] for j in removed}
     del graph.node[:]
@@ -182,4 +187,30 @@ def outline_residual_add_norm(
     out.functions.extend(functions)
     if not any(o.domain == LOCAL_DOMAIN for o in out.opset_import):
         out.opset_import.append(helper.make_opsetid(LOCAL_DOMAIN, 1))
-    return out, len(pairs)
+    return out
+
+
+def _total_traffic(model: onnx.ModelProto) -> int:
+    return sum(kernel_traffic_breakdown(model).values())
+
+
+def outline_residual_add_norm(
+    model: onnx.ModelProto,
+    min_bytes_saved: int = 0,
+) -> OutlineResult:
+    """Outline each eligible ``Add -> LayerNormalization`` pair whose measured
+    saving under the per-kernel traffic model is at least ``min_bytes_saved``.
+
+    Each pair is measured on its own: the model's total traffic with and
+    without that pair outlined (``decompose_functions=False``). Pairs are
+    disjoint, so the accepted pairs are then outlined together.
+    """
+    base = _total_traffic(model)
+    accepted: List[Tuple[int, int]] = []
+    saved: List[int] = []
+    for pair in _eligible_pairs(model):
+        gain = base - _total_traffic(_outline(model, [pair]))
+        if gain >= min_bytes_saved:
+            accepted.append(pair)
+            saved.append(gain)
+    return OutlineResult(_outline(model, accepted), tuple(saved))
