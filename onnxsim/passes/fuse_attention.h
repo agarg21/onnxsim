@@ -923,6 +923,25 @@ struct CausalAttentionMatch {
 // MatchAttention it does not need the Q/K/V projections or head-split chains
 // to be recognisable: it consumes the rank-4 Q, K^T and V values directly,
 // which is all `Attention` (ai.onnx, opset 23) needs for 4-D inputs.
+// Whether `v` is computed from a graph input (a run-time value), as opposed to
+// only from initializers and constants that folding would remove. The walk is
+// bounded so a large mask subgraph cannot make the matcher slow.
+inline bool DependsOnGraphInput(Value* v, int& budget) {
+  if (v == nullptr || --budget < 0) {
+    return false;
+  }
+  Node* producer = v->node();
+  if (producer->kind() == kParam) {
+    return FetchConstantTensor(v) == nullptr;
+  }
+  for (Value* in : producer->inputs()) {
+    if (DependsOnGraphInput(in, budget)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   if (!CheckKind(n, kReshape) || n->inputs().size() != 2 ||
       n->outputs().size() != 1) {
@@ -978,6 +997,7 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   Node* mask_add = nullptr;
   Node* where_node = nullptr;  // torch masked_fill: Where(cond, -inf, scores)
   bool fill_when_cond_true = false;
+  bool runtime_add = false;  // Add whose mask operand is computed at run time
   Value* scores = nullptr;
   if (CheckKind(masked, kAdd)) {
     if (masked->uses().size() != 1 || masked->node()->inputs().size() != 2) {
@@ -990,6 +1010,29 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
         scores = mask_add->input(i);
         break;
       }
+    }
+    if (scores == nullptr) {
+      // Runtime additive mask (computed in the graph, any shape broadcastable
+      // to [B, H, Sq, Skv]): the scores operand is the one produced by the
+      // QK^T MatMul or its scale. The scale chain and MatMul checks below
+      // verify it, so the matched Q/K are exactly that side's, and Add's
+      // commutativity makes the other operand the additive mask either way.
+      for (int i = 0; i < 2 && scores == nullptr; ++i) {
+        Value* cand = mask_add->input(i);
+        if (CheckKind(cand, kMatMul) || CheckKind(cand, kDiv) ||
+            CheckKind(cand, kMul)) {
+          scores = cand;
+          m.mask = mask_add->input(1 - i);
+        }
+      }
+      // A mask that folding can remove stays on the static path (where a
+      // causal one gets is_causal); only a mask that needs the run time is
+      // emitted as attn_mask.
+      int budget = 64;
+      if (scores != nullptr && !DependsOnGraphInput(m.mask, budget)) {
+        scores = nullptr;
+      }
+      runtime_add = scores != nullptr;
     }
     if (scores == nullptr || scores->uses().size() != 1) {
       return false;
@@ -1071,6 +1114,19 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
     } else {
       m.runtime_cond = where_node->input(0);
       m.runtime_fill_when_cond_true = fill_when_cond_true;
+    }
+  } else if (runtime_add) {
+    // Batch and head dims may broadcast, but ORT's Attention needs the mask to
+    // cover the whole [Sq, Skv] block: a mask that broadcasts over Sq or Skv
+    // (say [1, 1, 1, Skv]) would need an Expand, which costs a full score-sized
+    // tensor, so it declines. No static sizes are needed otherwise.
+    if (!m.mask->has_sizes()) {
+      return false;
+    }
+    const auto& ms = m.mask->sizes();
+    if (ms.size() != 4 || !SameSeqDim(ms[2], qs[2]) ||
+        !SameSeqDim(ms[3], ks[3])) {
+      return false;
     }
   } else {
     // Static masks (constant additive or constant bool) and unmasked KV-cache
