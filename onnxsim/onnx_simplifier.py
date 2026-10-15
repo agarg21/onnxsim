@@ -8946,6 +8946,9 @@ def simplify(
     gemm_fusion_backend: Literal[
         "ort_cpu", "unrestricted", "webgpu", "webnn"
     ] = "ort_cpu",
+    attention_fusion_backend: Literal[
+        "auto", "onnx", "ort_contrib", "none", "webgpu"
+    ] = "auto",
     profile: Optional[str] = None,
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
@@ -9113,6 +9116,13 @@ def simplify(
             there, since that is the only distinction the C++ side actually
             makes), so it works from every binding; setting this argument
             simply sets that variable for the call.
+    :param attention_fusion_backend: Which ``Attention`` form ``fuse_attention`` may emit
+            (implemented via ``ONNXSIM_ATTENTION_FUSION_BACKEND``):
+            ``"auto"``: both forms, as before this option existed (default).
+            ``"onnx"``: only the ai.onnx ``Attention`` (opset 23) causal/masked form; the com.microsoft form is disabled.
+            ``"ort_contrib"``: only the com.microsoft ``Attention`` form (unmasked self-attention); the causal form is disabled.
+            ``"none"``: no attention fusion.
+            ``"webgpu"``: only the com.microsoft form, which never has an ``attn_mask`` input that onnxruntime-web's WebGPU kernel rejects.
     :param profile: When set, profile every simplification fixed-point function
             (shape inference, the onnx-optimizer passes, constant folding and any
             custom rewriter) -- recording each one's wall-clock and CPU duration
@@ -9319,6 +9329,10 @@ def simplify(
                 os.environ["ONNXSIM_PROFILE"] = _fast_profile_path
             _fast_prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
             os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = _gemm_fusion_backend_for_cpp
+            _fast_prev_attention_backend_env = os.environ.get(
+                "ONNXSIM_ATTENTION_FUSION_BACKEND"
+            )
+            os.environ["ONNXSIM_ATTENTION_FUSION_BACKEND"] = attention_fusion_backend
             try:
                 if isinstance(model, str):
                     # ``output_path`` given: write the result there directly instead of a
@@ -9453,6 +9467,12 @@ def simplify(
                     os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = (
                         _fast_prev_gemm_backend_env
                     )
+                if _fast_prev_attention_backend_env is None:
+                    os.environ.pop("ONNXSIM_ATTENTION_FUSION_BACKEND", None)
+                else:
+                    os.environ["ONNXSIM_ATTENTION_FUSION_BACKEND"] = (
+                        _fast_prev_attention_backend_env
+                    )
 
     # Slow path: either check_n > 0 (needs the original model to compare
     # against) or a shape dict uses the "None key" convenience (needs the
@@ -9513,6 +9533,12 @@ def simplify(
     # does not leak into later calls in the same process.
     _prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
     os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = _gemm_fusion_backend_for_cpp
+
+    # Same for attention_fusion_backend -> ONNXSIM_ATTENTION_FUSION_BACKEND, read
+    # by fuse_attention via attention_fusion_backend.h. The C++ side parses the
+    # name directly, so no alias translation is needed here.
+    _prev_attention_backend_env = os.environ.get("ONNXSIM_ATTENTION_FUSION_BACKEND")
+    os.environ["ONNXSIM_ATTENTION_FUSION_BACKEND"] = attention_fusion_backend
 
     # Turn on onnxruntime's own session profiler by setting ``ONNXSIM_ORT_PROFILE``
     # (read by the executor). It has two modes: ``ort_profile`` writes standalone
@@ -9660,6 +9686,10 @@ def simplify(
             os.environ.pop("ONNXSIM_GEMM_FUSION_BACKEND", None)
         else:
             os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = _prev_gemm_backend_env
+        if _prev_attention_backend_env is None:
+            os.environ.pop("ONNXSIM_ATTENTION_FUSION_BACKEND", None)
+        else:
+            os.environ["ONNXSIM_ATTENTION_FUSION_BACKEND"] = _prev_attention_backend_env
         # Fold onnxruntime's captured per-operator traces into the onnxsim trace,
         # then drop the temporary files. Best-effort: a merge failure must not
         # sink an otherwise-successful simplification.
