@@ -179,7 +179,9 @@ def _collect_candidates(
         if size is None:
             saved = None
         else:
-            saved = 2 * size if sole_consumer(x) else size
+            # Softmax is multi-pass too: a sole-consumer intermediate is written,
+            # then read twice; a shared one keeps its write, so only the two reads go.
+            saved = 3 * size if sole_consumer(x) else 2 * size
         out.append(
             FusionCandidate(
                 kind="masked_softmax",

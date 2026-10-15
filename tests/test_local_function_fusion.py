@@ -173,3 +173,63 @@ def test_advisor_estimate_matches_the_measured_saving():
         c for c in fusion_candidates(model) if c.kind == "residual_add_norm"
     ]
     assert candidate.bytes_saved == outline_residual_add_norm(model).saved_bytes[0]
+
+
+def test_model_info_reports_the_outlined_kernel_traffic_when_asked():
+    from onnxsim.model_info import ModelInfo
+
+    model = _model()
+    default = ModelInfo(model, kernel_model=True).mem_access
+    outlined = ModelInfo(model, kernel_model=True, outline_min_bytes=0).mem_access
+    assert default == 6 * SIZE + PARAMS
+    assert outlined == 3 * SIZE + PARAMS
+    # The default is unchanged: outlining is opt-in.
+    assert (
+        ModelInfo(model, kernel_model=True, outline_min_bytes=None).mem_access
+        == default
+    )
+
+
+def test_advisor_masked_softmax_estimate_matches_the_measured_call():
+    # The Where -> Softmax pair measured as-is, then as one local-function call
+    # with the same boundary tensors. The difference is the advisor's estimate.
+    from onnx import helper
+
+    from onnxsim.fusion_advisor import fusion_candidates
+
+    unfused = parser.parse_model(
+        f"""
+        <ir_version: 9, opset_import: ["" : 17]>
+        g (float[{B}, 4, 8, 8] s, bool[{B}, 1, 8, 8] cond, float[1, 1, 1, 1] neg)
+            => (float[{B}, 4, 8, 8] p) {{
+          w = Where(cond, s, neg)
+          p = Softmax<axis=-1>(w)
+        }}
+        """
+    )
+    (candidate,) = [c for c in fusion_candidates(unfused) if c.kind == "masked_softmax"]
+    body = [
+        helper.make_node("Where", ["cond", "s", "neg"], ["w"]),
+        helper.make_node("Softmax", ["w"], ["p"], axis=-1),
+    ]
+    func = helper.make_function(
+        LOCAL_DOMAIN,
+        "WhereSoftmax",
+        ["s", "cond", "neg"],
+        ["p"],
+        body,
+        [helper.make_opsetid("", 17)],
+    )
+    call = parser.parse_model(
+        f"""
+        <ir_version: 9, opset_import: ["" : 17, "{LOCAL_DOMAIN}" : 1]>
+        g (float[{B}, 4, 8, 8] s, bool[{B}, 1, 8, 8] cond, float[1, 1, 1, 1] neg)
+            => (float[{B}, 4, 8, 8] p) {{
+          p = {LOCAL_DOMAIN}.WhereSoftmax(s, cond, neg)
+        }}
+        """
+    )
+    call.functions.append(func)
+    measured = _total(unfused) - _total(call)
+    small = 1 * 4 * 8 * 8 * FLOAT  # the [1, 4, 8, 8] intermediate
+    assert candidate.bytes_saved == measured == 3 * small

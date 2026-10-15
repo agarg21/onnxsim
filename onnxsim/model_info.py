@@ -1022,6 +1022,7 @@ class ModelInfo:
         attention_tiled: bool = True,
         kernel_model: bool = False,
         decompose_functions: bool = False,
+        outline_min_bytes: Optional[int] = None,
     ):
         # Delegate the counting to the single C++ implementation, which returns
         # op counts, model size, and the compute/memory metrics as polynomials;
@@ -1069,8 +1070,16 @@ class ModelInfo:
             # ops) replaces the per-node total. It runs on the original op types
             # (not the function-expanded graph) and already includes the attention
             # score traffic of a materializing kernel, so the add-on is skipped.
+            kernel_source = model
+            if outline_min_bytes is not None:
+                # Imported here: local_function_fusion imports this module.
+                from onnxsim.local_function_fusion import outline_residual_add_norm
+
+                kernel_source = outline_residual_add_norm(
+                    model, outline_min_bytes
+                ).model
             mem_access = _kernel_traffic(
-                _kernel_graph(model, decompose_functions).graph,
+                _kernel_graph(kernel_source, decompose_functions).graph,
                 {},
                 {},
                 attention_tiled=attention_tiled,
