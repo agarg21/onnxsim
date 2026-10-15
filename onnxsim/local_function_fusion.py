@@ -18,8 +18,9 @@ saving reaches the threshold are kept together.
 The saving is only real if the runtime runs the call as one kernel. Runtimes
 that inline model-local functions back to primitive ops (ORT does) keep the
 sum in memory again, so ``decompose_functions=True`` costs the same as the
-original graph. The gate does not check for a fused target kernel; that is the
-caller's responsibility (see ``fuse_skip_layer_norm``).
+original graph. By default a pair is only outlined when a fused kernel can take
+it (the conditions of ``fuse_skip_layer_norm``, see ``_has_fused_target``); the
+kernel itself is still the runtime's responsibility.
 """
 
 import copy
@@ -30,7 +31,10 @@ import onnx
 from onnx import helper
 
 from onnxsim.model_info import (
+    _collect_dtypes,
+    _collect_shapes,
     _is_std_domain,
+    _known,
     kernel_traffic_breakdown,
 )
 
@@ -98,6 +102,39 @@ def _build_function(
         body,
         [helper.make_opsetid("", opset)],
     )
+
+
+_FLOAT_BYTES = 4  # DTypeMap stores bytes per element
+
+
+def _has_fused_target(
+    add: onnx.NodeProto,
+    norm: onnx.NodeProto,
+    shapes: Dict[str, List],
+    dtypes: Dict[str, int],
+    opset: int,
+) -> bool:
+    """Whether the pair is one a fused kernel can take, i.e. what
+    ``fuse_skip_layer_norm`` requires: opset >= 17, a rank-3 float sum with
+    identical static shapes for both Add operands, a last-axis norm whose
+    extra outputs are unused, and 1-D scale and bias."""
+    if opset < 17:
+        return False
+    x, skip = add.input[0], add.input[1]
+    sx, ss = shapes.get(x), shapes.get(skip)
+    if not (_known(sx) and _known(ss)) or len(sx) != 3 or sx != ss:
+        return False
+    if dtypes.get(x) != _FLOAT_BYTES or dtypes.get(skip) != _FLOAT_BYTES:
+        return False
+    if any(out for out in norm.output[1:]):
+        return False
+    axis = next((a.i for a in norm.attribute if a.name == "axis"), -1)
+    if axis not in (-1, 2):
+        return False
+    for name in norm.input[1:]:
+        if name and not (_known(shapes.get(name)) and len(shapes[name]) == 1):
+            return False
+    return True
 
 
 def _eligible_pairs(model: onnx.ModelProto) -> List[Tuple[int, int]]:
@@ -197,6 +234,7 @@ def _total_traffic(model: onnx.ModelProto) -> int:
 def outline_residual_add_norm(
     model: onnx.ModelProto,
     min_bytes_saved: int = 0,
+    require_fused_target: bool = True,
 ) -> OutlineResult:
     """Outline each eligible ``Add -> LayerNormalization`` pair whose measured
     saving under the per-kernel traffic model is at least ``min_bytes_saved``.
@@ -204,11 +242,26 @@ def outline_residual_add_norm(
     Each pair is measured on its own: the model's total traffic with and
     without that pair outlined (``decompose_functions=False``). Pairs are
     disjoint, so the accepted pairs are then outlined together.
+
+    With ``require_fused_target`` (the default), a pair is only considered if
+    a fused kernel can take it (see ``_has_fused_target``). Pass ``False`` to
+    outline every structural match and rely on the measured saving alone.
     """
     base = _total_traffic(model)
     accepted: List[Tuple[int, int]] = []
     saved: List[int] = []
-    for pair in _eligible_pairs(model):
+    shapes, dtypes = {}, {}
+    opset = _default_opset(model)
+    if require_fused_target:
+        inferred = onnx.shape_inference.infer_shapes(model, data_prop=True)
+        shapes = _collect_shapes(inferred.graph, {})
+        dtypes = _collect_dtypes(inferred.graph, {})
+    for j, i in _eligible_pairs(model):
+        if require_fused_target and not _has_fused_target(
+            model.graph.node[j], model.graph.node[i], shapes, dtypes, opset
+        ):
+            continue
+        pair = (j, i)
         gain = base - _total_traffic(_outline(model, [pair]))
         if gain >= min_bytes_saved:
             accepted.append(pair)

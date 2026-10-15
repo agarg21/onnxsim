@@ -256,3 +256,25 @@ def test_simplify_outlining_when_requested_keeps_numerics():
     np.testing.assert_allclose(
         _run(outlined, feeds), _run(model, feeds), rtol=1e-5, atol=1e-5
     )
+
+
+def _axis1_model():
+    return parser.parse_model(
+        f"""
+        <ir_version: 9, opset_import: ["" : 17]>
+        g (float[{B}, {S}, {C}] x, float[{B}, {S}, {C}] skip, float[{S}] scale)
+            => (float[{B}, {S}, {C}] y) {{
+          s = Add(x, skip)
+          y = LayerNormalization<axis=1, epsilon=0.00001>(s, scale)
+        }}
+        """
+    )
+
+
+def test_fused_target_gate_excludes_a_non_last_axis_norm_by_default():
+    assert outline_residual_add_norm(_axis1_model()).count == 0
+
+
+def test_fused_target_gate_can_be_turned_off():
+    model = _axis1_model()
+    assert outline_residual_add_norm(model, require_fused_target=False).count == 1
