@@ -98,3 +98,54 @@ def test_decomposed_softmax_costs_more_than_native_kernel():
     assert {"ReduceMax", "Sub+Exp", "ReduceSum", "Div"} <= set(decomposed)
     assert sum(decomposed.values()) > native
     assert native == 3 * N * BYTES
+
+
+def test_gather_moves_the_selected_rows_not_the_whole_table():
+    # A 1000-row float table, 4 int64 indices, output [4, 64]. The kernel reads
+    # the 4 selected rows (the output size) and the indices, and writes the
+    # output: 2 * (4 * 64) floats + 4 int64s. The table is not read in full.
+    model = _model(
+        "y = Gather<axis=0>(table, idx)",
+        "float[1000, 64] table, int64[4] idx",
+        "float[4, 64] y",
+    )
+    rows = 4 * 64 * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == 2 * rows + 4 * 8
+
+
+def test_gather_of_an_unknown_output_charges_no_rows_but_keeps_the_indices():
+    model = _model(
+        "y = Gather<axis=0>(table, idx)",
+        "float[1000, 64] table, int64[4] idx",
+        "float[4, 64] y",
+    )
+    assert ModelInfo(model, kernel_model=True).mem_access == 2 * 4 * 64 * BYTES + 4 * 8
+
+
+def test_gather_nd_moves_the_selected_rows_not_the_whole_table():
+    # Decomposed grid sample gathers corners with GatherND: a 1000x64 table,
+    # 4 index tuples, output [4, 64]. Same accounting as Gather: indices plus
+    # the selected rows (the output size) read, and the output written.
+    model = _model(
+        "y = GatherND(table, idx)",
+        "float[1000, 64] table, int64[4, 1] idx",
+        "float[4, 64] y",
+    )
+    rows = 4 * 64 * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == 2 * rows + 4 * 8
+
+
+def test_scatter_nd_is_charged_as_a_copy_plus_updates():
+    # BEV pooling scatter-adds into a [C, H, W] grid. ScatterND copies the grid
+    # to its output, so the grid is read once and written once, and the updates
+    # and indices are read. The model keeps this copy convention.
+    grid = 64 * 128 * 128 * BYTES
+    k = 1000
+    model = _model(
+        'y = ScatterND<reduction="add">(grid, idx, upd)',
+        f"float[64, 128, 128] grid, int64[{k}, 3] idx, float[{k}] upd",
+        "float[64, 128, 128] y",
+    )
+    indices = k * 3 * 8
+    updates = k * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == 2 * grid + indices + updates

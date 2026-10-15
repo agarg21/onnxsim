@@ -365,12 +365,23 @@ def _node_memory_access(
     kernel keeps only the O(S*d) inputs and outputs.
     """
     total: Macs = 0
-    for name in list(node.input) + list(node.output):
+    # A Gather or GatherND reads only the rows it selects, and those rows are
+    # exactly its output. Charging its whole data table would bill every row.
+    is_gather = (
+        _is_std_domain(node) and node.op_type in ("Gather", "GatherND") and node.input
+    )
+    for k, name in enumerate(list(node.input) + list(node.output)):
         if not name:  # optional/omitted operand
+            continue
+        if is_gather and k == 0:  # the data table: only its selected rows move
             continue
         nbytes = _tensor_bytes(name, shapes, dtypes)
         if nbytes is not None:
             total += nbytes
+    if is_gather and node.output and node.output[0]:
+        rows = _tensor_bytes(node.output[0], shapes, dtypes)
+        if rows is not None:
+            total += rows
     if not attention_tiled:
         total += _attention_score_traffic(node, shapes, dtypes)
     return total
