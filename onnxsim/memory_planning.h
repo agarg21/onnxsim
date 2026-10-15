@@ -115,6 +115,15 @@ struct MemoryPlan {
 // Compute a memory plan for `graph`'s top-level activation tensors (graph
 // inputs, node outputs, graph outputs) -- see the module comment above for
 // what "top-level" and "planned" mean.
-MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph);
+//
+// With `attention_tiled == false` (a materializing attention kernel) each
+// attention node also reserves its S x S score matrix as a transient
+// workspace: a synthetic [i, i] interval sized to
+// NodeView::attention_score_bytes, placed disjoint from everything live while
+// node i runs, exactly as PeakMemoryFootprint adds the score on top of the live
+// set at that node. Nested subgraphs inherit the flag. The default (tiled)
+// leaves the plan unchanged.
+MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph,
+                                       bool attention_tiled = true);
 
 }  // namespace onnxsim

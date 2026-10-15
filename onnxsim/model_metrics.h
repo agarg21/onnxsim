@@ -41,6 +41,11 @@ struct NodeView {
   std::vector<std::string> outputs;
   std::map<std::string, int64_t> attr_ints;  // only the INT attributes
   std::vector<GraphView> subgraphs;          // bodies of If / Loop / Scan ...
+  // Bytes of the S x S score matrix a *materializing* attention kernel holds
+  // for this node (the C++ twin of model_info.py's _attention_score_bytes,
+  // filled in by model_info.cpp's BuildGraphView). Zero for non-attention ops
+  // and for attention whose score size is unknown; symbolic with dynamic dims.
+  SymExpr attention_score_bytes;
 
   int64_t AttrInt(const std::string& name, int64_t dflt) const;
   // Input/output name at an index, or "" when out of range (optional/omitted

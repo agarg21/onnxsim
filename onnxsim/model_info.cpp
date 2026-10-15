@@ -159,6 +159,88 @@ void AddValueInfo(const onnx::ValueInfoProto& value_info, ShapeMap& shapes,
   }
 }
 
+// Shape of a named tensor, or nullptr when unknown (the same contract as
+// model_metrics.cpp's Lookup, which is file-local there).
+const Shape* FindShape(const ShapeMap& shapes, const std::string& name) {
+  if (name.empty()) return nullptr;
+  auto it = shapes.find(name);
+  return it == shapes.end() ? nullptr : &it->second;
+}
+
+int64_t IntAttr(const onnx::NodeProto& node, const std::string& name,
+                int64_t dflt) {
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == name && attr.type() == onnx::AttributeProto::INT) {
+      return attr.i();
+    }
+  }
+  return dflt;
+}
+
+// C++ port of model_info.py's _attention_score_bytes: bytes of the S x S score
+// matrix (batch * heads * Sq * Skv elements at the query's element size) that a
+// materializing attention kernel holds for `node`. Covers the ai.onnx Attention
+// op (3D packed or 4D) and the com.microsoft contrib ops; zero for any other
+// node or when a required shape or the element size is unknown. Like the
+// Python version, Skv excludes any past KV cache.
+SymExpr AttentionScoreBytes(const onnx::NodeProto& node, const ShapeMap& shapes,
+                            const DTypeMap& dtypes) {
+  const std::string& domain = node.domain();
+  const std::string& op = node.op_type();
+  const bool std_attention =
+      op == "Attention" && (domain.empty() || domain == "ai.onnx");
+  const bool ms_attention = domain == "com.microsoft" &&
+                            (op == "Attention" || op == "MultiHeadAttention" ||
+                             op == "GroupQueryAttention");
+  if (!std_attention && !ms_attention) return SymExpr(0);
+  if (node.input_size() == 0) return SymExpr(0);
+
+  const Shape* q = FindShape(shapes, node.input(0));
+  if (q == nullptr || q->size() < 3) return SymExpr(0);
+  const auto esize_it = dtypes.find(node.input(0));
+  if (esize_it == dtypes.end()) return SymExpr(0);
+  const SymExpr esize(esize_it->second);
+
+  SymExpr batch, heads, sq, skv;
+  if (std_attention) {
+    const Shape* k =
+        node.input_size() > 1 ? FindShape(shapes, node.input(1)) : nullptr;
+    if (k == nullptr) return SymExpr(0);
+    if (q->size() == 4 && k->size() == 4) {
+      batch = (*q)[0];
+      heads = (*q)[1];
+      sq = (*q)[2];
+      skv = (*k)[2];
+    } else if (q->size() == 3 && k->size() == 3) {
+      const int64_t qh = IntAttr(node, "q_num_heads", 0);
+      if (qh <= 0) return SymExpr(0);
+      batch = (*q)[0];
+      heads = SymExpr(qh);
+      sq = (*q)[1];
+      skv = (*k)[1];
+    } else {
+      return SymExpr(0);
+    }
+  } else {
+    const int64_t num_heads = IntAttr(node, "num_heads", 0);
+    if (num_heads <= 0 || q->size() != 3) return SymExpr(0);
+    batch = (*q)[0];
+    heads = SymExpr(num_heads);
+    sq = (*q)[1];
+    if (op == "Attention") {  // com.microsoft self-attention: Skv == Sq
+      skv = sq;
+    } else {
+      const Shape* k =
+          node.input_size() > 1 ? FindShape(shapes, node.input(1)) : nullptr;
+      if (k == nullptr || (k->size() != 3 && k->size() != 4)) {
+        return SymExpr(0);
+      }
+      skv = k->size() == 4 ? (*k)[2] : (*k)[1];
+    }
+  }
+  return batch * heads * sq * skv * esize;
+}
+
 // Reduce a graph (and its control-flow subgraphs) to a GraphView. Shapes and
 // dtypes are inherited by value so a subgraph sees the tensors captured from
 // its enclosing scope, exactly as the Python metrics thread them down.
@@ -206,6 +288,8 @@ GraphView BuildGraphView(const onnx::GraphProto& graph, ShapeMap shapes,
     node_view.op_type = node.op_type();
     for (const auto& name : node.input()) node_view.inputs.push_back(name);
     for (const auto& name : node.output()) node_view.outputs.push_back(name);
+    node_view.attention_score_bytes =
+        AttentionScoreBytes(node, view.shapes, view.dtypes);
     for (const auto& attr : node.attribute()) {
       if (attr.type() == onnx::AttributeProto::INT) {
         node_view.attr_ints[attr.name()] = attr.i();

@@ -99,7 +99,9 @@ def _memory_plan_from_tuple(raw: tuple) -> MemoryPlan:
 
 
 def plan_activation_memory(
-    model: onnx.ModelProto, run_shape_inference: bool = True
+    model: onnx.ModelProto,
+    run_shape_inference: bool = True,
+    attention_tiled: bool = True,
 ) -> MemoryPlan:
     """Compute a :class:`MemoryPlan` for ``model``'s top-level graph, plus a
     nested :class:`MemoryPlan` per control-flow subgraph body (see
@@ -113,10 +115,21 @@ def plan_activation_memory(
     modified. Pass ``run_shape_inference=False`` when ``model`` already
     carries populated shapes (e.g. inferred with data propagation) to skip
     the extra pass.
+
+    ``attention_tiled=False`` models a materializing attention kernel: each
+    attention node also reserves its S x S score matrix (the same bytes
+    :class:`onnxsim.model_info.ModelInfo` counts as ``memory_footprint``
+    workspace) as a transient interval placed disjoint from everything live
+    while that node runs, so the arena grows accordingly. Only the top-level
+    graph's attention nodes are planned this way -- function bodies are not
+    inlined here, matching the rest of the planner's scope. The default
+    (tiled) plan is unchanged.
     """
     from onnxsim import onnxsim_cpp2py_export as _C
 
-    raw = _C._memory_plan(model.SerializeToString(), run_shape_inference)
+    raw = _C._memory_plan(
+        model.SerializeToString(), run_shape_inference, attention_tiled
+    )
     return _memory_plan_from_tuple(raw)
 
 
