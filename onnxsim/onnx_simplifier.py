@@ -8913,7 +8913,7 @@ def _with_range_opt(fn):
 @_with_hazard_checks
 @_with_certify
 @_with_range_opt
-def simplify(
+def _simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
     perform_optimization: bool = True,
@@ -9734,6 +9734,27 @@ def simplify(
                 location=external_data_path,
             )
     return model_opt, check_ok
+
+
+@functools.wraps(_simplify)
+def simplify(
+    model: Union[str, onnx.ModelProto],
+    *args,
+    outline_residual_min_bytes: Optional[int] = None,
+    **kwargs,
+) -> Tuple[onnx.ModelProto, bool]:
+    """Same as ``_simplify``; additionally, when ``outline_residual_min_bytes``
+    is given (opt-in, default ``None``), each residual ``Add -> LayerNormalization``
+    pair whose measured traffic saving is at least that many bytes is replaced by
+    a call to a model-local function. See ``onnxsim.local_function_fusion``.
+    """
+    result, check_ok = _simplify(model, *args, **kwargs)
+    if outline_residual_min_bytes is None:
+        return result, check_ok
+    from onnxsim.local_function_fusion import outline_residual_add_norm
+
+    outlined = outline_residual_add_norm(result, outline_residual_min_bytes)
+    return outlined.model, check_ok
 
 
 class PyModelExecutor(C.ModelExecutor):

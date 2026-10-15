@@ -233,3 +233,26 @@ def test_advisor_masked_softmax_estimate_matches_the_measured_call():
     measured = _total(unfused) - _total(call)
     small = 1 * 4 * 8 * 8 * FLOAT  # the [1, 4, 8, 8] intermediate
     assert candidate.bytes_saved == measured == 3 * small
+
+
+def test_simplify_outlining_is_opt_in():
+    from onnxsim import simplify
+
+    model = _model()
+    default, ok = simplify(model)
+    assert ok
+    assert len(default.functions) == 0
+    assert [n.op_type for n in default.graph.node] == ["Add", "LayerNormalization"]
+
+
+def test_simplify_outlining_when_requested_keeps_numerics():
+    from onnxsim import simplify
+
+    model = _model()
+    outlined, ok = simplify(model, outline_residual_min_bytes=0)
+    assert ok
+    assert [n.op_type for n in outlined.graph.node] == ["ResidualAddNorm_0"]
+    feeds = _feeds()
+    np.testing.assert_allclose(
+        _run(outlined, feeds), _run(model, feeds), rtol=1e-5, atol=1e-5
+    )
