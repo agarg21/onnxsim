@@ -20,7 +20,7 @@ kernel for the function body (see ``fuse_skip_layer_norm``).
 """
 
 import copy
-from typing import List
+from typing import Dict, List, Set
 
 import onnx
 from onnx import helper
@@ -108,8 +108,8 @@ def outline_residual_add_norm(
     graph = out.graph
     graph_outputs = {o.name for o in graph.output}
 
-    producer = {}
-    consumers = {}
+    producer: Dict[str, int] = {}
+    consumers: Dict[str, List[int]] = {}
     for i, node in enumerate(graph.node):
         for name in node.input:
             if name:
@@ -119,7 +119,7 @@ def outline_residual_add_norm(
                 producer[name] = i
 
     pairs = []  # (add_index, norm_index)
-    used = set()
+    used: Set[int] = set()
     for i, norm in enumerate(graph.node):
         if not (_is_std_domain(norm) and norm.op_type == _NORM and norm.input):
             continue
@@ -151,7 +151,7 @@ def outline_residual_add_norm(
     by_norm = {i: j for j, i in pairs}
     removed = {j for j, _ in pairs}
     new_nodes = []
-    functions = []
+    functions: List[onnx.FunctionProto] = []
     for i, node in enumerate(graph.node):
         if i in removed:
             continue
