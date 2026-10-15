@@ -1256,16 +1256,16 @@ inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
   Node* mask_shape = insert(Symbol("Shape"), {mask});
   Node* q_shape = insert(Symbol("Shape"), {q});
   Node* kt_shape = insert(Symbol("Shape"), {k_t});
-  Node* mask_bh = insert(Symbol("Slice"),
-                         {mask_shape->output(), make_ints({0}),
-                          make_ints({2}), make_ints({0})});
+  Node* mask_bh = insert(Symbol("Slice"), {mask_shape->output(), make_ints({0}),
+                                           make_ints({2}), make_ints({0})});
   Node* sq = insert(Symbol("Slice"), {q_shape->output(), make_ints({2}),
                                       make_ints({3}), make_ints({0})});
   Node* skv = insert(Symbol("Slice"), {kt_shape->output(), make_ints({3}),
                                        make_ints({4}), make_ints({0})});
   Node* lengths = insert(Symbol("Concat"), {sq->output(), skv->output()});
   lengths->i_(Symbol("axis"), 0);
-  Node* target = insert(Symbol("Concat"), {mask_bh->output(), lengths->output()});
+  Node* target =
+      insert(Symbol("Concat"), {mask_bh->output(), lengths->output()});
   target->i_(Symbol("axis"), 0);
   Node* expanded = insert(Symbol("Expand"), {mask, target->output()});
   return expanded->output();
