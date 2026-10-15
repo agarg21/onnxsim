@@ -119,7 +119,8 @@ class UnionFind {
 
 }  // namespace
 
-MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
+MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph,
+                                       bool attention_tiled) {
   MemoryPlan plan;
 
   const std::set<std::string> weights(graph.initializers.begin(),
@@ -315,7 +316,8 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
 
     int64_t reserved = 0;
     for (std::size_t s = 0; s < node.subgraphs.size(); ++s) {
-      MemoryPlan sub_plan = ComputeActivationMemoryPlan(node.subgraphs[s]);
+      MemoryPlan sub_plan =
+          ComputeActivationMemoryPlan(node.subgraphs[s], attention_tiled);
       reserved += sub_plan.arena_bytes;
       plan.subgraph_plans[key_base + "#" + std::to_string(s)] =
           std::move(sub_plan);
@@ -324,6 +326,22 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
 
     plan.subgraph_reserved_bytes += reserved;
     intervals.push_back({key_base + "#reserved", reserved, i, i});
+  }
+
+  // Materializing attention (attention_tiled == false): each attention node
+  // holds its S x S score matrix as transient workspace while it runs. Like
+  // the subgraph reservation above, this is a synthetic [i, i] interval -- not
+  // a tensor, never aliased, never in `offsets` -- so Pass 2 keeps it disjoint
+  // from every group live at node i. Attention nodes with an unknown or
+  // symbolic score size contribute nothing (the same best-effort rule as the
+  // Python footprint). The tiled default skips this loop entirely.
+  if (!attention_tiled) {
+    for (int i = 0; i < end; ++i) {
+      const SymExpr& score = graph.nodes[i].attention_score_bytes;
+      if (score.is_symbolic() || score.to_int() <= 0) continue;
+      intervals.push_back(
+          {"#attn_workspace" + std::to_string(i), score.to_int(), i, i});
+    }
   }
 
   // Pass 2: greedy best-fit placement, largest group first (ties broken by

@@ -564,3 +564,73 @@ def test_annotate_memory_plan_custom_prefix():
     meta = _metadata(annotated)
     assert "custom.memory_plan_arena_bytes" in meta
     assert METADATA_PREFIX + "memory_plan_arena_bytes" not in meta
+
+
+# --------------------------------------------------------------------------- #
+# Materializing attention (attention_tiled=False) as transient arena workspace
+# --------------------------------------------------------------------------- #
+ATT_B, ATT_H, ATT_S, ATT_D = 2, 8, 16, 64
+ATT_ELEM = 4  # float32
+ATT_TENSOR_BYTES = ATT_B * ATT_H * ATT_S * ATT_D * ATT_ELEM
+# Score matrix: batch * heads * Sq * Skv elements at the activation dtype's size.
+ATT_SCORE_BYTES = ATT_B * ATT_H * ATT_S * ATT_S * ATT_ELEM
+
+
+def _attention_model(body_extra=""):
+    shape = f"float[{ATT_B},{ATT_H},{ATT_S},{ATT_D}]"
+    return _model(
+        f"""
+        g ({shape} q, {shape} k, {shape} v) => ({shape} y)
+        {{
+          a = Attention(q, k, v)
+          {body_extra or "y = Identity(a)"}
+        }}
+        """
+    )
+
+
+def test_attention_tiled_default_plan_is_unchanged():
+    model = _attention_model()
+    default = plan_activation_memory(model)
+    explicit = plan_activation_memory(model, attention_tiled=True)
+    assert default == explicit
+
+
+def test_materialized_attention_arena_includes_score_workspace():
+    model = _attention_model()
+    tiled = plan_activation_memory(model)
+    materialized = plan_activation_memory(model, attention_tiled=False)
+    # q, k, v live through the attention node (3 tensors + the attention output
+    # `a`) and the score matrix sits on top of that live set while it runs.
+    assert tiled.arena_bytes == 4 * ATT_TENSOR_BYTES
+    assert materialized.arena_bytes == tiled.arena_bytes + ATT_SCORE_BYTES
+    assert materialized.arena_bytes > tiled.arena_bytes
+    # Planned tensors are unaffected: the workspace is not a tensor.
+    assert materialized.tensor_offsets.keys() == tiled.tensor_offsets.keys()
+    assert materialized.naive_bytes == tiled.naive_bytes
+
+
+def test_materialized_attention_workspace_is_disjoint_from_live_tensors():
+    model = _attention_model()
+    plan = plan_activation_memory(model, attention_tiled=False)
+    # `a` (produced by node 0) is live at node 0 alongside q/k/v, so the score
+    # block must not overlap any of their byte ranges.
+    lo_score = plan.arena_bytes - ATT_SCORE_BYTES
+    for name in ("q", "k", "v", "a"):
+        offset, size = plan.tensor_offsets[name]
+        assert offset + size <= lo_score or offset >= lo_score + ATT_SCORE_BYTES
+
+
+def test_materialized_attention_without_attention_is_unchanged():
+    model = _model(
+        """
+        g (float[4, 4] x) => (float[4, 4] y)
+        {
+          a = Relu(x)
+          y = Sigmoid(a)
+        }
+        """
+    )
+    assert plan_activation_memory(model, attention_tiled=False) == (
+        plan_activation_memory(model)
+    )

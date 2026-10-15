@@ -603,6 +603,35 @@ void TestSubgraphNodeWithoutOutputNameFallsBackToSyntheticKey() {
          plan.subgraph_plans.at("#node0#0").arena_bytes);
 }
 
+// Single Conv (x -> y) with a materializing-attention workspace of 512 bytes
+// attached to it. Tiled ignores the workspace entirely; attention_tiled=false
+// reserves it on top of the live set at that node, so the arena grows by
+// exactly the workspace, and the workspace never shares space with x or y.
+void TestMaterializedAttentionWorkspaceReservedAtNode() {
+  GraphView g;
+  g.shapes["x"] = {SymExpr(1), SymExpr(3), SymExpr(8), SymExpr(8)};
+  g.shapes["y"] = {SymExpr(1), SymExpr(4), SymExpr(8), SymExpr(8)};
+  for (const char* n : {"x", "y"}) g.dtypes[n] = 4;  // float32
+  g.inputs = {"x"};
+  g.outputs = {"y"};
+  NodeView relu;
+  relu.op_type = "Relu";
+  relu.inputs = {"x"};
+  relu.outputs = {"y"};
+  relu.attention_score_bytes = SymExpr(512);
+  g.nodes = {relu};
+
+  const int64_t xb = 1LL * 3 * 8 * 8 * 4;  // 768
+  const int64_t yb = 1LL * 4 * 8 * 8 * 4;  // 1024
+
+  const MemoryPlan tiled = ComputeActivationMemoryPlan(g);
+  assert(tiled.arena_bytes == xb + yb);  // x and y alias or not, unchanged
+  const MemoryPlan materialized = ComputeActivationMemoryPlan(g, false);
+  assert(materialized.arena_bytes == tiled.arena_bytes + 512);
+  assert(materialized.naive_bytes == tiled.naive_bytes);
+  assert(materialized.offsets == tiled.offsets);
+}
+
 }  // namespace
 
 int main() {
@@ -620,6 +649,7 @@ int main() {
   TestSubgraphsPlannedIndependentlyAndReserved();
   TestSingleSubgraphNodeReservation();
   TestSubgraphNodeWithoutOutputNameFallsBackToSyntheticKey();
+  TestMaterializedAttentionWorkspaceReservedAtNode();
   std::cout << "all memory_planning tests passed\n";
   return 0;
 }

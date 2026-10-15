@@ -401,19 +401,24 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // rebuild a nested ``MemoryPlan`` dataclass tree, mirroring how
   // ``_model_metrics`` hands its polynomials back to ``model_info`` for the
   // sympy rebuild.
+  // ``attention_tiled=False`` reserves each attention node's S x S score matrix
+  // as transient workspace in the plan (see memory_planning.h); the default
+  // leaves the plan unchanged.
   m.def(
       "_memory_plan",
-      [](const py::bytes& model_bytes, bool run_shape_inference) {
+      [](const py::bytes& model_bytes, bool run_shape_inference,
+         bool attention_tiled) {
         onnx::ModelProto model;
         onnx::ParseProtoFromBytes(&model, model_bytes.c_str(),
                                   model_bytes.size());
         const onnxsim::GraphView view =
             GetGraphView(model, run_shape_inference);
         const onnxsim::MemoryPlan plan =
-            onnxsim::ComputeActivationMemoryPlan(view);
+            onnxsim::ComputeActivationMemoryPlan(view, attention_tiled);
         return MemoryPlanToPyTuple(plan);
       },
-      "model_bytes"_a, "run_shape_inference"_a = true);
+      "model_bytes"_a, "run_shape_inference"_a = true,
+      "attention_tiled"_a = true);
 
   // Emit a standalone C source file reconstructing `model` as an XNNPACK
   // Subgraph (see xnnpack_codegen.h for scope/layout convention). Unlike

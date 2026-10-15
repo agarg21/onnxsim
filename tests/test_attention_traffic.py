@@ -8,10 +8,13 @@ counted as extra ``mem_access`` and as transient workspace in
 are unaffected by the flag. Models are built with ``onnx.parser.parse_model``.
 """
 
+import itertools
+
+import pytest
 from onnx import parser
 
 from onnxsim import model_info
-from onnxsim.model_info import ModelInfo
+from onnxsim.model_info import METADATA_PREFIX, ModelInfo, annotate_metadata
 
 B, H, S, D = 2, 8, 16, 64
 # Score matrix elements: batch * heads * Sq * Skv.
@@ -218,3 +221,96 @@ def test_score_bytes_zero_head_count_is_unknown():
     """
     node, shapes, dtypes = _node_and_maps(body)
     assert model_info._attention_score_bytes(node, shapes, dtypes) is None
+
+
+# --------------------------------------------------------------------------- #
+# annotate_metadata matches ModelInfo for every model-flag combination
+# --------------------------------------------------------------------------- #
+def _annotated_model_props(model, **flags):
+    meta = {
+        entry.key: entry.value
+        for entry in annotate_metadata(model, **flags).metadata_props
+    }
+    return meta
+
+
+def _attention_relu_model():
+    # Attention (a score-matrix op) feeding an elementwise op, so the kernel
+    # model fuses the Relu separately and decompose_functions has a schema
+    # function op to expand.
+    return _parse(
+        f"""
+        g (float[{B},{H},{S},{D}] q, float[{B},{H},{S},{D}] k,
+           float[{B},{H},{S},{D}] v) => (float[{B},{H},{S},{D}] y)
+        {{
+          a = Attention(q, k, v)
+          y = Relu(a)
+        }}
+        """
+    )
+
+
+FLAG_COMBINATIONS = list(itertools.product([True, False], repeat=2))
+
+
+def test_annotate_metadata_defaults_unchanged():
+    model = _attention_relu_model()
+    default = annotate_metadata(model)
+    explicit = annotate_metadata(
+        model, attention_tiled=True, kernel_model=False, decompose_functions=False
+    )
+    assert default.SerializeToString() == explicit.SerializeToString()
+
+
+@pytest.mark.parametrize("attention_tiled, kernel_model", FLAG_COMBINATIONS)
+@pytest.mark.parametrize("decompose_functions", [False, True])
+def test_annotate_metadata_model_values_match_model_info(
+    attention_tiled, kernel_model, decompose_functions
+):
+    model = _attention_relu_model()
+    info = ModelInfo(
+        model,
+        attention_tiled=attention_tiled,
+        kernel_model=kernel_model,
+        decompose_functions=decompose_functions,
+    )
+    meta = _annotated_model_props(
+        model,
+        attention_tiled=attention_tiled,
+        kernel_model=kernel_model,
+        decompose_functions=decompose_functions,
+    )
+    p = METADATA_PREFIX
+    assert meta[p + "macs"] == str(info.macs)
+    assert meta[p + "flops"] == str(info.flops)
+    assert meta[p + "mem_access"] == str(info.mem_access)
+    assert meta[p + "memory_footprint"] == str(info.memory_footprint)
+    assert meta[p + "model_size"] == str(info.model_size)
+    assert meta[p + "compute_density"] == str(info.compute_density)
+
+
+def test_annotate_metadata_flags_change_the_annotated_totals():
+    model = _attention_relu_model()
+    tiled = _annotated_model_props(model)
+    materialized = _annotated_model_props(model, attention_tiled=False)
+    p = METADATA_PREFIX
+    assert int(materialized[p + "mem_access"]) > int(tiled[p + "mem_access"])
+    assert int(materialized[p + "memory_footprint"]) == (
+        int(tiled[p + "memory_footprint"]) + SCORE_ELEMS * 4
+    )
+
+
+def test_annotate_metadata_attention_node_carries_score_traffic():
+    model = _attention_relu_model()
+    p = METADATA_PREFIX
+
+    def attention_mem(**flags):
+        annotated = annotate_metadata(model, **flags)
+        node = next(n for n in annotated.graph.node if n.op_type == "Attention")
+        return int(
+            next(e.value for e in node.metadata_props if e.key == p + "mem_access")
+        )
+
+    assert attention_mem(attention_tiled=False) == (
+        attention_mem(attention_tiled=True) + 2 * SCORE_ELEMS * 4
+    )
