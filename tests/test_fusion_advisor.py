@@ -108,7 +108,8 @@ def test_where_feeding_softmax_is_a_masked_softmax_candidate():
     (candidate,) = fusion_candidates(model)
     assert candidate.kind == "masked_softmax"
     assert candidate.op_types == ("Where", "Softmax")
-    assert candidate.bytes_saved == 2 * TENSOR
+    # Written by the Where, read twice by the multi-pass Softmax: 3 * TENSOR.
+    assert candidate.bytes_saved == 3 * TENSOR
 
 
 def test_gate_flips_at_threshold_on_real_candidate():
