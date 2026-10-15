@@ -946,6 +946,112 @@ inline bool DependsOnGraphInput(Value* v, int& budget) {
   return false;
 }
 
+// Symbolic check that the additive mask `v` is causal, i.e. entry (r, c) of
+// its [Sq, Skv] window is a large negative fill exactly when c > r. The only
+// shape this proves is the one exporters emit from a dynamic length:
+//   Slice[cols 0:N](Unsqueeze[0,1](Mul(Trilu_upper_k1(Expand(fill)),
+//                                       Cast_f32(Greater(Range_c,
+//                                       Reshape_[-1,1](Range_r))))))
+// with Range(0, _, 1), fill a constant <= -1e30 and k == 1. Then:
+//   Trilu(upper, k=1) of a constant gives fill where c >= r + 1 and 0
+//   elsewhere, Greater gives exactly [c > r] (column values 0.., row values
+//   0..), so the product is fill * [c > r], and a column slice from 0 keeps
+//   that on the [Sq, Skv] window. Any other structure returns false (no
+//   assumption is made).
+inline bool IsSymbolicCausalMask(Value* v) {
+  auto is_range01 = [](Value* r) {
+    if (!CheckKind(r, "Range") || r->node()->inputs().size() != 3) {
+      return false;
+    }
+    std::vector<int64_t> start, delta;
+    return ConstantInt64Vector(r->node()->input(0), start) &&
+           start == std::vector<int64_t>{0} &&
+           ConstantInt64Vector(r->node()->input(2), delta) &&
+           delta == std::vector<int64_t>{1};
+  };
+  if (!CheckKind(v, "Slice") || v->node()->inputs().size() < 4) {
+    return false;
+  }
+  Node* sl = v->node();
+  std::vector<int64_t> starts, steps, axes;
+  if (!ConstantInt64Vector(sl->input(1), starts) ||
+      starts != std::vector<int64_t>{0} ||
+      !ConstantInt64Vector(sl->input(3), axes) ||
+      axes != std::vector<int64_t>{3}) {
+    return false;
+  }
+  if (sl->inputs().size() == 5 && (!ConstantInt64Vector(sl->input(4), steps) ||
+                                   steps != std::vector<int64_t>{1})) {
+    return false;
+  }
+  Value* unsq = sl->input(0);
+  if (!CheckKind(unsq, "Unsqueeze") || unsq->node()->inputs().size() < 2) {
+    return false;
+  }
+  std::vector<int64_t> uaxes;
+  if (!ConstantInt64Vector(unsq->node()->input(1), uaxes) ||
+      uaxes != std::vector<int64_t>{0, 1}) {
+    return false;
+  }
+  Value* mul_out = unsq->node()->input(0);
+  if (!CheckKind(mul_out, "Mul") || mul_out->node()->inputs().size() != 2) {
+    return false;
+  }
+  Value* trilu = nullptr;
+  Value* cast = nullptr;
+  for (int i = 0; i < 2; ++i) {
+    if (CheckKind(mul_out->node()->input(i), "Trilu")) {
+      trilu = mul_out->node()->input(i);
+    } else if (CheckKind(mul_out->node()->input(i), "Cast")) {
+      cast = mul_out->node()->input(i);
+    }
+  }
+  if (trilu == nullptr || cast == nullptr) {
+    return false;
+  }
+  // Trilu(upper=1, k=1) of a constant-filled matrix.
+  Node* tr = trilu->node();
+  if (tr->inputs().size() != 2 ||
+      GetValueFromAttrWithDefault(tr, "upper", int64_t(0)) != 1) {
+    return false;
+  }
+  std::vector<int64_t> k;
+  if (!ConstantInt64Vector(tr->input(1), k) || k != std::vector<int64_t>{1}) {
+    return false;
+  }
+  Value* expand = tr->input(0);
+  if (!CheckKind(expand, "Expand") || expand->node()->inputs().size() != 2) {
+    return false;
+  }
+  const Tensor* fill = FetchConstantTensor(expand->node()->input(0));
+  if (fill == nullptr || fill->elem_type() != TensorProto_DataType_FLOAT) {
+    return false;
+  }
+  const std::vector<float> fv = ReadFloatTensorFlat(*fill);
+  if (fv.size() != 1 || !(fv[0] <= -1e30f)) {
+    return false;
+  }
+  // Cast to float of Greater(Range_c, Reshape(Range_r, [-1, 1])).
+  if (GetValueFromAttrWithDefault(cast->node(), "to", int64_t(0)) !=
+      TensorProto_DataType_FLOAT) {
+    return false;
+  }
+  Value* gt = cast->node()->input(0);
+  if (!CheckKind(gt, "Greater") || gt->node()->inputs().size() != 2) {
+    return false;
+  }
+  Value* col = gt->node()->input(0);
+  Value* row_r = gt->node()->input(1);
+  if (!is_range01(col) || !CheckKind(row_r, "Reshape") ||
+      row_r->node()->inputs().size() != 2 ||
+      !is_range01(row_r->node()->input(0))) {
+    return false;
+  }
+  std::vector<int64_t> rshape;
+  return ConstantInt64Vector(row_r->node()->input(1), rshape) &&
+         rshape == std::vector<int64_t>{-1, 1};
+}
+
 inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
   if (!CheckKind(n, kReshape) || n->inputs().size() != 2 ||
       n->outputs().size() != 1) {
@@ -1131,7 +1237,11 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
     if (ms.size() != 4) {
       return false;
     }
-    if (!SameSeqDim(ms[2], qs[2]) || !SameSeqDim(ms[3], ks[3])) {
+    if (SameSeqDim(qs[2], ks[3]) && IsSymbolicCausalMask(m.mask)) {
+      // Proven causal: is_causal, no mask input (see IsSymbolicCausalMask).
+      m.is_causal = true;
+      m.mask = nullptr;
+    } else if (!SameSeqDim(ms[2], qs[2]) || !SameSeqDim(ms[3], ks[3])) {
       m.expand_mask = true;
     }
   } else {
