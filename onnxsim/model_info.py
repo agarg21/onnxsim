@@ -1555,6 +1555,7 @@ def _annotate_graph(
     prefix: str,
     inherited_shapes: ShapeMap,
     inherited_dtypes: DTypeMap,
+    attention_tiled: bool = True,
 ) -> Tuple[Macs, Macs]:
     """Write per-node and per-value metrics onto ``graph`` in place and return
     the graph's ``(macs, mem_access)`` subtotal.
@@ -1588,7 +1589,9 @@ def _annotate_graph(
                 node_macs = counter(node, shapes)
             except Exception:
                 node_macs = 0
-        node_mem = _node_memory_access(node, shapes, dtypes)
+        node_mem = _node_memory_access(
+            node, shapes, dtypes, attention_tiled=attention_tiled
+        )
         _set_metadata(node, prefix + "macs", _metric_str(node_macs))
         _set_metadata(node, prefix + "flops", _metric_str(node_macs * 2))
         _set_metadata(node, prefix + "mem_access", _metric_str(node_mem))
@@ -1600,7 +1603,9 @@ def _annotate_graph(
                 sub_graphs.append(attr.g)
             sub_graphs.extend(attr.graphs)
             for sub_graph in sub_graphs:
-                sub_macs, sub_mem = _annotate_graph(sub_graph, prefix, shapes, dtypes)
+                sub_macs, sub_mem = _annotate_graph(
+                    sub_graph, prefix, shapes, dtypes, attention_tiled
+                )
                 macs += sub_macs
                 mem_access += sub_mem
 
@@ -1611,7 +1616,11 @@ def _annotate_graph(
 
 
 def annotate_metadata(
-    model: onnx.ModelProto, prefix: str = METADATA_PREFIX
+    model: onnx.ModelProto,
+    prefix: str = METADATA_PREFIX,
+    attention_tiled: bool = True,
+    kernel_model: bool = False,
+    decompose_functions: bool = False,
 ) -> onnx.ModelProto:
     """Return a shape-inferred copy of ``model`` with the computed metrics stored
     in ``metadata_props`` at three levels, so downstream tools can read them back:
@@ -1628,14 +1637,29 @@ def annotate_metadata(
     Tensors of unknown shape/dtype are simply left unannotated. The input model
     is never mutated; the returned copy is shape-inferred so intermediate values
     carry the shapes the per-value/per-node metrics are derived from.
+
+    ``attention_tiled``, ``kernel_model`` and ``decompose_functions`` are passed
+    through to :class:`ModelInfo`, so the model-level totals (and therefore the
+    graph-level ``macs``/``flops``/``mem_access`` of the top graph) equal the
+    corresponding ``ModelInfo`` values for every flag combination. The per-node
+    and per-value entries stay per-node: with ``attention_tiled=False`` a
+    node's ``mem_access`` includes its score-matrix traffic, but under
+    ``kernel_model=True`` traffic is attributed per fused kernel rather than per
+    node, so node-level ``mem_access`` remains the authored per-node figure.
+    Defaults reproduce the previous output exactly.
     """
-    info = ModelInfo(model)
+    info = ModelInfo(
+        model,
+        attention_tiled=attention_tiled,
+        kernel_model=kernel_model,
+        decompose_functions=decompose_functions,
+    )
     # Work on an inferred copy: infer_shapes returns a fresh model on success,
     # but the original object on failure -- deep-copy first so the caller's model
     # is never touched and the annotations land on populated value_info.
     work = ModelInfo._infer_shapes(copy.deepcopy(model))
 
-    _annotate_graph(work.graph, prefix, {}, {})
+    _annotate_graph(work.graph, prefix, {}, {}, attention_tiled)
 
     totals = {
         "macs": info.macs,
