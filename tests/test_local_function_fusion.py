@@ -160,3 +160,16 @@ def test_shared_sum_is_not_outlined():
         """
     )
     assert outline_residual_add_norm(model).count == 0
+
+
+def test_advisor_estimate_matches_the_measured_saving():
+    # fusion_advisor predicts the saving for a sole-consumer residual pair from
+    # static shapes alone; the outliner measures the same pair in the traffic
+    # model. They must agree, or one of them is wrong.
+    from onnxsim.fusion_advisor import fusion_candidates
+
+    model = _model()
+    (candidate,) = [
+        c for c in fusion_candidates(model) if c.kind == "residual_add_norm"
+    ]
+    assert candidate.bytes_saved == outline_residual_add_norm(model).saved_bytes[0]

@@ -83,19 +83,20 @@ def test_residual_add_feeding_layernorm_saves_sum_write_and_read():
     assert candidate.kind == "residual_add_norm"
     assert candidate.op_types == ("Add", "LayerNormalization")
     assert candidate.tensors == ("s",)
-    assert candidate.bytes_saved == 2 * TENSOR
+    # Written by the Add, then read twice by the multi-pass norm: 3 * TENSOR.
+    assert candidate.bytes_saved == 3 * TENSOR
 
 
 def test_residual_stream_still_materialized_saves_only_the_reread():
     # The sum is also a graph output (the residual stream), so it is written
-    # anyway; only the norm's re-read is avoided.
+    # anyway; the norm's two reads of it are avoided: 2 * TENSOR.
     model = _model(
         "s = Add(a, b)\ny = LayerNormalization<axis = -1>(s, g, bt)",
         f"float[1, {N}] a, float[1, {N}] b, float[{N}] g, float[{N}] bt",
         f"float[1, {N}] y, float[1, {N}] s",
     )
     (candidate,) = fusion_candidates(model)
-    assert candidate.bytes_saved == TENSOR
+    assert candidate.bytes_saved == 2 * TENSOR
 
 
 def test_where_feeding_softmax_is_a_masked_softmax_candidate():

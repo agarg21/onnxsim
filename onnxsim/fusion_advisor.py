@@ -143,7 +143,12 @@ def _collect_candidates(
         if size is None:
             saved = None
         else:
-            saved = 2 * size if sole_consumer(x) else size
+            # The norm is multi-pass (see model_info._KERNEL_MULTIPASS_OPS): it
+            # reads the sum for its statistics and again to normalize. A sole-
+            # consumer sum is also written once by the Add: 3 * size in all. A
+            # sum that must stay in memory keeps its write, so only the two
+            # reads go: 2 * size.
+            saved = 3 * size if sole_consumer(x) else 2 * size
         out.append(
             FusionCandidate(
                 kind="residual_add_norm",

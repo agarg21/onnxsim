@@ -165,6 +165,7 @@ from onnxsim.llm_fp4 import (
 )
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
+from onnxsim.local_function_fusion import OutlineResult, outline_residual_add_norm
 from onnxsim.lora import (
     LoraAdapter,
     LoraBlock,
@@ -897,6 +898,8 @@ __all__ = [
     "import_gguf_weights",
     "inject_lora_cpp",
     "inline_local_functions",
+    "OutlineResult",
+    "outline_residual_add_norm",
     "load_model",
     "read_gguf_metadata",
     "reconstruct_gguf_graph",
