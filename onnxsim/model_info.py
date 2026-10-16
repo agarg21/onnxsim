@@ -502,7 +502,10 @@ def _is_view_joiner(node: onnx.NodeProto) -> bool:
 
 
 def _kernel_groups(
-    graph: onnx.GraphProto, consumers: Dict[str, List[int]], view_mode: bool = False
+    graph: onnx.GraphProto,
+    consumers: Dict[str, List[int]],
+    view_mode: bool = False,
+    flash_attention: bool = False,
 ) -> List[List[int]]:
     """Kernel groups of ``graph``'s nodes as lists of node indices (in node order).
 
@@ -597,6 +600,72 @@ def _kernel_groups(
         if join([p, *readers]):
             merged.update([p, *readers])
 
+    # Flash attention: MatMul -> elementwise chain -> Softmax -> MatMul, each link
+    # with a single consumer, is one kernel. The scores and the probabilities are
+    # tiled through on-chip memory, so the kernel reads Q, K, the mask and V and
+    # writes the output. Such a kernel holds two matmuls, so the join allows two.
+    if flash_attention:
+        for s, sm in enumerate(graph.node):
+            if not (_is_std_domain(sm) and sm.op_type == "Softmax"):
+                continue
+            if not sm.input or not sm.input[0] or not sm.output[0]:
+                continue
+            if sm.output[0] in graph_outputs:
+                continue
+            readers = consumers.get(sm.output[0], [])
+            if len(readers) != 1:
+                continue
+            m2 = readers[0]
+            if not (
+                _is_std_domain(graph.node[m2]) and graph.node[m2].op_type == "MatMul"
+            ):
+                continue
+            chain: List[int] = []
+            name = sm.input[0]
+            m1 = None
+            while m1 is None and len(chain) <= 4:
+                p = producer.get(name)
+                if (
+                    p is None
+                    or name in graph_outputs
+                    or len(consumers.get(name, [])) != 1
+                ):
+                    break
+                node = graph.node[p]
+                if _is_std_domain(node) and node.op_type == "MatMul":
+                    m1 = p
+                    break
+                if not _is_kernel_elementwise(node):
+                    break
+                chain.append(p)
+                # Follow the input that comes from the chain (the other is a mask).
+                nxt = [
+                    x
+                    for x in node.input
+                    if x
+                    and producer.get(x) is not None
+                    and (
+                        _is_kernel_elementwise(graph.node[producer[x]])
+                        or _is_std_domain(graph.node[producer[x]])
+                        and graph.node[producer[x]].op_type == "MatMul"
+                    )
+                ]
+                if len(nxt) != 1:
+                    break
+                name = nxt[0]
+            if m1 is None or m1 == m2:
+                continue
+            members = [m1, *chain, s, m2]
+            roots = {find(x) for x in members}
+            total = sum(matmuls[r] for r in roots)
+            if total > 2:
+                continue
+            root = find(m1)
+            for r in roots:
+                parent[r] = root
+            matmuls[root] = total
+            merged.update(members)
+
     groups: Dict[int, List[int]] = {}
     order: List[int] = []
     for i, node in enumerate(graph.node):
@@ -616,6 +685,7 @@ def _kernel_traffic(
     attention_tiled: bool = True,
     breakdown: Optional[Dict[str, Macs]] = None,
     view_mode: bool = False,
+    flash_attention: bool = False,
 ) -> Macs:
     """Total bytes moved by ``graph``'s kernels, control-flow bodies included.
 
@@ -636,7 +706,7 @@ def _kernel_traffic(
         return 0 if value is None else value
 
     total: Macs = 0
-    for group in _kernel_groups(graph, consumers, view_mode):
+    for group in _kernel_groups(graph, consumers, view_mode, flash_attention):
         members = [graph.node[i] for i in group]
         if len(members) == 1 and not _is_kernel_elementwise(members[0]):
             node = members[0]
@@ -652,7 +722,13 @@ def _kernel_traffic(
                 bodies = ([attr.g] if attr.HasField("g") else []) + list(attr.graphs)
                 for body in bodies:
                     traffic = traffic + _kernel_traffic(
-                        body, shapes, dtypes, attention_tiled, breakdown, view_mode
+                        body,
+                        shapes,
+                        dtypes,
+                        attention_tiled,
+                        breakdown,
+                        view_mode,
+                        flash_attention,
                     )
             key = node.op_type
         else:
@@ -726,6 +802,7 @@ def kernel_traffic_breakdown(
     attention_tiled: bool = True,
     decompose_functions: bool = False,
     view_mode: bool = False,
+    flash_attention: bool = False,
 ) -> Dict[str, Macs]:
     """Bytes moved per kernel, under the per-kernel traffic model.
 
@@ -745,6 +822,7 @@ def kernel_traffic_breakdown(
         attention_tiled=attention_tiled,
         breakdown=breakdown,
         view_mode=view_mode,
+        flash_attention=flash_attention,
     )
     return breakdown
 
@@ -1130,6 +1208,7 @@ class ModelInfo:
         decompose_functions: bool = False,
         outline_min_bytes: Optional[int] = None,
         view_mode: bool = False,
+        flash_attention: bool = False,
     ):
         # Delegate the counting to the single C++ implementation, which returns
         # op counts, model size, and the compute/memory metrics as polynomials;
@@ -1191,6 +1270,7 @@ class ModelInfo:
                 {},
                 attention_tiled=attention_tiled,
                 view_mode=view_mode,
+                flash_attention=flash_attention,
             )
         elif not attention_tiled:
             mem_access = mem_access + _attention_traffic(inferred.graph, {}, {})
