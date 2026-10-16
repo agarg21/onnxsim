@@ -315,3 +315,30 @@ def test_view_mode_keeps_a_transpose_whose_output_is_a_graph_output():
     assert kernel_traffic_breakdown(model, view_mode=True) == kernel_traffic_breakdown(
         model
     )
+
+
+_ATTENTION = "s = MatMul(q, kt)\n  m = Add(s, mask)\n  p = Softmax<axis=-1>(m)\n  y = MatMul(p, v)"
+_ATTENTION_INPUTS = "float[4, 8] q, float[8, 4] kt, float[4, 4] mask, float[4, 8] v"
+
+
+def test_flash_attention_is_one_kernel_that_reads_qkv_and_mask_only():
+    # Decomposed attention: scores = Q.K^T, mask add, softmax, probs.V. With flash
+    # attention the scores and probabilities never reach memory: the kernel reads
+    # Q, K, the mask and V, and writes the output.
+    model = _model(_ATTENTION, _ATTENTION_INPUTS, "float[4, 8] y")
+    q, kt, mask, v, out = (4 * 8, 8 * 4, 4 * 4, 4 * 8, 4 * 8)
+    assert kernel_traffic_breakdown(model, flash_attention=True) == {
+        "MatMul+Add+Softmax+MatMul": (q + kt + mask + v + out) * BYTES
+    }
+
+
+def test_flash_attention_needs_a_single_consumer_softmax():
+    # The probabilities also leave the kernel, so they must be written: no fusion.
+    model = _model(
+        _ATTENTION + "\n  z = Relu(p)",
+        _ATTENTION_INPUTS,
+        "float[4, 8] y, float[4, 4] z",
+    )
+    assert kernel_traffic_breakdown(
+        model, flash_attention=True
+    ) == kernel_traffic_breakdown(model)
