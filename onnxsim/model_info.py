@@ -484,14 +484,24 @@ def _is_kernel_elementwise(node: onnx.NodeProto) -> bool:
     return _is_std_domain(node) and node.op_type in _KERNEL_ELEMENTWISE_OPS
 
 
+# Ops whose kernel can absorb the elementwise ops that consume their output as an
+# epilogue: the output is produced and consumed in registers, never written.
+_KERNEL_EPILOGUE_PRODUCERS = {"Conv", "Gemm", "MatMul"}
+
+
+def _is_kernel_epilogue_producer(node: onnx.NodeProto) -> bool:
+    return _is_std_domain(node) and node.op_type in _KERNEL_EPILOGUE_PRODUCERS
+
+
 def _kernel_groups(
     graph: onnx.GraphProto, consumers: Dict[str, List[int]]
 ) -> List[List[int]]:
     """Kernel groups of ``graph``'s nodes as lists of node indices (in node order).
 
     Two elementwise nodes join when one consumes the other's output and that
-    output has no other consumer and is not a graph output. Everything else is
-    its own group.
+    output has no other consumer and is not a graph output. An elementwise node
+    also joins a MatMul, Gemm or Conv (an epilogue, e.g. bias, activation or
+    residual) under the same rule. Everything else is its own group.
     """
     producer: Dict[str, int] = {}
     for i, node in enumerate(graph.node):
@@ -507,6 +517,8 @@ def _kernel_groups(
             i = parent[i]
         return i
 
+    # Phase 1: elementwise chains. A consumer joins a producer when the producer's
+    # output has no other consumer and is not a graph output.
     for i, node in enumerate(graph.node):
         if not _is_kernel_elementwise(node):
             continue
@@ -517,10 +529,37 @@ def _kernel_groups(
             if len(consumers.get(name, [])) == 1 and name not in graph_outputs:
                 parent[find(p)] = find(i)
 
+    # Phase 2: epilogues. A MatMul, Gemm or Conv whose output is only read by
+    # elementwise ops joins all of them: the output is shared inside one kernel,
+    # never written. A kernel takes at most one such producer, so two matmuls
+    # never end up in one kernel.
+    epilogue_count = [0] * len(graph.node)
+    merged: Set[int] = set()
+    for p, node in enumerate(graph.node):
+        if not _is_kernel_epilogue_producer(node) or not node.output[0]:
+            continue
+        out = node.output[0]
+        readers = consumers.get(out, [])
+        if not readers or out in graph_outputs:
+            continue
+        if not all(_is_kernel_elementwise(graph.node[c]) for c in readers):
+            continue
+        roots = {find(p)} | {find(c) for c in readers}
+        if sum(epilogue_count[r] for r in roots) + 1 > 1:
+            continue
+        root = find(p)
+        for r in roots - {root}:
+            parent[r] = root
+        for c in readers:
+            parent[find(c)] = root
+        epilogue_count[root] = 1
+        merged.update([p, *readers])
+
     groups: Dict[int, List[int]] = {}
     order: List[int] = []
     for i, node in enumerate(graph.node):
-        key = find(i) if _is_kernel_elementwise(node) else -(i + 1)
+        in_group = _is_kernel_elementwise(node) or i in merged
+        key = find(i) if in_group else -(i + 1)
         if key not in groups:
             groups[key] = []
             order.append(key)

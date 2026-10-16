@@ -162,3 +162,72 @@ def test_slice_moves_the_selected_elements_not_the_whole_input():
     )
     rows = 4 * 64 * BYTES
     assert sum(kernel_traffic_breakdown(model).values()) == 2 * rows + 3 * 8
+
+
+def test_activation_after_matmul_is_its_epilogue():
+    # MatMul [4,8] x [8,16] then Relu. Unfused, the MatMul writes its output and
+    # Relu reads it back: A + B + out, then out + out. As one kernel the output
+    # stays in registers: A + B + the activated output only.
+    model = _model(
+        "m = MatMul(a, b)\n  y = Relu(m)",
+        "float[4, 8] a, float[8, 16] b",
+        "float[4, 16] y",
+    )
+    a, b, out = 4 * 8 * BYTES, 8 * 16 * BYTES, 4 * 16 * BYTES
+    breakdown = kernel_traffic_breakdown(model)
+    assert breakdown == {"MatMul+Relu": a + b + out}
+
+
+def test_gemm_and_conv_take_an_activation_epilogue():
+    gemm = _model(
+        "m = Gemm<alpha=1.0, beta=1.0>(a, b, c)\n  y = Sigmoid(m)",
+        "float[4, 8] a, float[8, 16] b, float[16] c",
+        "float[4, 16] y",
+    )
+    assert kernel_traffic_breakdown(gemm) == {
+        "Gemm+Sigmoid": (4 * 8 + 8 * 16 + 16 + 4 * 16) * BYTES
+    }
+    conv = _model(
+        "m = Conv<kernel_shape=[3, 3]>(x, w)\n  y = Relu(m)",
+        "float[1, 2, 8, 8] x, float[4, 2, 3, 3] w",
+        "float[1, 4, 6, 6] y",
+    )
+    assert kernel_traffic_breakdown(conv) == {
+        "Conv+Relu": (1 * 2 * 8 * 8 + 4 * 2 * 3 * 3 + 1 * 4 * 6 * 6) * BYTES
+    }
+
+
+def test_matmul_output_with_a_second_consumer_is_not_fused():
+    # The MatMul result is also a graph output, so it must be written: no epilogue.
+    model = _model(
+        "m = MatMul(a, b)\n  y = Relu(m)",
+        "float[4, 8] a, float[8, 16] b",
+        "float[4, 16] y, float[4, 16] m",
+    )
+    a, b, out = 4 * 8 * BYTES, 8 * 16 * BYTES, 4 * 16 * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == (a + b + out) + (out + out)
+
+
+def test_matmul_output_shared_by_elementwise_consumers_is_one_kernel():
+    # A GELU-like fan-out: the MatMul output feeds both a Mul and a Div, and an
+    # Add joins them. All consumers are elementwise and in one kernel, so the
+    # output is shared in registers: inputs a, b, c and the final output only.
+    model = _model(
+        "m = MatMul(a, b)\n  p = Mul(m, c)\n  q = Div(m, c)\n  y = Add(p, q)",
+        "float[4, 8] a, float[8, 16] b, float[1] c",
+        "float[4, 16] y",
+    )
+    a, b, c, out = 4 * 8 * BYTES, 8 * 16 * BYTES, BYTES, 4 * 16 * BYTES
+    assert kernel_traffic_breakdown(model) == {"MatMul+Mul+Div+Add": a + b + c + out}
+
+
+def test_two_matmuls_never_share_a_kernel_epilogue():
+    # Each MatMul output feeds an Add. The Add can absorb only one of the two
+    # matmuls: a kernel takes at most one matmul.
+    model = _model(
+        "m1 = MatMul(a, b)\n  m2 = MatMul(a2, b2)\n  y = Add(m1, m2)",
+        "float[4, 8] a, float[8, 16] b, float[4, 8] a2, float[8, 16] b2",
+        "float[4, 16] y",
+    )
+    breakdown = kernel_traffic_breakdown(model)
+    assert set(breakdown) == {"MatMul+Add", "MatMul"}
