@@ -505,6 +505,61 @@ def _is_view_joiner(node: onnx.NodeProto) -> bool:
     return _is_std_domain(node) and node.op_type in _KERNEL_VIEW_JOIN_OPS
 
 
+# Stride-aware accounting (``stride_aware``): a cache line is the unit of a
+# strided read, and a tensor no larger than the assumed cache keeps its lines
+# resident across the reads of one kernel.
+_CACHE_LINE_BYTES = 64
+_STRIDE_CACHE_BYTES = 4 * 2**20
+
+
+def _transpose_strided_extra(
+    node: onnx.NodeProto, shapes: ShapeMap, dtypes: DTypeMap
+) -> Macs:
+    """Extra bytes a Transpose view costs when its readers read it strided.
+
+    A transposed view reads its input in the order of the view's own innermost
+    dims. The dims a permutation leaves in place at the end form a contiguous run
+    in memory; when that run is shorter than a cache line, each run pulls in a
+    whole line. The penalty is the refetch beyond one read of the input, and
+    applies only when the input is too large for the cache to keep its lines.
+    0 for an identity permutation, an unknown shape, or a run of a cache line.
+    """
+    if not (node.input and node.input[0]):
+        return 0
+    name = node.input[0]
+    shape = shapes.get(name)
+    esize = dtypes.get(name)
+    nbytes = _tensor_bytes(name, shapes, dtypes)
+    if not (
+        _known(shape)
+        and all(isinstance(d, int) for d in shape)
+        and esize is not None
+        and nbytes is not None
+    ):
+        return 0
+    if nbytes <= _STRIDE_CACHE_BYTES:
+        return 0
+    rank = len(shape)
+    perm = next(
+        (list(a.ints) for a in node.attribute if a.name == "perm"),
+        list(reversed(range(rank))),
+    )
+    # The trailing dims the permutation leaves in place are the contiguous run.
+    k = rank
+    while k > 0 and perm[k - 1] == k - 1:
+        k -= 1
+    if k == 0:
+        return 0
+    run_elems = 1
+    for d in shape[k:]:
+        run_elems *= d
+    run_bytes = run_elems * esize
+    if run_bytes >= _CACHE_LINE_BYTES:
+        return 0
+    lines_per_run = -(-_CACHE_LINE_BYTES // run_bytes)  # ceil
+    return nbytes * (lines_per_run - 1)
+
+
 def _slice_is_unit_stride(node: onnx.NodeProto, graph: onnx.GraphProto) -> bool:
     """Whether a Slice keeps every element step (its ``steps`` are all 1).
 
@@ -753,6 +808,7 @@ def _kernel_traffic(
     view_mode: bool = False,
     flash_attention: bool = False,
     reduction_fusion: bool = False,
+    stride_aware: bool = False,
 ) -> Macs:
     """Total bytes moved by ``graph``'s kernels, control-flow bodies included.
 
@@ -818,6 +874,7 @@ def _kernel_traffic(
                         view_mode,
                         flash_attention,
                         reduction_fusion,
+                        stride_aware,
                     )
             key = node.op_type
         else:
@@ -825,6 +882,13 @@ def _kernel_traffic(
             member_set = set(group)
             traffic = 0
             seen: Set[str] = set()
+            # A MatMul, Gemm or Conv reads a transposed operand in its own layout,
+            # so the stride penalty applies to groups without one.
+            strided = (
+                stride_aware
+                and view_mode
+                and not any(_is_kernel_epilogue_producer(n) for n in members)
+            )
             for n in members:
                 for k, name in enumerate(n.input):
                     if name and name not in produced and name not in seen:
@@ -834,6 +898,9 @@ def _kernel_traffic(
                             traffic = traffic + nbytes(n.output[0])
                         else:
                             traffic = traffic + nbytes(name)
+                # A joined Transpose reads its input strided, in the group's order.
+                if strided and n.op_type == "Transpose" and _is_std_domain(n):
+                    traffic = traffic + _transpose_strided_extra(n, shapes, dtypes)
             for o in sorted(produced):
                 leaves = any(c not in member_set for c in consumers.get(o, []))
                 if leaves or o in graph_outputs:
@@ -893,6 +960,7 @@ def kernel_traffic_breakdown(
     view_mode: bool = False,
     flash_attention: bool = False,
     reduction_fusion: bool = False,
+    stride_aware: bool = False,
 ) -> Dict[str, Macs]:
     """Bytes moved per kernel, under the per-kernel traffic model.
 
@@ -903,6 +971,12 @@ def kernel_traffic_breakdown(
     ``view_mode`` lets a Slice, Transpose or Concat whose readers are all
     elementwise join those readers as one kernel: the view is read in place and
     its output is never written. Off by default.
+
+    ``stride_aware`` (with ``view_mode``) charges the strided reads of a
+    transposed view that is joined into an elementwise or reduction kernel: a
+    channel-last layout read in channel-first order pulls in a cache line per
+    element run. Only tensors above the assumed cache size pay it (see
+    ``_transpose_strided_extra``). Off by default.
     """
     breakdown: Dict[str, Macs] = {}
     _kernel_traffic(
@@ -914,6 +988,7 @@ def kernel_traffic_breakdown(
         view_mode=view_mode,
         flash_attention=flash_attention,
         reduction_fusion=reduction_fusion,
+        stride_aware=stride_aware,
     )
     return breakdown
 
