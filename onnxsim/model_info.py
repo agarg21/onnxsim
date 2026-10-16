@@ -488,13 +488,21 @@ def _is_kernel_elementwise(node: onnx.NodeProto) -> bool:
 # epilogue: the output is produced and consumed in registers, never written.
 _KERNEL_EPILOGUE_PRODUCERS = {"Conv", "Gemm", "MatMul"}
 
+# View mode: data-movement ops that a fused elementwise kernel can read directly
+# (strided access), so their output is never materialized when they feed one.
+_KERNEL_VIEW_JOIN_OPS = {"Concat", "Slice", "Transpose"}
+
 
 def _is_kernel_epilogue_producer(node: onnx.NodeProto) -> bool:
     return _is_std_domain(node) and node.op_type in _KERNEL_EPILOGUE_PRODUCERS
 
 
+def _is_view_joiner(node: onnx.NodeProto) -> bool:
+    return _is_std_domain(node) and node.op_type in _KERNEL_VIEW_JOIN_OPS
+
+
 def _kernel_groups(
-    graph: onnx.GraphProto, consumers: Dict[str, List[int]]
+    graph: onnx.GraphProto, consumers: Dict[str, List[int]], view_mode: bool = False
 ) -> List[List[int]]:
     """Kernel groups of ``graph``'s nodes as lists of node indices (in node order).
 
@@ -533,8 +541,22 @@ def _kernel_groups(
     # elementwise ops joins all of them: the output is shared inside one kernel,
     # never written. A kernel takes at most one such producer, so two matmuls
     # never end up in one kernel.
-    epilogue_count = [0] * len(graph.node)
     merged: Set[int] = set()
+    if view_mode:
+        for v, node in enumerate(graph.node):
+            if not _is_view_joiner(node) or not node.output[0]:
+                continue
+            out = node.output[0]
+            readers = consumers.get(out, [])
+            if not readers or out in graph_outputs:
+                continue
+            if not all(_is_kernel_elementwise(graph.node[c]) for c in readers):
+                continue
+            for c in readers:
+                parent[find(v)] = find(c)
+            merged.update([v, *readers])
+
+    epilogue_count = [0] * len(graph.node)
     for p, node in enumerate(graph.node):
         if not _is_kernel_epilogue_producer(node) or not node.output[0]:
             continue
@@ -542,7 +564,11 @@ def _kernel_groups(
         readers = consumers.get(out, [])
         if not readers or out in graph_outputs:
             continue
-        if not all(_is_kernel_elementwise(graph.node[c]) for c in readers):
+        if not all(
+            _is_kernel_elementwise(graph.node[c])
+            or (view_mode and _is_view_joiner(graph.node[c]))
+            for c in readers
+        ):
             continue
         roots = {find(p)} | {find(c) for c in readers}
         if sum(epilogue_count[r] for r in roots) + 1 > 1:
@@ -573,6 +599,7 @@ def _kernel_traffic(
     inherited_dtypes: DTypeMap,
     attention_tiled: bool = True,
     breakdown: Optional[Dict[str, Macs]] = None,
+    view_mode: bool = False,
 ) -> Macs:
     """Total bytes moved by ``graph``'s kernels, control-flow bodies included.
 
@@ -593,7 +620,7 @@ def _kernel_traffic(
         return 0 if value is None else value
 
     total: Macs = 0
-    for group in _kernel_groups(graph, consumers):
+    for group in _kernel_groups(graph, consumers, view_mode):
         members = [graph.node[i] for i in group]
         if len(members) == 1 and not _is_kernel_elementwise(members[0]):
             node = members[0]
@@ -609,7 +636,7 @@ def _kernel_traffic(
                 bodies = ([attr.g] if attr.HasField("g") else []) + list(attr.graphs)
                 for body in bodies:
                     traffic = traffic + _kernel_traffic(
-                        body, shapes, dtypes, attention_tiled, breakdown
+                        body, shapes, dtypes, attention_tiled, breakdown, view_mode
                     )
             key = node.op_type
         else:
@@ -618,10 +645,14 @@ def _kernel_traffic(
             traffic = 0
             seen: Set[str] = set()
             for n in members:
-                for name in n.input:
+                for k, name in enumerate(n.input):
                     if name and name not in produced and name not in seen:
                         seen.add(name)
-                        traffic = traffic + nbytes(name)
+                        # A Slice inside a group reads only the elements it selects.
+                        if view_mode and n.op_type == "Slice" and k == 0:
+                            traffic = traffic + nbytes(n.output[0])
+                        else:
+                            traffic = traffic + nbytes(name)
             for o in sorted(produced):
                 leaves = any(c not in member_set for c in consumers.get(o, []))
                 if leaves or o in graph_outputs:
@@ -678,12 +709,17 @@ def kernel_traffic_breakdown(
     model: onnx.ModelProto,
     attention_tiled: bool = True,
     decompose_functions: bool = False,
+    view_mode: bool = False,
 ) -> Dict[str, Macs]:
     """Bytes moved per kernel, under the per-kernel traffic model.
 
     Keys are kernel labels: a single op type, or the op types of a fused
     elementwise chain joined with '+'. The values sum to the kernel-model
     ``mem_access`` of ``ModelInfo(model, kernel_model=True)``.
+
+    ``view_mode`` lets a Slice, Transpose or Concat whose readers are all
+    elementwise join those readers as one kernel: the view is read in place and
+    its output is never written. Off by default.
     """
     breakdown: Dict[str, Macs] = {}
     _kernel_traffic(
@@ -692,6 +728,7 @@ def kernel_traffic_breakdown(
         {},
         attention_tiled=attention_tiled,
         breakdown=breakdown,
+        view_mode=view_mode,
     )
     return breakdown
 
@@ -1076,6 +1113,7 @@ class ModelInfo:
         kernel_model: bool = False,
         decompose_functions: bool = False,
         outline_min_bytes: Optional[int] = None,
+        view_mode: bool = False,
     ):
         # Delegate the counting to the single C++ implementation, which returns
         # op counts, model size, and the compute/memory metrics as polynomials;
@@ -1136,6 +1174,7 @@ class ModelInfo:
                 {},
                 {},
                 attention_tiled=attention_tiled,
+                view_mode=view_mode,
             )
         elif not attention_tiled:
             mem_access = mem_access + _attention_traffic(inferred.graph, {}, {})
