@@ -411,3 +411,43 @@ def test_view_mode_split_output_that_is_a_graph_output_is_materialized():
     )
     half = 4 * 4 * BYTES
     assert kernel_traffic_breakdown(model, view_mode=True) == {"Split": 2 * half}
+
+
+def test_view_mode_unit_stride_slice_that_is_a_graph_output_is_materialized():
+    model = _model(
+        "y = Slice(x, s, e, a, st)",
+        "float[4, 8] x, int64[1] s = {0}, int64[1] e = {2}, int64[1] a = {0}, "
+        "int64[1] st = {1}",
+        "float[2, 8] y",
+    )
+    assert kernel_traffic_breakdown(model, view_mode=True) == {"Slice": 2 * 8 * BYTES}
+
+
+def test_view_mode_unit_stride_slice_is_free_when_its_consumer_reads_it_in_place():
+    # The Slice is an offset view: the ReduceSum reads its 2 x 8 elements directly
+    # (charged to the ReduceSum), so the Slice itself moves nothing.
+    model = _model(
+        "y = Slice(x, s, e, a, st)\n  r = ReduceSum<keepdims=1>(y, ax)",
+        "float[4, 8] x, int64[1] s = {0}, int64[1] e = {2}, int64[1] a = {0}, "
+        "int64[1] st = {1}, int64[1] ax = {1}",
+        "float[2, 1] r",
+    )
+    y, axes, out = 2 * 8 * BYTES, 1 * 8, 2 * 1 * BYTES
+    assert kernel_traffic_breakdown(model, view_mode=True) == {
+        "Slice": 0,
+        "ReduceSum": y + axes + out,
+    }
+
+
+def test_view_mode_strided_slice_stays_a_copy():
+    # Steps of 2 keep every other element, so the slice cannot be an offset view.
+    # It is charged as a copy in both modes.
+    model = _model(
+        "y = Slice(x, s, e, a, st)\n  r = ReduceSum<keepdims=1>(y, ax)",
+        "float[4, 8] x, int64[1] s = {0}, int64[1] e = {4}, int64[1] a = {0}, "
+        "int64[1] st = {2}, int64[1] ax = {1}",
+        "float[2, 1] r",
+    )
+    assert kernel_traffic_breakdown(model, view_mode=True) == (
+        kernel_traffic_breakdown(model)
+    )

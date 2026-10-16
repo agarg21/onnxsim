@@ -505,6 +505,21 @@ def _is_view_joiner(node: onnx.NodeProto) -> bool:
     return _is_std_domain(node) and node.op_type in _KERNEL_VIEW_JOIN_OPS
 
 
+def _slice_is_unit_stride(node: onnx.NodeProto, graph: onnx.GraphProto) -> bool:
+    """Whether a Slice keeps every element step (its ``steps`` are all 1).
+
+    Omitted steps default to 1. Steps held in an initializer are read; any other
+    source (a computed or Constant-node value) is unknown, so the Slice is not
+    treated as unit-stride.
+    """
+    if len(node.input) < 5 or not node.input[4]:
+        return True
+    for init in graph.initializer:
+        if init.name == node.input[4]:
+            return all(int(v) == 1 for v in numpy_helper.to_array(init).flat)
+    return False
+
+
 def _kernel_groups(
     graph: onnx.GraphProto,
     consumers: Dict[str, List[int]],
@@ -766,6 +781,18 @@ def _kernel_traffic(
             node = members[0]
             if _is_std_domain(node) and node.op_type in _KERNEL_VIEW_OPS:
                 traffic: Macs = 0
+            elif (
+                view_mode
+                and _is_std_domain(node)
+                and node.op_type == "Slice"
+                and _slice_is_unit_stride(node, graph)
+            ):
+                # A unit-stride Slice is an offset view of its data. Its consumers
+                # read the selected elements in place, and that read is charged to
+                # them. Only a graph output must be materialized.
+                traffic = (
+                    nbytes(node.output[0]) if node.output[0] in graph_outputs else 0
+                )
             elif view_mode and _is_std_domain(node) and node.op_type == "Split":
                 # Each output is a contiguous slice its consumers read in place.
                 # Only an output that is a graph output must be materialized.
