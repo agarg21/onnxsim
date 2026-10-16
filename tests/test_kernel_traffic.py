@@ -505,3 +505,20 @@ def test_stride_aware_matmul_reads_a_transposed_operand_in_its_own_layout():
     assert kernel_traffic_breakdown(
         model, view_mode=True, stride_aware=True
     ) == kernel_traffic_breakdown(model, view_mode=True)
+
+
+def test_stride_aware_cache_settings_are_per_call():
+    # The 64 KiB channel-last input fits the default 4 MiB cache, so it pays
+    # nothing. With a 1 KiB cache it pays the refetch: a 64-byte line per 4-byte
+    # run is 15 extra reads. A 8-byte line halves that to one extra read.
+    model = _model(
+        "t = Transpose<perm=[0, 2, 3, 1]>(x)\n  y = Relu(t)",
+        "float[1, 64, 16, 16] x",
+        "float[1, 16, 16, 64] y",
+    )
+    x = 1 * 64 * 16 * 16 * BYTES
+    view = sum(kernel_traffic_breakdown(model, view_mode=True).values())
+    small = dict(view_mode=True, stride_aware=True, cache_bytes=1024)
+    assert sum(kernel_traffic_breakdown(model, **small).values()) == view + 15 * x
+    narrow = dict(small, cache_line_bytes=8)
+    assert sum(kernel_traffic_breakdown(model, **narrow).values()) == view + x

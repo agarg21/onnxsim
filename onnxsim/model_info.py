@@ -513,7 +513,11 @@ _STRIDE_CACHE_BYTES = 4 * 2**20
 
 
 def _transpose_strided_extra(
-    node: onnx.NodeProto, shapes: ShapeMap, dtypes: DTypeMap
+    node: onnx.NodeProto,
+    shapes: ShapeMap,
+    dtypes: DTypeMap,
+    cache_line_bytes: int = _CACHE_LINE_BYTES,
+    cache_bytes: int = _STRIDE_CACHE_BYTES,
 ) -> Macs:
     """Extra bytes a Transpose view costs when its readers read it strided.
 
@@ -537,7 +541,7 @@ def _transpose_strided_extra(
         and nbytes is not None
     ):
         return 0
-    if nbytes <= _STRIDE_CACHE_BYTES:
+    if nbytes <= cache_bytes:
         return 0
     rank = len(shape)
     perm = next(
@@ -554,9 +558,9 @@ def _transpose_strided_extra(
     for d in shape[k:]:
         run_elems *= d
     run_bytes = run_elems * esize
-    if run_bytes >= _CACHE_LINE_BYTES:
+    if run_bytes >= cache_line_bytes:
         return 0
-    lines_per_run = -(-_CACHE_LINE_BYTES // run_bytes)  # ceil
+    lines_per_run = -(-cache_line_bytes // run_bytes)  # ceil
     return nbytes * (lines_per_run - 1)
 
 
@@ -809,6 +813,8 @@ def _kernel_traffic(
     flash_attention: bool = False,
     reduction_fusion: bool = False,
     stride_aware: bool = False,
+    cache_line_bytes: int = _CACHE_LINE_BYTES,
+    cache_bytes: int = _STRIDE_CACHE_BYTES,
 ) -> Macs:
     """Total bytes moved by ``graph``'s kernels, control-flow bodies included.
 
@@ -875,6 +881,8 @@ def _kernel_traffic(
                         flash_attention,
                         reduction_fusion,
                         stride_aware,
+                        cache_line_bytes,
+                        cache_bytes,
                     )
             key = node.op_type
         else:
@@ -900,7 +908,9 @@ def _kernel_traffic(
                             traffic = traffic + nbytes(name)
                 # A joined Transpose reads its input strided, in the group's order.
                 if strided and n.op_type == "Transpose" and _is_std_domain(n):
-                    traffic = traffic + _transpose_strided_extra(n, shapes, dtypes)
+                    traffic = traffic + _transpose_strided_extra(
+                        n, shapes, dtypes, cache_line_bytes, cache_bytes
+                    )
             for o in sorted(produced):
                 leaves = any(c not in member_set for c in consumers.get(o, []))
                 if leaves or o in graph_outputs:
@@ -961,6 +971,8 @@ def kernel_traffic_breakdown(
     flash_attention: bool = False,
     reduction_fusion: bool = False,
     stride_aware: bool = False,
+    cache_line_bytes: int = _CACHE_LINE_BYTES,
+    cache_bytes: int = _STRIDE_CACHE_BYTES,
 ) -> Dict[str, Macs]:
     """Bytes moved per kernel, under the per-kernel traffic model.
 
@@ -975,8 +987,9 @@ def kernel_traffic_breakdown(
     ``stride_aware`` (with ``view_mode``) charges the strided reads of a
     transposed view that is joined into an elementwise or reduction kernel: a
     channel-last layout read in channel-first order pulls in a cache line per
-    element run. Only tensors above the assumed cache size pay it (see
-    ``_transpose_strided_extra``). Off by default.
+    element run. Only tensors above ``cache_bytes`` (default 4 MiB) pay it,
+    refetching ``cache_line_bytes`` (default 64) per element run; see
+    ``_transpose_strided_extra``. Off by default.
     """
     breakdown: Dict[str, Macs] = {}
     _kernel_traffic(
@@ -989,6 +1002,8 @@ def kernel_traffic_breakdown(
         flash_attention=flash_attention,
         reduction_fusion=reduction_fusion,
         stride_aware=stride_aware,
+        cache_line_bytes=cache_line_bytes,
+        cache_bytes=cache_bytes,
     )
     return breakdown
 
