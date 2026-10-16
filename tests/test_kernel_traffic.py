@@ -149,3 +149,16 @@ def test_scatter_nd_is_charged_as_a_copy_plus_updates():
     indices = k * 3 * 8
     updates = k * BYTES
     assert sum(kernel_traffic_breakdown(model).values()) == 2 * grid + indices + updates
+
+
+def test_slice_moves_the_selected_elements_not_the_whole_input():
+    # A 1024x64 float tensor sliced to its first 4 rows. The kernel reads the 4
+    # rows (the output size) and the three int64 bounds, and writes the output:
+    # 2 * (4 * 64) floats + 3 int64s. The 1024-row input is not read in full.
+    model = _model(
+        "y = Slice(x, s, e, a)",
+        "float[1024, 64] x, int64[1] s, int64[1] e, int64[1] a",
+        "float[4, 64] y",
+    )
+    rows = 4 * 64 * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == 2 * rows + 3 * 8
