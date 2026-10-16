@@ -766,6 +766,13 @@ def _kernel_traffic(
             node = members[0]
             if _is_std_domain(node) and node.op_type in _KERNEL_VIEW_OPS:
                 traffic: Macs = 0
+            elif view_mode and _is_std_domain(node) and node.op_type == "Split":
+                # Each output is a contiguous slice its consumers read in place.
+                # Only an output that is a graph output must be materialized.
+                traffic = 0
+                for name in node.output:
+                    if name and name in graph_outputs:
+                        traffic = traffic + nbytes(name)
             else:
                 traffic = _node_memory_access(
                     node, shapes, dtypes, attention_tiled=attention_tiled

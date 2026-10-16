@@ -382,3 +382,32 @@ def test_reduction_chain_that_is_a_graph_output_is_not_absorbed():
     assert kernel_traffic_breakdown(
         model, reduction_fusion=True
     ) == kernel_traffic_breakdown(model)
+
+
+def test_view_mode_split_is_a_view_its_consumers_read_in_place():
+    # Split [4, 8] into two [4, 4] slices that an Add reads. Default: the Split
+    # reads its input and writes both slices. View mode: the slices are views, so
+    # the Split costs nothing and the Add reads them directly.
+    model = _model(
+        "a, b = Split<axis=1>(x, sp)\n  y = Add(a, b)",
+        "float[4, 8] x, int64[2] sp = {4, 4}",
+        "float[4, 4] y",
+    )
+    x, sp, half, out = 4 * 8 * BYTES, 2 * 8, 4 * 4 * BYTES, 4 * 4 * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == (x + sp + 2 * half) + (
+        2 * half + out
+    )
+    assert kernel_traffic_breakdown(model, view_mode=True) == {
+        "Split": 0,
+        "Add": 2 * half + out,
+    }
+
+
+def test_view_mode_split_output_that_is_a_graph_output_is_materialized():
+    model = _model(
+        "a, b = Split<axis=1>(x, sp)",
+        "float[4, 8] x, int64[2] sp = {4, 4}",
+        "float[4, 4] a, float[4, 4] b",
+    )
+    half = 4 * 4 * BYTES
+    assert kernel_traffic_breakdown(model, view_mode=True) == {"Split": 2 * half}
