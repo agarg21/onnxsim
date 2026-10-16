@@ -451,3 +451,74 @@ def test_view_mode_strided_slice_stays_a_copy():
     assert kernel_traffic_breakdown(model, view_mode=True) == (
         kernel_traffic_breakdown(model)
     )
+
+
+def test_stride_aware_channel_last_read_pays_a_line_per_element_run():
+    # NCHW -> NHWC (perm 0,2,3,1) joined into a Relu: the innermost NHWC dim is
+    # the channel, 256 * 256 elements apart in memory, so each float is its own
+    # run of 4 bytes. A 16 MiB input exceeds the assumed cache: its reads pull a
+    # 64-byte line per element, 16 times the bytes, so 15 extra reads.
+    model = _model(
+        "t = Transpose<perm=[0, 2, 3, 1]>(x)\n  y = Relu(t)",
+        "float[1, 64, 256, 256] x",
+        "float[1, 256, 256, 64] y",
+    )
+    x = 1 * 64 * 256 * 256 * BYTES
+    view = kernel_traffic_breakdown(model, view_mode=True)
+    strided = kernel_traffic_breakdown(model, view_mode=True, stride_aware=True)
+    assert sum(strided.values()) == sum(view.values()) + 15 * x
+
+
+def test_stride_aware_small_transposed_tensor_fits_the_cache():
+    # Same layout at 64 KiB: the lines stay resident, so nothing extra is charged.
+    model = _model(
+        "t = Transpose<perm=[0, 2, 3, 1]>(x)\n  y = Relu(t)",
+        "float[1, 64, 16, 16] x",
+        "float[1, 16, 16, 64] y",
+    )
+    assert kernel_traffic_breakdown(
+        model, view_mode=True, stride_aware=True
+    ) == kernel_traffic_breakdown(model, view_mode=True)
+
+
+def test_stride_aware_permutation_keeping_the_inner_dim_is_contiguous():
+    # perm (0,2,1,3) keeps the innermost 256 floats contiguous (1 KiB runs), so
+    # the read is a full-line stream and nothing extra is charged.
+    model = _model(
+        "t = Transpose<perm=[0, 2, 1, 3]>(x)\n  y = Relu(t)",
+        "float[1, 64, 256, 256] x",
+        "float[1, 256, 64, 256] y",
+    )
+    assert kernel_traffic_breakdown(
+        model, view_mode=True, stride_aware=True
+    ) == kernel_traffic_breakdown(model, view_mode=True)
+
+
+def test_stride_aware_matmul_reads_a_transposed_operand_in_its_own_layout():
+    # A GEMM takes the transposed operand through its layout flags, so the joined
+    # Transpose costs no extra read.
+    model = _model(
+        "t = Transpose<perm=[0, 2, 3, 1]>(x)\n  y = MatMul(t, w)",
+        "float[1, 64, 256, 256] x, float[64, 64] w",
+        "float[1, 256, 256, 64] y",
+    )
+    assert kernel_traffic_breakdown(
+        model, view_mode=True, stride_aware=True
+    ) == kernel_traffic_breakdown(model, view_mode=True)
+
+
+def test_stride_aware_cache_settings_are_per_call():
+    # The 64 KiB channel-last input fits the default 4 MiB cache, so it pays
+    # nothing. With a 1 KiB cache it pays the refetch: a 64-byte line per 4-byte
+    # run is 15 extra reads. A 8-byte line halves that to one extra read.
+    model = _model(
+        "t = Transpose<perm=[0, 2, 3, 1]>(x)\n  y = Relu(t)",
+        "float[1, 64, 16, 16] x",
+        "float[1, 16, 16, 64] y",
+    )
+    x = 1 * 64 * 16 * 16 * BYTES
+    view = sum(kernel_traffic_breakdown(model, view_mode=True).values())
+    small = dict(view_mode=True, stride_aware=True, cache_bytes=1024)
+    assert sum(kernel_traffic_breakdown(model, **small).values()) == view + 15 * x
+    narrow = dict(small, cache_line_bytes=8)
+    assert sum(kernel_traffic_breakdown(model, **narrow).values()) == view + x
