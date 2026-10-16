@@ -156,3 +156,31 @@ def test_symbolic_size_is_undecided():
 def test_unknown_size_is_undecided():
     candidate = FusionCandidate("elementwise_chain", (), (), (), None)
     assert should_fuse(candidate) is None
+
+
+def _gridsample_model(x_shape, grid_shape, out_shape, mode="bilinear"):
+    return parser.parse_model(
+        f"""
+        <ir_version: 10, opset_import: ["" : 20]>
+        g (float{x_shape} X, float{grid_shape} grid) => (float{out_shape} Y) {{
+          Y = GridSample<mode="{mode}", padding_mode="zeros", align_corners=0>(X, grid)
+        }}
+        """
+    )
+
+
+def test_gridsample_fusion_saving_is_decomposed_minus_fused_traffic():
+    # Measured with the traffic model: the decomposed graph moves 1,618,944 bytes
+    # and the original GridSample 329,728 (see the decomposed GridSample probe in
+    # PR #2183). The saving from keeping the fused op is the difference.
+    model = _gridsample_model("[1, 64, 32, 32]", "[1, 16, 16, 2]", "[1, 64, 16, 16]")
+    (candidate,) = [
+        c for c in fusion_candidates(model) if c.kind == "gridsample_fusion"
+    ]
+    assert candidate.op_types == ("GridSample",)
+    assert candidate.bytes_saved == 1618944 - 329728
+
+
+def test_gridsample_fusion_is_not_reported_for_symbolic_shapes():
+    model = _gridsample_model("[1, 64, 32, 32]", "[1, h, w, 2]", "[1, 64, h, w]")
+    assert [c for c in fusion_candidates(model) if c.kind == "gridsample_fusion"] == []
