@@ -1,123 +1,115 @@
-"""Integration test for the ONNX -> onnxsim -> ONNX Runtime path used by Autoware's
-lidar TransFusion node (autoware_lidar_transfusion, ONNX Runtime backend).
+"""Integration test for onnxsim on Autoware's lidar TransFusion model.
 
-The node feeds the model three tensors that change shape every frame (the voxel
-count is dynamic) and reads three fixed-shape outputs back. This test builds a
-graph with the same I/O contract, simplifies it with onnxsim, and checks that the
-simplified model still matches the original under ONNX Runtime for several voxel
-counts. It is a stand-in for the real TransFusion weights, which are not in this
-repository.
+Autoware's lidar TransFusion node (autoware_lidar_transfusion, ONNX Runtime backend)
+runs AutowareFoundation/lidar_transfusion's transfusion.onnx. This test simplifies that
+real model with onnxsim and checks it under ONNX Runtime.
+
+The model is about 170 MB, so the test is skipped unless TRANSFUSION_ONNX points at a
+local copy (the weekly workflow fetches it at a pinned revision).
+
+Final outputs are not compared element-wise. The head selects peaks with
+``Equal(sigmoid(heatmap), maxpool(heatmap))``, which depends on exact float ties.
+Folding BatchNorm into the preceding ConvTranspose changes float rounding by about
+1e-6, which flips a few hundred peak decisions and so changes the selected
+proposals. The test therefore checks the continuous heatmap tensor element-wise,
+and checks the final outputs for interface and sanity only.
 """
+
+import os
 
 import numpy as np
 import onnx
 import pytest
-from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
-POINTS_PER_PILLAR = 20
-NUM_FEATURES = 4
-NUM_COORD_VALUES = 2
-NUM_CLASSES = 3
-NUM_PROPOSALS = 8
-NUM_BOX_VALUES = 7
+MODEL_PATH = os.environ.get("TRANSFUSION_ONNX")
+pytestmark = pytest.mark.skipif(
+    not MODEL_PATH or not os.path.isfile(MODEL_PATH),
+    reason="set TRANSFUSION_ONNX to a local transfusion.onnx to run",
+)
 
+# Heatmap tensor before the peak-selection Equal. It is continuous, so it is compared
+# element-wise.
+HEATMAP_TENSOR = "/pts_bbox_head/Sigmoid_output_0"
 OUTPUT_NAMES = ["cls_score0", "bbox_pred0", "dir_cls_pred0"]
+NUM_VOXELS = 50
+HEATMAP_ATOL = 1e-5
 
 
-def _transfusion_like_model():
-    # Opset 12 keeps ReduceSum's axes as an attribute, which keeps the text form readable.
-    # Inline Constant nodes hold the fixed output shapes; the voxel count NV stays symbolic.
-    model = parser.parse_model(
-        f"""
-        <ir_version: 7, opset_import: ["": 12]>
-        transfusion (float[NV, {POINTS_PER_PILLAR}, {NUM_FEATURES}] voxels,
-                     int32[NV] num_points,
-                     int32[NV, {NUM_COORD_VALUES}] coors)
-          => (float[1, {NUM_CLASSES}, {NUM_PROPOSALS}] cls_score0,
-              float[1, {NUM_BOX_VALUES}, {NUM_PROPOSALS}] bbox_pred0,
-              float[1, 2, {NUM_PROPOSALS}] dir_cls_pred0)
-        {{
-          feat_sum = ReduceSum<axes = [0, 1, 2], keepdims = 0>(voxels)
-          points = Cast<to = 1>(num_points)
-          points_sum = ReduceSum<axes = [0], keepdims = 0>(points)
-          coors_f = Cast<to = 1>(coors)
-          coors_sum = ReduceSum<axes = [0, 1], keepdims = 0>(coors_f)
-          partial = Add(feat_sum, points_sum)
-          total = Add(partial, coors_sum)
-          total_1d = Reshape(total, one_shape)
-          cls_shape = Constant<value = int64[3] {{1, {NUM_CLASSES}, {NUM_PROPOSALS}}}>()
-          box_shape = Constant<value = int64[3] {{1, {NUM_BOX_VALUES}, {NUM_PROPOSALS}}}>()
-          dir_shape = Constant<value = int64[3] {{1, 2, {NUM_PROPOSALS}}}>()
-          cls_score0 = Expand(total_1d, cls_shape)
-          bbox_pred0 = Expand(total_1d, box_shape)
-          dir_cls_pred0 = Expand(total_1d, dir_shape)
-        }}
-        """
-    )
-    one_shape = onnx.helper.make_tensor("one_shape", onnx.TensorProto.INT64, [1], [1])
-    model.graph.initializer.append(one_shape)
-    return model
+@pytest.fixture(scope="module")
+def original():
+    return onnx.load(MODEL_PATH)
 
 
-def _frame(num_voxels, rng):
+@pytest.fixture(scope="module")
+def simplified(original):
+    sim, check_ok = onnxsim.simplify(original, check_n=0)
+    assert check_ok
+    return sim
+
+
+def _expose(model, names):
+    exposed = onnx.ModelProto()
+    exposed.CopyFrom(model)
+    for name in names:
+        exposed.graph.output.append(onnx.helper.make_empty_tensor_value_info(name))
+    return exposed
+
+
+def _frame(num_voxels):
+    rng = np.random.default_rng(0)
     return {
-        "voxels": rng.standard_normal(
-            (num_voxels, POINTS_PER_PILLAR, NUM_FEATURES)
-        ).astype(np.float32),
-        "num_points": rng.integers(1, POINTS_PER_PILLAR, size=(num_voxels,)).astype(
-            np.int32
-        ),
-        "coors": rng.integers(0, 100, size=(num_voxels, NUM_COORD_VALUES)).astype(
-            np.int32
-        ),
+        "voxels": rng.standard_normal((num_voxels, 20, 5)).astype(np.float32),
+        "num_points": rng.integers(1, 20, size=(num_voxels,)).astype(np.int32),
+        "coors": np.column_stack(
+            [np.zeros(num_voxels), rng.integers(0, 400, (num_voxels, 3))]
+        ).astype(np.int32),
     }
 
 
-def _session(model):
-    return ort.InferenceSession(
+def _run(model, names, feeds):
+    session = ort.InferenceSession(
         model.SerializeToString(), providers=["CPUExecutionProvider"]
     )
+    return dict(zip(names, session.run(names, feeds)))
 
 
-def test_simplify_keeps_transfusion_io_contract():
-    model = _transfusion_like_model()
-    sim_model, check_ok = onnxsim.simplify(model)
-    assert check_ok
-
-    session = _session(sim_model)
-    inputs = {i.name: (i.type, i.shape) for i in session.get_inputs()}
-    assert inputs["voxels"] == (
-        "tensor(float)",
-        ["NV", POINTS_PER_PILLAR, NUM_FEATURES],
+def test_simplify_keeps_transfusion_interface(original, simplified):
+    session = ort.InferenceSession(
+        simplified.SerializeToString(), providers=["CPUExecutionProvider"]
     )
-    assert inputs["num_points"] == ("tensor(int32)", ["NV"])
-    assert inputs["coors"] == ("tensor(int32)", ["NV", NUM_COORD_VALUES])
-    assert [o.name for o in session.get_outputs()] == OUTPUT_NAMES
+    inputs = {i.name: (i.type, i.shape) for i in session.get_inputs()}
+    assert inputs["voxels"] == ("tensor(float)", ["voxels_num", 20, 5])
+    assert inputs["num_points"] == ("tensor(int32)", ["voxels_num"])
+    assert inputs["coors"] == ("tensor(int32)", ["voxels_num", 4])
+    outputs = {o.name: o.shape for o in session.get_outputs()}
+    assert outputs == {
+        "cls_score0": [1, 5, 500],
+        "bbox_pred0": [1, 8, 500],
+        "dir_cls_pred0": [1, 2, 500],
+    }
 
 
-@pytest.mark.parametrize("num_voxels", [1, 7, 33])
-def test_simplified_model_matches_original_under_onnxruntime(num_voxels):
-    model = _transfusion_like_model()
-    sim_model, check_ok = onnxsim.simplify(model)
-    assert check_ok
-
-    feeds = _frame(num_voxels, np.random.default_rng(num_voxels))
-    want = _session(model).run(OUTPUT_NAMES, feeds)
-    got = _session(sim_model).run(OUTPUT_NAMES, feeds)
-
-    for name, w, g in zip(OUTPUT_NAMES, want, got):
-        assert g.shape == w.shape, name
-        np.testing.assert_allclose(g, w, rtol=1e-5, atol=1e-5, err_msg=name)
+def test_simplify_reduces_graph(original, simplified):
+    assert len(simplified.graph.node) < len(original.graph.node)
 
 
-def test_simplify_reduces_nodes_and_keeps_dynamic_voxel_dim():
-    model = _transfusion_like_model()
-    sim_model, _ = onnxsim.simplify(model)
+def test_heatmap_matches_original(original, simplified):
+    feeds = _frame(NUM_VOXELS)
+    want = _run(_expose(original, [HEATMAP_TENSOR]), [HEATMAP_TENSOR], feeds)[
+        HEATMAP_TENSOR
+    ]
+    got = _run(_expose(simplified, [HEATMAP_TENSOR]), [HEATMAP_TENSOR], feeds)[
+        HEATMAP_TENSOR
+    ]
+    assert got.shape == want.shape
+    np.testing.assert_allclose(got, want, rtol=0, atol=HEATMAP_ATOL)
 
-    assert len(sim_model.graph.node) <= len(model.graph.node)
-    dims = sim_model.graph.input[0].type.tensor_type.shape.dim
-    assert dims[0].dim_param == "NV"
+
+def test_final_outputs_are_finite_and_shaped(simplified):
+    outputs = _run(simplified, OUTPUT_NAMES, _frame(NUM_VOXELS))
+    for name in OUTPUT_NAMES:
+        assert np.all(np.isfinite(outputs[name])), name
