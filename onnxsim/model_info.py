@@ -681,7 +681,7 @@ def _kernel_groups(
             if not node.input or not node.input[0] or not node.output[0]:
                 continue
             # Prologue: walk back through single-consumer elementwise ops.
-            chain: List[int] = []
+            prologue: List[int] = []
             name = node.input[0]
             while True:
                 p = producer.get(name)
@@ -690,10 +690,10 @@ def _kernel_groups(
                     or name in graph_outputs
                     or len(consumers.get(name, [])) != 1
                     or not _is_kernel_elementwise(graph.node[p])
-                    or len(chain) >= 8
+                    or len(prologue) >= 8
                 ):
                     break
-                chain.append(p)
+                prologue.append(p)
                 feeds = [
                     x
                     for x in graph.node[p].input
@@ -704,8 +704,8 @@ def _kernel_groups(
                 if len(feeds) != 1:
                     break
                 name = feeds[0]
-            if chain and join([r, *chain]):
-                merged.update([r, *chain])
+            if prologue and join([r, *prologue]):
+                merged.update([r, *prologue])
             # Epilogue: elementwise readers of the reduced result join it.
             out = node.output[0]
             readers = consumers.get(out, [])
