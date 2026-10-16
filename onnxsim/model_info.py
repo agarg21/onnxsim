@@ -492,6 +492,10 @@ _KERNEL_EPILOGUE_PRODUCERS = {"Conv", "Gemm", "MatMul"}
 # (strided access), so their output is never materialized when they feed one.
 _KERNEL_VIEW_JOIN_OPS = {"Concat", "Slice", "Transpose"}
 
+# Reductions: one kernel can read an elementwise input chain directly (prologue)
+# and apply elementwise ops to the reduced result (epilogue).
+_KERNEL_REDUCE_OPS = {"ReduceMax", "ReduceMean", "ReduceMin", "ReduceProd", "ReduceSum"}
+
 
 def _is_kernel_epilogue_producer(node: onnx.NodeProto) -> bool:
     return _is_std_domain(node) and node.op_type in _KERNEL_EPILOGUE_PRODUCERS
@@ -506,6 +510,7 @@ def _kernel_groups(
     consumers: Dict[str, List[int]],
     view_mode: bool = False,
     flash_attention: bool = False,
+    reduction_fusion: bool = False,
 ) -> List[List[int]]:
     """Kernel groups of ``graph``'s nodes as lists of node indices (in node order).
 
@@ -666,6 +671,52 @@ def _kernel_groups(
             matmuls[root] = total
             merged.update(members)
 
+    # Reductions (reduction_fusion): the elementwise chain that feeds a reduction
+    # is read inside its kernel, and elementwise ops that consume the reduced
+    # result join it. The reduction's own input and output are then charged once.
+    if reduction_fusion:
+        for r, node in enumerate(graph.node):
+            if not (_is_std_domain(node) and node.op_type in _KERNEL_REDUCE_OPS):
+                continue
+            if not node.input or not node.input[0] or not node.output[0]:
+                continue
+            # Prologue: walk back through single-consumer elementwise ops.
+            chain: List[int] = []
+            name = node.input[0]
+            while True:
+                p = producer.get(name)
+                if (
+                    p is None
+                    or name in graph_outputs
+                    or len(consumers.get(name, [])) != 1
+                    or not _is_kernel_elementwise(graph.node[p])
+                    or len(chain) >= 8
+                ):
+                    break
+                chain.append(p)
+                feeds = [
+                    x
+                    for x in graph.node[p].input
+                    if x
+                    and producer.get(x) is not None
+                    and _is_kernel_elementwise(graph.node[producer[x]])
+                ]
+                if len(feeds) != 1:
+                    break
+                name = feeds[0]
+            if chain and join([r, *chain]):
+                merged.update([r, *chain])
+            # Epilogue: elementwise readers of the reduced result join it.
+            out = node.output[0]
+            readers = consumers.get(out, [])
+            if (
+                readers
+                and out not in graph_outputs
+                and all(_is_kernel_elementwise(graph.node[c]) for c in readers)
+            ):
+                if join([r, *readers]):
+                    merged.update([r, *readers])
+
     groups: Dict[int, List[int]] = {}
     order: List[int] = []
     for i, node in enumerate(graph.node):
@@ -686,6 +737,7 @@ def _kernel_traffic(
     breakdown: Optional[Dict[str, Macs]] = None,
     view_mode: bool = False,
     flash_attention: bool = False,
+    reduction_fusion: bool = False,
 ) -> Macs:
     """Total bytes moved by ``graph``'s kernels, control-flow bodies included.
 
@@ -706,7 +758,9 @@ def _kernel_traffic(
         return 0 if value is None else value
 
     total: Macs = 0
-    for group in _kernel_groups(graph, consumers, view_mode, flash_attention):
+    for group in _kernel_groups(
+        graph, consumers, view_mode, flash_attention, reduction_fusion
+    ):
         members = [graph.node[i] for i in group]
         if len(members) == 1 and not _is_kernel_elementwise(members[0]):
             node = members[0]
@@ -729,6 +783,7 @@ def _kernel_traffic(
                         breakdown,
                         view_mode,
                         flash_attention,
+                        reduction_fusion,
                     )
             key = node.op_type
         else:
@@ -803,6 +858,7 @@ def kernel_traffic_breakdown(
     decompose_functions: bool = False,
     view_mode: bool = False,
     flash_attention: bool = False,
+    reduction_fusion: bool = False,
 ) -> Dict[str, Macs]:
     """Bytes moved per kernel, under the per-kernel traffic model.
 
@@ -823,6 +879,7 @@ def kernel_traffic_breakdown(
         breakdown=breakdown,
         view_mode=view_mode,
         flash_attention=flash_attention,
+        reduction_fusion=reduction_fusion,
     )
     return breakdown
 
@@ -1209,6 +1266,7 @@ class ModelInfo:
         outline_min_bytes: Optional[int] = None,
         view_mode: bool = False,
         flash_attention: bool = False,
+        reduction_fusion: bool = False,
     ):
         # Delegate the counting to the single C++ implementation, which returns
         # op counts, model size, and the compute/memory metrics as polynomials;
@@ -1271,6 +1329,7 @@ class ModelInfo:
                 attention_tiled=attention_tiled,
                 view_mode=view_mode,
                 flash_attention=flash_attention,
+                reduction_fusion=reduction_fusion,
             )
         elif not attention_tiled:
             mem_access = mem_access + _attention_traffic(inferred.graph, {}, {})

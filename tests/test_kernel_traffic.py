@@ -342,3 +342,43 @@ def test_flash_attention_needs_a_single_consumer_softmax():
     assert kernel_traffic_breakdown(
         model, flash_attention=True
     ) == kernel_traffic_breakdown(model)
+
+
+def test_reduction_takes_its_elementwise_input_chain_into_its_kernel():
+    # Mul(x, x) feeds ReduceMean over axis 1. Default: the product is written and
+    # read back. With reduction fusion the reduction reads x and the axes inside
+    # one kernel and writes only the [2, 1] result.
+    model = _model(
+        "y = Mul(x, x)\n  r = ReduceMean<keepdims=1>(y, ax)",
+        "float[2, 4] x, int64[1] ax = {1}",
+        "float[2, 1] r",
+    )
+    x, y, out = 2 * 4 * BYTES, 2 * 4 * BYTES, 2 * 1 * BYTES
+    axes = 8
+    assert sum(kernel_traffic_breakdown(model).values()) == (x + y) + (y + axes + out)
+    assert kernel_traffic_breakdown(model, reduction_fusion=True) == {
+        "Mul+ReduceMean": x + axes + out
+    }
+
+
+def test_elementwise_reader_of_a_reduction_joins_it():
+    model = _model(
+        "r = ReduceSum<keepdims=1>(x, ax)\n  y = Add(r, b)",
+        "float[2, 4] x, int64[1] ax = {1}, float[2, 1] b",
+        "float[2, 1] y",
+    )
+    x, axes, b, out = 2 * 4 * BYTES, 8, 2 * 1 * BYTES, 2 * 1 * BYTES
+    assert kernel_traffic_breakdown(model, reduction_fusion=True) == {
+        "ReduceSum+Add": x + axes + b + out
+    }
+
+
+def test_reduction_chain_that_is_a_graph_output_is_not_absorbed():
+    model = _model(
+        "y = Mul(x, x)\n  r = ReduceMean<keepdims=1>(y, ax)",
+        "float[2, 4] x, int64[1] ax = {1}",
+        "float[2, 1] r, float[2, 4] y",
+    )
+    assert kernel_traffic_breakdown(
+        model, reduction_fusion=True
+    ) == kernel_traffic_breakdown(model)
