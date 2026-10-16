@@ -231,3 +231,47 @@ def test_two_matmuls_never_share_a_kernel_epilogue():
     )
     breakdown = kernel_traffic_breakdown(model)
     assert set(breakdown) == {"MatMul+Add", "MatMul"}
+
+
+def test_view_mode_slice_is_read_in_place_by_its_elementwise_reader():
+    # Default: the Slice is its own kernel and the Relu another, each reading and
+    # writing its tensors. View mode: the Slice joins the Relu and reads its
+    # selected elements in place, so the intermediate is never written.
+    model = _model(
+        "y = Slice(x, s, e, a)\n  z = Relu(y)",
+        "float[4, 8] x, int64[1] s = {0}, int64[1] e = {2}, int64[1] a = {0}",
+        "float[2, 8] z",
+    )
+    x_out = 2 * 8 * BYTES
+    indices = 3 * 8
+    assert (
+        sum(kernel_traffic_breakdown(model).values())
+        == (2 * x_out + indices) + 2 * x_out
+    )
+    assert kernel_traffic_breakdown(model, view_mode=True) == {
+        "Slice+Relu": x_out + indices + x_out
+    }
+
+
+def test_view_mode_transpose_feeds_an_elementwise_kernel_without_a_copy():
+    model = _model(
+        "t = Transpose<perm=[2, 0, 1]>(x)\n  z = Relu(t)",
+        "float[2, 3, 4] x",
+        "float[4, 2, 3] z",
+    )
+    size = 2 * 3 * 4 * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == (2 * size) + (2 * size)
+    assert kernel_traffic_breakdown(model, view_mode=True) == {
+        "Transpose+Relu": 2 * size
+    }
+
+
+def test_view_mode_keeps_a_view_whose_output_is_a_graph_output():
+    model = _model(
+        "t = Transpose<perm=[2, 0, 1]>(x)\n  z = Relu(t)",
+        "float[2, 3, 4] x",
+        "float[4, 2, 3] z, float[4, 2, 3] t",
+    )
+    assert kernel_traffic_breakdown(model, view_mode=True) == kernel_traffic_breakdown(
+        model
+    )
