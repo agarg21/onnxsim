@@ -890,6 +890,7 @@ def _kernel_traffic(
             member_set = set(group)
             traffic = 0
             seen: Set[str] = set()
+            externals: List[str] = []
             # A MatMul, Gemm or Conv reads a transposed operand in its own layout,
             # so the stride penalty applies to groups without one.
             strided = (
@@ -901,6 +902,7 @@ def _kernel_traffic(
                 for k, name in enumerate(n.input):
                     if name and name not in produced and name not in seen:
                         seen.add(name)
+                        externals.append(name)
                         # A Slice inside a group reads only the elements it selects.
                         if view_mode and n.op_type == "Slice" and k == 0:
                             traffic = traffic + nbytes(n.output[0])
@@ -911,6 +913,17 @@ def _kernel_traffic(
                     traffic = traffic + _transpose_strided_extra(
                         n, shapes, dtypes, cache_line_bytes, cache_bytes
                     )
+            # A reduction fused with the elementwise ops around it is a normalization
+            # when one input feeds two members: the statistics pass reads it and the
+            # normalize pass reads it again, as LayerNormalization is charged above.
+            if reduction_fusion and any(
+                n.op_type in _KERNEL_REDUCE_OPS for n in members
+            ):
+                for name in externals:
+                    readers = sum(1 for n in members if name in n.input)
+                    if readers >= 2:
+                        traffic = traffic + nbytes(name)
+                        break
             for o in sorted(produced):
                 leaves = any(c not in member_set for c in consumers.get(o, []))
                 if leaves or o in graph_outputs:
