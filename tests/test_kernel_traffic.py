@@ -522,3 +522,20 @@ def test_stride_aware_cache_settings_are_per_call():
     assert sum(kernel_traffic_breakdown(model, **small).values()) == view + 15 * x
     narrow = dict(small, cache_line_bytes=8)
     assert sum(kernel_traffic_breakdown(model, **narrow).values()) == view + x
+
+
+def test_decomposed_rmsnorm_pays_the_second_pass_over_its_input():
+    # x -> Pow -> ReduceMean -> Add -> Sqrt -> Div(x, .): one kernel with reduction
+    # fusion. x feeds two members, so the statistics read and the normalize read
+    # are both charged, as LayerNormalization charges its extra input read.
+    model = _model(
+        "p = Pow(x, two)\n  r = ReduceMean<keepdims=1>(p, ax)\n"
+        "  a = Add(r, eps)\n  s = Sqrt(a)\n  z = Div(x, s)",
+        "float[2, 4] x, float[1] two = {2}, int64[1] ax = {1}, float[1] eps = {1}",
+        "float[2, 4] z",
+    )
+    x, out = 2 * 4 * BYTES, 2 * 4 * BYTES
+    consts = BYTES + 8 + BYTES  # two, ax, eps
+    assert kernel_traffic_breakdown(model, reduction_fusion=True) == {
+        "Pow+ReduceMean+Add+Sqrt+Div": x + x + consts + out
+    }
