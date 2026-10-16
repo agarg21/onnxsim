@@ -275,3 +275,43 @@ def test_view_mode_keeps_a_view_whose_output_is_a_graph_output():
     assert kernel_traffic_breakdown(model, view_mode=True) == kernel_traffic_breakdown(
         model
     )
+
+
+def test_view_mode_transpose_is_read_in_place_by_its_matmul():
+    # Transpose [4,8] -> [8,4] feeding a MatMul with [4,16]. Default: the copy is
+    # written and read back. View mode: the MatMul reads the transposed input in
+    # place, so only a, b and the output move.
+    model = _model(
+        "t = Transpose<perm=[1, 0]>(a)\n  y = MatMul(t, b)",
+        "float[4, 8] a, float[4, 16] b",
+        "float[8, 16] y",
+    )
+    a, b, out = 4 * 8 * BYTES, 4 * 16 * BYTES, 8 * 16 * BYTES
+    assert sum(kernel_traffic_breakdown(model).values()) == (a + a) + (a + b + out)
+    assert kernel_traffic_breakdown(model, view_mode=True) == {
+        "Transpose+MatMul": a + b + out
+    }
+
+
+def test_view_mode_never_puts_two_matmuls_in_one_kernel():
+    # Each MatMul reads a transposed input, and both feed one Add. The Add can
+    # take only one of the two matmuls, so no kernel label holds two MatMuls.
+    model = _model(
+        "t1 = Transpose<perm=[1, 0]>(a)\n  m1 = MatMul(t1, b)\n"
+        "  t2 = Transpose<perm=[1, 0]>(a2)\n  m2 = MatMul(t2, b2)\n  y = Add(m1, m2)",
+        "float[4, 8] a, float[4, 16] b, float[4, 8] a2, float[4, 16] b2",
+        "float[8, 16] y",
+    )
+    breakdown = kernel_traffic_breakdown(model, view_mode=True)
+    assert all(label.count("MatMul") <= 1 for label in breakdown)
+
+
+def test_view_mode_keeps_a_transpose_whose_output_is_a_graph_output():
+    model = _model(
+        "t = Transpose<perm=[1, 0]>(a)\n  y = MatMul(t, b)",
+        "float[4, 8] a, float[4, 16] b",
+        "float[8, 16] y, float[8, 4] t",
+    )
+    assert kernel_traffic_breakdown(model, view_mode=True) == kernel_traffic_breakdown(
+        model
+    )

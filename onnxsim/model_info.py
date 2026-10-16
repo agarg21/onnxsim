@@ -507,9 +507,15 @@ def _kernel_groups(
     """Kernel groups of ``graph``'s nodes as lists of node indices (in node order).
 
     Two elementwise nodes join when one consumes the other's output and that
-    output has no other consumer and is not a graph output. An elementwise node
-    also joins a MatMul, Gemm or Conv (an epilogue, e.g. bias, activation or
-    residual) under the same rule. Everything else is its own group.
+    output has no other consumer and is not a graph output. A MatMul, Gemm or
+    Conv joins the elementwise ops that read its output (an epilogue, e.g. bias,
+    activation or residual), and the output is then never written. A kernel
+    holds at most one MatMul, Gemm or Conv.
+
+    With ``view_mode``, a Slice, Transpose or Concat whose readers are all
+    elementwise joins those readers, and one whose only reader is a MatMul,
+    Gemm or Conv joins that op: the view is read in place. Everything else is
+    its own group.
     """
     producer: Dict[str, int] = {}
     for i, node in enumerate(graph.node):
@@ -518,6 +524,8 @@ def _kernel_groups(
                 producer[out] = i
     graph_outputs = {o.name for o in graph.output}
     parent = list(range(len(graph.node)))
+    # Number of MatMul/Gemm/Conv kernels in each group, indexed by its root.
+    matmuls = [1 if _is_kernel_epilogue_producer(n) else 0 for n in graph.node]
 
     def find(i: int) -> int:
         while parent[i] != i:
@@ -525,8 +533,20 @@ def _kernel_groups(
             i = parent[i]
         return i
 
-    # Phase 1: elementwise chains. A consumer joins a producer when the producer's
-    # output has no other consumer and is not a graph output.
+    def join(members: List[int]) -> bool:
+        """Put ``members`` in one group, unless that group would hold two matmuls."""
+        roots = {find(m) for m in members}
+        total = sum(matmuls[r] for r in roots)
+        if total > 1:
+            return False
+        root = find(members[0])
+        for r in roots:
+            parent[r] = root
+        matmuls[root] = total
+        return True
+
+    merged: Set[int] = set()
+    # Elementwise chains.
     for i, node in enumerate(graph.node):
         if not _is_kernel_elementwise(node):
             continue
@@ -535,13 +555,11 @@ def _kernel_groups(
             if p is None or p == i or not _is_kernel_elementwise(graph.node[p]):
                 continue
             if len(consumers.get(name, [])) == 1 and name not in graph_outputs:
-                parent[find(p)] = find(i)
+                join([p, i])
+                merged.update([p, i])
 
-    # Phase 2: epilogues. A MatMul, Gemm or Conv whose output is only read by
-    # elementwise ops joins all of them: the output is shared inside one kernel,
-    # never written. A kernel takes at most one such producer, so two matmuls
-    # never end up in one kernel.
-    merged: Set[int] = set()
+    # Views (view mode): a view joins the elementwise ops that read it, or the
+    # single MatMul, Gemm or Conv that reads it.
     if view_mode:
         for v, node in enumerate(graph.node):
             if not _is_view_joiner(node) or not node.output[0]:
@@ -550,13 +568,19 @@ def _kernel_groups(
             readers = consumers.get(out, [])
             if not readers or out in graph_outputs:
                 continue
-            if not all(_is_kernel_elementwise(graph.node[c]) for c in readers):
+            if all(_is_kernel_elementwise(graph.node[c]) for c in readers):
+                joined = join([v, *readers])
+            elif len(readers) == 1 and _is_kernel_epilogue_producer(
+                graph.node[readers[0]]
+            ):
+                joined = join([v, readers[0]])
+            else:
                 continue
-            for c in readers:
-                parent[find(v)] = find(c)
-            merged.update([v, *readers])
+            if joined:
+                merged.update([v, *readers])
 
-    epilogue_count = [0] * len(graph.node)
+    # Epilogues: a MatMul, Gemm or Conv joins the elementwise ops (and view ops,
+    # in view mode) that read its output, so the output is never written.
     for p, node in enumerate(graph.node):
         if not _is_kernel_epilogue_producer(node) or not node.output[0]:
             continue
@@ -570,16 +594,8 @@ def _kernel_groups(
             for c in readers
         ):
             continue
-        roots = {find(p)} | {find(c) for c in readers}
-        if sum(epilogue_count[r] for r in roots) + 1 > 1:
-            continue
-        root = find(p)
-        for r in roots - {root}:
-            parent[r] = root
-        for c in readers:
-            parent[find(c)] = root
-        epilogue_count[root] = 1
-        merged.update([p, *readers])
+        if join([p, *readers]):
+            merged.update([p, *readers])
 
     groups: Dict[int, List[int]] = {}
     order: List[int] = []
