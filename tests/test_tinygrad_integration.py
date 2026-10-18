@@ -49,7 +49,8 @@ import pytest
 from onnx import numpy_helper, parser
 
 tinygrad = pytest.importorskip("tinygrad", reason="tinygrad is not installed")
-from tinygrad.nn.onnx import OnnxRunner  # noqa: E402
+# some tinygrad installs have no tinygrad.nn.onnx (the module this test runs); skip rather than fail collection
+OnnxRunner = pytest.importorskip("tinygrad.nn.onnx", reason="tinygrad.nn.onnx (OnnxRunner) not available").OnnxRunner  # noqa: E402
 
 import onnxsim  # noqa: E402  (imported after the tinygrad availability check)
 
