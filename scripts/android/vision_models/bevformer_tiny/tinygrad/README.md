@@ -65,12 +65,12 @@ and the device gap is measured on the real 2500-query calls.
    its query block, so this means generating the sequence with a query range.
 4. Compute the SCA visibility mask on the host (it depends only on `bev_mask`), which removes its 67 ms kernel.
 
-## Fusion: direct gathers through a rangeify fix (`rangeify_index_gather.patch`)
+## Fusion: direct gathers through a rangeify fix (fork branch `bevformer-dsp-patches`, commit `e192300cd`)
 
 tinygrad's own indexing (`__getitem__`, `gather`) is a one-hot compare plus a sum over every row of the source.
 Rangeify realizes each such reduce, so each tap of the MSDA became its own kernel. A direct `INDEX(buffer,
 computed_index)` load has no reduce, but rangeify did not handle it: the buffer was indexed by the output ranges
-and the index was never given them. The patch (against the fork's `dsp-consolidated`, commit `9a4680353`) fixes
+and the index was never given them. The fork commit `e192300cd` (on `bevformer-dsp-patches`, based on `dsp-consolidated` at `9a4680353`) fixes
 that in `tinygrad/schedule/indexing.py`: the index args of an `INDEX` take the output's ranges, and the addressed
 buffer is used as is. Tested on the CPU backend: `test_indexing`, `test_setitem_schedule`, `test_getitem_ops`,
 `test_callify`, `test_tensor_data`, `test_dtype_weak`, `test_assign`, `test_realize_is_realize`,
@@ -178,7 +178,7 @@ backbone's convolutions through that QDQ path, not the float one.
 
 The repo's one-camera int8 backbone (`backbone1.q8.onnx`: uint8 NHWC in, uint8 feats out; 55 convs, 16 adds) goes through
 `nn/onnx_qdq.py` (QDQ_HMX=1) -> `dsp_graph` -> skel -> phone. Three things were needed in the lowering
-(`qdq_add_relayout.patch` against the fork's `dsp-consolidated`):
+(fork commit `d8d3b2407`, on `bevformer-dsp-patches`):
 
 - The QDQ net's scales must be built before the capture (the lowering reads them with `.numpy()`; inside the capture no
   kernel runs, so they came back 0.0 and the QAdd constants were NaN). `phone_qdq_backbone.py` builds it first.
@@ -215,7 +215,7 @@ arithmetic of each tap.
 ## Per-call profile of the int8 backbone (fixed)
 
 The profiler's slot count was 256 in both `skel.c` and `client.c`, below the 474 calls of the backbone, so the earlier
-per-call breakdown was truncated (`dsp_graph_profile_slots.patch`: 1024). With the cap raised, the per-call times sum to
+per-call breakdown was truncated (fork commit `fb9c9df08`: 1024). With the cap raised, the per-call times sum to
 the device total: 438.4 ms against 438.5 ms, HMX=1, bit-exact (0 of 96000 mismatches).
 
 The time is in the convolution kernels (HMX). The heaviest calls, by kernel name from `graph.h`:
@@ -233,9 +233,9 @@ The time is in the convolution kernels (HMX). The heaviest calls, by kernel name
 344 calls have nonzero time. The next concrete target is the efficiency of these HMX kernels (the fork's own notes put
 its 3x3 kernels about 4x behind the hand HMX kernels), not the graph overhead.
 
-## fp16 on the DSP mock: what works and what doesn't (`fp16_mock_helpers.patch`)
+## fp16 on the DSP mock: what works and what doesn't (fork commit `a87a34eb0`)
 
-- The MOCKDSP link (v65) has no fp16 conversion helpers. `fp16_mock_helpers.patch` adds `__extendhfsf2` and
+- The MOCKDSP link (v65) has no fp16 conversion helpers. the fork commit `a87a34eb0` adds `__extendhfsf2` and
   `__truncsfhf2` (round to nearest even) and prepends them to a kernel only under the mock and only when the kernel uses
   `__fp16` or `_Float16`. The first version missed this trigger: clang lowers the renderer's `__fp16` casts to those calls
   without the source naming them.
@@ -264,7 +264,7 @@ python3 check.py encoder --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work --
 G=<scratch>; K=$C/work/msda_io
 python3 capture_msda.py $K/l0_tsa --out $G/gen_l0_tsa
 python3 capture_msda.py $K/l0_sca --out $G/gen_l0_sca
-# with the fork patched: git -C <tinygrad fork> apply <this dir>/rangeify_index_gather.patch
+# the fork changes are on onnxsim/tinygrad branch bevformer-dsp-patches (PR #13); check it out before running these
 cd phone && GEN=$G OUT=$G/phone_build RUN=1 FLAGS=1,4,65536 TURBO=1 PHONE_LOCK_OWNER=<branch> ./build.sh
 ```
 
