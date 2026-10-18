@@ -284,3 +284,18 @@ kernels use the HMX tile op. Output stays bit-exact: 0 of 96000 values differ fr
 
 The per-call profile does not add up to the total in either build (about 15 % of the device time is attributed to calls),
 so the breakdown is not trusted yet. The profile slot count (256 in skel.c and client.c) is also smaller than the 476 calls.
+
+## v69 codegen for the MSDA (`HVX_ARCH=v69`)
+
+The DSP renderer takes its target from `HVX_ARCH` (default v65). With v69, the v68+ qfloat paths are on, and the hand MSDA
+body is qfloat too. Bench, one thread, turbo, median of 10, same session:
+
+| call | v65 (before) | v69 (now) | hand, 4 threads |
+|---|---:|---:|---:|
+| TSA | 81 ms | 57 ms | 4.7 ms |
+| SCA | 308 ms | 273 ms | 4.2 ms |
+
+Both pass the phone's reference check (max abs about 1e-5). The int8 HMX backbone renders identical sources for v69 (185 of
+185 kernels unchanged), so it stays at about 440 ms. Changes: `capture_msda.py` has `TRACE_ONLY=1` (trace the launches when
+qemu can't run the code, e.g. v69 qfloat), dedupes the qfloat helper preludes, and emits one `__TG_RECIP`; the fork's DSP compile allows
+unused functions under -Werror (fork commit `c7cc65359`).
