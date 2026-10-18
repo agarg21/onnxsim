@@ -1,0 +1,26 @@
+diff --git a/tinygrad/runtime/support/dsp_graph_files/client.c b/tinygrad/runtime/support/dsp_graph_files/client.c
+index 8614c7803..f37a8fecc 100644
+--- a/tinygrad/runtime/support/dsp_graph_files/client.c
++++ b/tinygrad/runtime/support/dsp_graph_files/client.c
+@@ -15,7 +15,7 @@ static unsigned char* rd(const char* dir, const char* nm, long* n) {
+   fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
+   unsigned char* b = malloc(*n); if (fread(b, 1, *n, f) != (size_t)*n) exit(1); fclose(f); return b;
+ }
+-#define MAXP 256
++#define MAXP 1024
+ int main(int argc, char** argv) {
+   if (argc < 3) { fprintf(stderr, "usage: %s uri case_dir [iters [prof]]\n", argv[0]); return 2; }
+   int iters = argc > 3 ? atoi(argv[3]) : 10;
+diff --git a/tinygrad/runtime/support/dsp_graph_files/skel.c b/tinygrad/runtime/support/dsp_graph_files/skel.c
+index 050020cd5..9836d8b26 100644
+--- a/tinygrad/runtime/support/dsp_graph_files/skel.c
++++ b/tinygrad/runtime/support/dsp_graph_files/skel.c
+@@ -11,7 +11,7 @@
+ #include "tg_hmx_rpc.h"
+ #include "hmx_runtime.h"
+ extern unsigned long long HAP_perf_get_time_us(void);
+-#define G_NPROF 256
++#define G_NPROF 1024
+ /* G_PROF has to be defined before graph.h, which is where the calls are emitted. g_p_last is the
+    per-call cursor and is deliberately NOT g_last: g_run's own G_PROF(i) updates it on every call, so
+    sharing one variable with the total's start would leave t[0] measuring only the final call. */
