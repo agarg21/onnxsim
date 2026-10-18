@@ -240,7 +240,11 @@ its 3x3 kernels about 4x behind the hand HMX kernels), not the graph overhead.
   `__fp16` or `_Float16`. The first version missed this trigger: clang lowers the renderer's `__fp16` casts to those calls
   without the source naming them.
 - Scalar conversions are then bit-exact against numpy (checked on values including subnormals, infinities and -0).
-- Still broken on the mock: vector fp16 conversions. The renderer emits
+- Vector fp16 conversions are now lane by lane under the mock (the renderer emits a scalar cast per lane): all 65536 half
+  values convert to float32 exactly (checked against numpy).
+- Still broken on the mock: fp16 vector arithmetic. Clang's native fp16 vector multiply on v65 gives zeros (a 4-element
+  multiply returns 0). Fixing it needs the upcast heuristic to skip half kernels under the mock, or a per-op lane loop.
+- Earlier note, now resolved for conversions only: vector fp16 conversions. The renderer emits
   `__builtin_convertvector` from an fp16 vector of 128 lanes to float32, and the v65 backend lowers it wrongly. That
   gives 255 of 256 wrong values in a 256-element cast, and fp16 elementwise multiply and add fail for the same reason.
   The fp16 matmul still has NaNs with HMX=0. v69 would have native fp16 vector instructions, but qemu aborts on them.
