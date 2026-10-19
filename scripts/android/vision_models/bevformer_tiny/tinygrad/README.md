@@ -320,7 +320,16 @@ Things tried after that, none of which helped (phone, qfloat, four threads):
 | asm barriers removed | 97.5: the sampler has none |
 
 The hand-written sampler I tried (a simplified C version with the same layout, 54 ms) is not the hand MSDA. The hand SCA
-(`flags 4` in the same phone runs) is 7.6 ms on four threads, so the remaining gap is about 8x. The hand kernel
+(`flags 4` in the same phone runs) is 7.6 ms on four threads, so the remaining gap is about 8x. Debugging the vectorizer (qfloat, four threads): the packed layout was slow because of a select around the whole
+output. `sca_sparse` built the zero row for invisible pairs with a `cat` of the entry outputs, which tinygrad turns into a
+select over every lane of the sampler's output; that select blocks the vectorizer from folding the lane sums. Removing the
+`cat` (`SP_NOCAT`, default on: the inverse index is clamped and the rows are multiplied by a 0/1 visibility mask) gives
+97.4 -> 50.2 ms, with the sampler and the reduce both vector code. The 32-channel chunked reduce (`SP_CHUNK=1`) is slower
+(103 ms): the 256-lane gather came out as scalar lanes plus misaligned pieces, but 8 chunks were worse still.
+Reproductions of the layouts in isolation (row gathers, gated rows, computed weights) all vectorize, which is why the cat
+was the piece that mattered.
+
+The hand kernel
 vectorises across the sample lanes (`msda_taps_hvx`); the generated sampler does not, and that is the next target.
 
 Phone, four threads, qfloat: sparse SCA 98 ms, dense SCA 153 ms (same session, same tables).

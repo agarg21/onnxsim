@@ -107,6 +107,21 @@ def sca_sparse(value: Tensor, hw: tuple[int, int], ref_cam: Tensor, off: Tensor,
     ref_e, off_e, att_e = ref_e.realize(), off_e.realize(), att_e.realize()
   out_e = sample_entries(value, hw, ref_e, off_e, att_e, mapid)                          # (N, E)
   # reduce: each (camera, query) reads its slot's entry, or the zero row N where the camera does not see it
+  if getenv("SP_NOCAT", 1):
+    # no zero row (a cat here became a select over every lane of the sampler's output, which the vectorizer cannot
+    # fold): the inverse index N (invisible) is clamped to 0 and the row is multiplied by a 0/1 visibility mask
+    iv = inv.cast(dtypes.int32)
+    vis_f = (iv < N).cast(dtypes.float32)                                              # (NV, Q)
+    rows_i = iv * (iv < N).cast(dtypes.int32)
+    flat32 = _flat(out_e).reshape(N * (B.E // 32), 32)                                  # 32-channel rows
+    if getenv("SP_CHUNK", 0):   # slower (103 ms against 50): the stacked gather is kept
+      # eight aligned 32-lane gathers stacked over the channel chunks: a 256-lane gather came out as scalar lanes and
+      # misaligned vector pieces (the reduce kernel was lane-scalar)
+      chunks = [B.gather_rows(flat32.reshape(-1), rows_i * (B.E // 32) + c, 32) for c in range(B.E // 32)]
+      per_cam = Tensor.stack(*chunks, dim=2).reshape(NV, Q, B.E) * vis_f.reshape(NV, Q, 1)
+    else:
+      per_cam = B.gather_rows(_flat(out_e), rows_i, B.E).reshape(NV, Q, B.E) * vis_f.reshape(NV, Q, 1)
+    return per_cam.sum(0) * (1.0 / count.maximum(1.0)).reshape(Q, 1)
   zero = Tensor.zeros(1, B.E, dtype=dtypes.float32)
   out_pad = _flat(Tensor.cat(out_e, zero, dim=0))
   per_cam = B.gather_rows(out_pad, inv.cast(dtypes.int32).reshape(-1), B.E).reshape(NV, Q, B.E)
