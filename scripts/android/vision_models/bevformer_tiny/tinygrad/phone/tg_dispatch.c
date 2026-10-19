@@ -1,35 +1,50 @@
-/* Routes one msda call to the tinygrad launch sequence generated for its shape (capture_msda.py): TSA is NV = 2 without
- * visibility, SCA is NV = 6 with it. The generated code has a one-time prep and per-query-range launches; disjoint query
- * ranges are independent, so the skel runs them on several HVX threads. tg_stop (TG_PROF builds only): run the first
- * tg_stop launches, for per-launch profiling by prefix. */
+/* Routes one msda call to the generated tinygrad phases for its shape (capture_msda.py): TSA = NV 2 without visibility,
+ * SCA = NV 6 with it, decoder = NV 1 without it. Each case's functions are weak, so a skel holds any subset of the cases
+ * it was built with. tg_stop (TG_PROF builds only): run the first tg_stop launches, for per-launch profiling. */
 #include <stddef.h>
+#define WEAK __attribute__((weak))
+#define CASE_DECL(tag)                                                                                             \
+  int tg_##tag##_nphase(void) WEAK;                                                                                \
+  int tg_##tag##_is_range(int) WEAK;                                                                               \
+  void tg_##tag##_prep_call(const unsigned char*) WEAK;                                                            \
+  void tg_##tag##_call(const float*, const float*, const float*, const float*, const unsigned char*, float*, int, int, int) WEAK;
+CASE_DECL(l0_tsa)
+CASE_DECL(l0_sca)
+CASE_DECL(dec_l0)
 
 #ifdef TG_PROF
 int tg_stop = -1;
 #endif
 
-void tg_l0_tsa_prep(const unsigned char* vis_u8);
-void tg_l0_tsa_range(const float* value, const float* ref, const float* off, const float* attw,
-                     const unsigned char* vis_u8, float* out, int q0, int q1);
-void tg_l0_sca_prep(const unsigned char* vis_u8);
-void tg_l0_sca_range(const float* value, const float* ref, const float* off, const float* attw,
-                     const unsigned char* vis_u8, float* out, int q0, int q1);
-
-/* mode 0: the one-time prep; mode 1: queries [q0, q1) */
-int tg_run(int mode, int NV, int has_vis, int stop, const float* value, const float* ref, const float* loc,
-           const float* attw, const unsigned char* vis, float* out, int q0, int q1) {
+/* -> case id (0 TSA, 1 SCA, 2 decoder) or -1 */
+int tg_case(int NV, int has_vis) {
+  if (!has_vis && NV == 2) return 0;
+  if (has_vis && NV == 6) return 1;
+  if (!has_vis && NV == 1) return 2;
+  return -1;
+}
+int tg_nphase(int c) {
+  if (c == 0 && tg_l0_tsa_nphase) return tg_l0_tsa_nphase();
+  if (c == 1 && tg_l0_sca_nphase) return tg_l0_sca_nphase();
+  if (c == 2 && tg_dec_l0_nphase) return tg_dec_l0_nphase();
+  return -1;
+}
+int tg_is_range(int c, int k) {
+  if (c == 0) return tg_l0_tsa_is_range(k);
+  if (c == 1) return tg_l0_sca_is_range(k);
+  return tg_dec_l0_is_range(k);
+}
+void tg_prep(int c, const unsigned char* vis) {
+  if (c == 0) tg_l0_tsa_prep_call(0);
+  else if (c == 1) tg_l0_sca_prep_call(vis);
+  else tg_dec_l0_prep_call(0);
+}
+void tg_call(int c, const float* value, const float* ref, const float* off, const float* attw, const unsigned char* vis,
+             float* out, int k, int q0, int q1) {
 #ifdef TG_PROF
-  tg_stop = stop;
-#else
-  (void)stop;
+  tg_stop = -1;
 #endif
-  if (!has_vis && NV == 2) {
-    if (mode == 0) tg_l0_tsa_prep(0); else tg_l0_tsa_range(value, ref, loc, attw, 0, out, q0, q1);
-    return 0;
-  }
-  if (has_vis && NV == 6) {
-    if (mode == 0) tg_l0_sca_prep(vis); else tg_l0_sca_range(value, ref, loc, attw, vis, out, q0, q1);
-    return 0;
-  }
-  return -3;
+  if (c == 0) tg_l0_tsa_call(value, ref, off, attw, 0, out, k, q0, q1);
+  else if (c == 1) tg_l0_sca_call(value, ref, off, attw, vis, out, k, q0, q1);
+  else tg_dec_l0_call(value, ref, off, attw, 0, out, k, q0, q1);
 }

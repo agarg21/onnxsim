@@ -313,3 +313,22 @@ HVX threads (flags low bits, as for the hand kernel). Phone, turbo, same session
 | SCA | 268 ms | 84 ms | 4.2 ms |
 
 Both pass the phone's reference check (max abs about 1e-5).
+
+## Phases, the scratch-size fix, and the decoder
+
+The generator now emits phases: a run of query-range launches is one phase (threads split it), and each whole-buffer
+launch is its own phase, with a barrier between phases. Two bugs found on the way:
+- Reordering a whole-buffer kernel ahead of a query-range kernel that reads the buffer first (a write-after-read
+  dependency) gives wrong results. Phases keep the launch order.
+- A scratch buffer is reused by tensors of different sizes (the decoder's [W, H] constant, then a 900-entry buffer). The
+  scratch array was sized from its first use, so the later writes overran it. It is now sized by its largest use.
+
+Phone, turbo, same session (one thread / four threads, DSP ms), all passing the reference check:
+
+| call | 1 thread | 4 threads | hand, 4 threads |
+|---|---:|---:|---:|
+| TSA | 54 ms | 16 ms | 4.6 ms |
+| SCA | 275 ms | 85 ms | 4.2 ms |
+| decoder (900 queries, one map) | 12.2 ms | 3.1 ms | 1.3 ms |
+
+`dump_decoder_msda.py` writes the decoder's cross-attention calls of real frame data as case directories.

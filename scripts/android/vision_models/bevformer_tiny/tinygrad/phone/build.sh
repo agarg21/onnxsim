@@ -30,7 +30,7 @@ HX=("$HEXAGON_TOOLCHAIN/bin/hexagon-clang" -O2 -fPIC -mcpu=hexagonv69 -mhvx -mhv
 "${HX[@]}" -c -Wall "${INC[@]}" "${QURT_INC[@]}" -o impl.o msda_impl.c
 "${HX[@]}" -c "${INC[@]}" -o dispatch.o tg_dispatch.c
 objs=()
-for t in l0_tsa l0_sca; do
+for t in ${TAGS:-l0_tsa l0_sca}; do
   mkdir -p "$t"
   cp "$GEN/gen_$t/run.c" "$GEN/gen_$t/kernels.c" "$t/"
   "${HX[@]}" -c "${INC[@]}" -o "tg_$t.o" "$t/run.c"
@@ -48,6 +48,6 @@ PR="${PHONE_RUN:-$HOME/.cache/android-phone/phone-run}"
 S="$DEVICE_SERIAL"
 "$PR" adb -s "$S" shell "rm -rf $D && mkdir -p $D"
 "$PR" adb -s "$S" push msda_client msda_rpc.so "$D/" >/dev/null
-for t in l0_tsa l0_sca; do "$PR" adb -s "$S" push "$CASES/$t" "$D/$t" >/dev/null; done
+for t in ${TAGS:-l0_tsa l0_sca}; do "$PR" adb -s "$S" push "$CASES/$t" "$D/$t" >/dev/null; done
 "$PR" adb -s "$S" shell "chmod 755 $D/msda_client && cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D \
-  ./msda_client 'file:///msda_rpc.so?msda_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' ${REPS:-10} ${TURBO:-0} ${FLAGS:-4,65536} l0_tsa l0_sca"
+  ./msda_client 'file:///msda_rpc.so?msda_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' ${REPS:-10} ${TURBO:-0} ${FLAGS:-4,65536} ${TAGS:-l0_tsa l0_sca}"
