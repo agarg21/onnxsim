@@ -299,3 +299,17 @@ Both pass the phone's reference check (max abs about 1e-5). The int8 HMX backbon
 185 kernels unchanged), so it stays at about 440 ms. Changes: `capture_msda.py` has `TRACE_ONLY=1` (trace the launches when
 qemu can't run the code, e.g. v69 qfloat), dedupes the qfloat helper preludes, and emits one `__TG_RECIP`; the fork's DSP compile allows
 unused functions under -Werror (fork commit `c7cc65359`).
+
+## Threads: queries split across the HVX threads (as the hand kernel)
+
+The generated launches take a query range (`tg_<case>_range(..., q0, q1)`); a one-time `tg_<case>_prep` runs first. Each
+kernel's query loop is clamped to its range; whole-buffer kernels (a constant fill) run once in prep, and the generator
+checks that no such kernel reads a buffer a query-range launch writes. The skel runs the prep, then the query ranges on N
+HVX threads (flags low bits, as for the hand kernel). Phone, turbo, same session:
+
+| call | 1 thread | 4 threads | hand, 4 threads |
+|---|---:|---:|---:|
+| TSA | 57 ms | 17.7 ms | 4.7 ms |
+| SCA | 268 ms | 84 ms | 4.2 ms |
+
+Both pass the phone's reference check (max abs about 1e-5).
