@@ -6,6 +6,7 @@
 #define CASE_DECL(tag)                                                                                             \
   int tg_##tag##_nphase(void) WEAK;                                                                                \
   int tg_##tag##_is_range(int) WEAK;                                                                               \
+  int tg_##tag##_phase_ext(int) WEAK;                                                                              \
   void tg_##tag##_prep_call(const unsigned char*) WEAK;                                                            \
   void tg_##tag##_call(const float*, const float*, const float*, const float*, const unsigned char*, float*, int, int, int) WEAK;
 CASE_DECL(l0_tsa)
@@ -27,6 +28,13 @@ int tg_nphase(int c) {
   if (c == 0 && tg_l0_tsa_nphase) return tg_l0_tsa_nphase();
   if (c == 1 && tg_l0_sca_nphase) return tg_l0_sca_nphase();
   if (c == 2 && tg_dec_l0_nphase) return tg_dec_l0_nphase();
+  return -1;
+}
+/* a range phase's loop extent (the runner splits [0, extent)); -1 for a skel built before extents were generated */
+int tg_phase_ext(int c, int k) {
+  if (c == 0 && tg_l0_tsa_phase_ext) return tg_l0_tsa_phase_ext(k);
+  if (c == 1 && tg_l0_sca_phase_ext) return tg_l0_sca_phase_ext(k);
+  if (c == 2 && tg_dec_l0_phase_ext) return tg_dec_l0_phase_ext(k);
   return -1;
 }
 int tg_is_range(int c, int k) {

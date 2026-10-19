@@ -11,6 +11,7 @@ proto = """
 int tg_case(int NV, int has_vis);
 int tg_nphase(int c);
 int tg_is_range(int c, int k);
+int tg_phase_ext(int c, int k);
 void tg_prep(int c, const unsigned char* vis);
 void tg_call(int c, const float* value, const float* ref, const float* off, const float* attw, const unsigned char* vis,
              float* out, int k, int q0, int q1);
@@ -60,9 +61,14 @@ block = """  if (flags & 0x10000) {
     TG_JOB(0, 0, 0, 0, 0);
     TG_RUN_JOBS(1);
     int np = tg_nphase(c);
+    /* profiling: bits 17-23 = 1 + the number of phases to run (0: all); the time of a prefix is the sum of its phases */
+    int sf = (flags >> 17) & 0x7f;
+    if (sf) np = sf - 1 < np ? sf - 1 : np;
     for (int k = 0; k < np && rc == 0; k++) {
       if (tg_is_range(c, k)) {
-        for (int t = 0; t < nt; t++) TG_JOB(t, 1, k, (int)((long)Q * t / nt), (int)((long)Q * (t + 1) / nt));
+        int ext = tg_phase_ext(c, k);
+        if (ext < 0) ext = Q;   /* an older skel: its range phases span the queries */
+        for (int t = 0; t < nt; t++) TG_JOB(t, 1, k, (int)((long)ext * t / nt), (int)((long)ext * (t + 1) / nt));
         TG_RUN_JOBS(nt);
       } else {
         TG_JOB(0, 1, k, 0, 0);

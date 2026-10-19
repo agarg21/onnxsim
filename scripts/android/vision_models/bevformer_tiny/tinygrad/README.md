@@ -65,12 +65,12 @@ and the device gap is measured on the real 2500-query calls.
    its query block, so this means generating the sequence with a query range.
 4. Compute the SCA visibility mask on the host (it depends only on `bev_mask`), which removes its 67 ms kernel.
 
-## Fusion: direct gathers through a rangeify fix (fork branch `bevformer-dsp-patches`, commit `e192300cd`)
+## Fusion: direct gathers through a rangeify fix (`rangeify_index_gather.patch`)
 
 tinygrad's own indexing (`__getitem__`, `gather`) is a one-hot compare plus a sum over every row of the source.
 Rangeify realizes each such reduce, so each tap of the MSDA became its own kernel. A direct `INDEX(buffer,
 computed_index)` load has no reduce, but rangeify did not handle it: the buffer was indexed by the output ranges
-and the index was never given them. The fork commit `e192300cd` (on `bevformer-dsp-patches`, based on `dsp-consolidated` at `9a4680353`) fixes
+and the index was never given them. The patch (against the fork's `dsp-consolidated`, commit `9a4680353`) fixes
 that in `tinygrad/schedule/indexing.py`: the index args of an `INDEX` take the output's ranges, and the addressed
 buffer is used as is. Tested on the CPU backend: `test_indexing`, `test_setitem_schedule`, `test_getitem_ops`,
 `test_callify`, `test_tensor_data`, `test_dtype_weak`, `test_assign`, `test_realize_is_realize`,
@@ -178,7 +178,7 @@ backbone's convolutions through that QDQ path, not the float one.
 
 The repo's one-camera int8 backbone (`backbone1.q8.onnx`: uint8 NHWC in, uint8 feats out; 55 convs, 16 adds) goes through
 `nn/onnx_qdq.py` (QDQ_HMX=1) -> `dsp_graph` -> skel -> phone. Three things were needed in the lowering
-(fork commit `d8d3b2407`, on `bevformer-dsp-patches`):
+(`qdq_add_relayout.patch` against the fork's `dsp-consolidated`):
 
 - The QDQ net's scales must be built before the capture (the lowering reads them with `.numpy()`; inside the capture no
   kernel runs, so they came back 0.0 and the QAdd constants were NaN). `phone_qdq_backbone.py` builds it first.
@@ -215,7 +215,7 @@ arithmetic of each tap.
 ## Per-call profile of the int8 backbone (fixed)
 
 The profiler's slot count was 256 in both `skel.c` and `client.c`, below the 474 calls of the backbone, so the earlier
-per-call breakdown was truncated (fork commit `fb9c9df08`: 1024). With the cap raised, the per-call times sum to
+per-call breakdown was truncated (`dsp_graph_profile_slots.patch`: 1024). With the cap raised, the per-call times sum to
 the device total: 438.4 ms against 438.5 ms, HMX=1, bit-exact (0 of 96000 mismatches).
 
 The time is in the convolution kernels (HMX). The heaviest calls, by kernel name from `graph.h`:
@@ -233,23 +233,89 @@ The time is in the convolution kernels (HMX). The heaviest calls, by kernel name
 344 calls have nonzero time. The next concrete target is the efficiency of these HMX kernels (the fork's own notes put
 its 3x3 kernels about 4x behind the hand HMX kernels), not the graph overhead.
 
-## fp16 on the DSP mock: what works and what doesn't (fork commit `a87a34eb0`)
+## fp16 on the DSP mock: what works and what doesn't (`fp16_mock_helpers.patch`)
 
-- The MOCKDSP link (v65) has no fp16 conversion helpers. the fork commit `a87a34eb0` adds `__extendhfsf2` and
+- The MOCKDSP link (v65) has no fp16 conversion helpers. `fp16_mock_helpers.patch` adds `__extendhfsf2` and
   `__truncsfhf2` (round to nearest even) and prepends them to a kernel only under the mock and only when the kernel uses
   `__fp16` or `_Float16`. The first version missed this trigger: clang lowers the renderer's `__fp16` casts to those calls
   without the source naming them.
 - Scalar conversions are then bit-exact against numpy (checked on values including subnormals, infinities and -0).
-- Vector fp16 conversions are now lane by lane under the mock (the renderer emits a scalar cast per lane): all 65536 half
-  values convert to float32 exactly (checked against numpy).
-- Still broken on the mock: fp16 vector arithmetic. Clang's native fp16 vector multiply on v65 gives zeros (a 4-element
-  multiply returns 0). Fixing it needs the upcast heuristic to skip half kernels under the mock, or a per-op lane loop.
-- Earlier note, now resolved for conversions only: vector fp16 conversions. The renderer emits
+- Still broken on the mock: vector fp16 conversions. The renderer emits
   `__builtin_convertvector` from an fp16 vector of 128 lanes to float32, and the v65 backend lowers it wrongly. That
   gives 255 of 256 wrong values in a 256-element cast, and fp16 elementwise multiply and add fail for the same reason.
   The fp16 matmul still has NaNs with HMX=0. v69 would have native fp16 vector instructions, but qemu aborts on them.
 - So fp16 kernels can't be validated on the host yet. The next fix is either a scalar fallback for fp16 vector
   conversions under the mock, or integer-vector half-to-float code for v65 HVX.
+
+## Profiling the sparse SCA: which tools work (phone, hexagon-sim, SDK)
+
+The sparse SCA (`sca_sparse_tg.py`, generated with `sca_sparse_capture.py`) is the profiling target. Numbers are from
+the Xiaomi 12S (V69, qfloat), one thread unless stated; the simulator numbers are v69, qfloat, and their outputs are not
+checked against the phone's numerics.
+
+| tool | works? | what it gives | limits |
+|---|---|---|---|
+| phone phase timing (`make_impl.py`, flags bits 17-23 = prefix) | yes | wall time per generated phase, `HAP_perf_get_time_us` (1 us) | per phase only; a prefix of N phases runs N-1 of them, so a phase's time is a difference |
+| phone hardware counters (`HAP_user_pmu.h`) | no | would give cache misses and HVX stalls on the device | HAP PMU needs a debug-enabled device and is not reachable from an unsigned protection domain; this phone is a `user` build (`ro.debuggable=0`, `ro.secure=1`) |
+| `hexagon-sim` (Qualcomm ISS) | yes, with two setup steps | `Pcycles=`, instruction counts, and with `--timing --packet_analyze FILE` a JSON of hardware counters | see below |
+| `hexagon-profiler` | JSON only | reads the `--packet_analyze` JSON | the HTML output segfaults, also with `QT_QPA_PLATFORM=offscreen`; read the JSON directly |
+| `hexagon-gprof`, `hexagon-llvm-profdata` | not used | need profile data we don't produce yet | |
+
+**hexagon-sim setup.** It needs `libncurses.so.5`, which this machine lacks. Make a shim directory with
+`libncurses.so.5 -> libncursesw.so.6` and `libtinfo.so.5 -> libtinfo.so.6`, and put it first in `LD_LIBRARY_PATH`.
+`hexagon_sim_timer.h` is a declaration without a library in the link, so the driver reads the cycle counter itself
+(`c3:2`, PCYCLE). Passing arguments to `hexagon-sim` fails ("More than one non-option"), so the driver is built once per
+phase prefix (`-DNP=<n>`). `sim/sca_sim_main.c` and `sim/sca_sim_prefix.sh` do this.
+
+**Use the simulator's totals, not in-program reads.** Reading the counter around each phase gave zeros and a wrapped
+value. The per-phase numbers are differences of the `Pcycles=` totals of the prefix runs.
+
+**Non-timing runs have no cache model.** A plain `hexagon-sim` run gave 213M cycles for the sparse SCA, and it looked
+instruction-bound (IPC about 0.8). With `--timing --packet_analyze pa.json` the same run is 238.5M cycles and the
+counters show that memory dominates. Use timing mode for any conclusion about stalls.
+
+Sparse SCA, qfloat, one thread, simulator (prefix differences):
+
+| phase | Pcycles | share |
+|---|---:|---:|
+| sample taps (3841 entries) | 142.2M | 69% |
+| coordinates (3840 entries) | 31.0M | 15% |
+| reduce (2500 queries) | 32.0M | 16% |
+| gathers, copies, zero fill | 3.9M | 2% |
+| prep (overhead, every prefix) | 7.0M | |
+
+Timing-mode counters for the whole run (`pa.json`, `stats`): `DU_CACHE_MISS_PVIEW_CYCLES` 92.6M (39%),
+`HVX_ACTIVE` 80.8M (34%), `DCACHE_DEMAND_MISS` 5.0M, `L2_ACCESS` 22.3M, 71.0M packets for 169.4M committed instructions.
+Memory stalls are the largest cost, and HVX is busy a third of the time. The one-entry-ahead `dcfetch` prefetch of the
+sample kernel did not help (phone 122.7 ms against 117.5 ms), so the next experiment should move the prefetch further
+ahead and check the miss counters in timing mode.
+
+Follow-up, qfloat, phone, four threads (baseline 97.4 ms):
+
+| variant | ms | note |
+|---|---:|---|
+| prefetch distance 1, 2, 4, 8 | 102.2, 100.3, 102.4, 101.9 | every distance is slower than none |
+| coordinates lazy (`SP_FUSE=1`) | 97.4 | same launches: the coordinate table is still realized |
+| coordinates and gathers lazy (`SP_FUSE=1 SP_LAZY_GATHER=1`) | 119.6 | recomputing the coordinates costs more than the traffic it saves |
+
+Timing-mode prefixes (prefix 6, 7, 9 and the full run) split the 92.6M miss cycles: the sample kernel has 73M of them
+(about 42% of its cycles, 88% of the demand misses), the reduce 10M, the coordinate phase 4M. A data-cache trace of
+prefix 9 (`--dcachetrace`, 4.5 GB) puts the sample kernel's misses in one 4.5 MB region spread evenly, which fits the
+realized coordinate table (4.9 MB) and the gathered per-entry tables (`off_e`, `att_e`, `ref_e`, about 3.4 MB). Lazy
+recomputation removes that traffic but adds more instructions than it saves, and the kernel is already limited by its
+instruction count (about 116 instructions per tap). So the next change is in the generated code, not the data layout:
+vectorise the tap offsets and weights over the sample lanes, as `msda_taps_hvx` does.
+
+Phone, four threads, qfloat: sparse SCA 98 ms, dense SCA 153 ms (same session, same tables).
+
+```bash
+# simulator: one binary per prefix, totals per prefix, then the per-phase differences
+GEN=<sca_sparse_capture.py output> TOOLS=<HEXAGON_Tools/19.0.04/Tools> SHIM=<ncurses shim> \
+  bash sim/sca_sim_prefix.sh                  # writes sim_build/prefix_summary.txt
+# timing-mode counters for the full run (JSON for hexagon-profiler or a script); sim_build/sim_sca_10 is the full run
+LD_LIBRARY_PATH=<ncurses shim> <Tools>/bin/hexagon-sim --march v69 --timing --packet_analyze pa.json sim_build/sim_sca_10
+```
+The driver reads the case from `/mnt/data/cache/claude-work/bevphase/cases/l0_sca` (hard-coded in `sim/sca_sim_main.c`).
 
 ## Reproduce
 
@@ -264,7 +330,7 @@ python3 check.py encoder --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work --
 G=<scratch>; K=$C/work/msda_io
 python3 capture_msda.py $K/l0_tsa --out $G/gen_l0_tsa
 python3 capture_msda.py $K/l0_sca --out $G/gen_l0_sca
-# the fork changes are on onnxsim/tinygrad branch bevformer-dsp-patches (PR #13); check it out before running these
+# with the fork patched: git -C <tinygrad fork> apply <this dir>/rangeify_index_gather.patch
 cd phone && GEN=$G OUT=$G/phone_build RUN=1 FLAGS=1,4,65536 TURBO=1 PHONE_LOCK_OWNER=<branch> ./build.sh
 ```
 
@@ -284,51 +350,3 @@ kernels use the HMX tile op. Output stays bit-exact: 0 of 96000 values differ fr
 
 The per-call profile does not add up to the total in either build (about 15 % of the device time is attributed to calls),
 so the breakdown is not trusted yet. The profile slot count (256 in skel.c and client.c) is also smaller than the 476 calls.
-
-## v69 codegen for the MSDA (`HVX_ARCH=v69`)
-
-The DSP renderer takes its target from `HVX_ARCH` (default v65). With v69, the v68+ qfloat paths are on, and the hand MSDA
-body is qfloat too. Bench, one thread, turbo, median of 10, same session:
-
-| call | v65 (before) | v69 (now) | hand, 4 threads |
-|---|---:|---:|---:|
-| TSA | 81 ms | 57 ms | 4.7 ms |
-| SCA | 308 ms | 273 ms | 4.2 ms |
-
-Both pass the phone's reference check (max abs about 1e-5). The int8 HMX backbone renders identical sources for v69 (185 of
-185 kernels unchanged), so it stays at about 440 ms. Changes: `capture_msda.py` has `TRACE_ONLY=1` (trace the launches when
-qemu can't run the code, e.g. v69 qfloat), dedupes the qfloat helper preludes, and emits one `__TG_RECIP`; the fork's DSP compile allows
-unused functions under -Werror (fork commit `c7cc65359`).
-
-## Threads: queries split across the HVX threads (as the hand kernel)
-
-The generated launches take a query range (`tg_<case>_range(..., q0, q1)`); a one-time `tg_<case>_prep` runs first. Each
-kernel's query loop is clamped to its range; whole-buffer kernels (a constant fill) run once in prep, and the generator
-checks that no such kernel reads a buffer a query-range launch writes. The skel runs the prep, then the query ranges on N
-HVX threads (flags low bits, as for the hand kernel). Phone, turbo, same session:
-
-| call | 1 thread | 4 threads | hand, 4 threads |
-|---|---:|---:|---:|
-| TSA | 57 ms | 17.7 ms | 4.7 ms |
-| SCA | 268 ms | 84 ms | 4.2 ms |
-
-Both pass the phone's reference check (max abs about 1e-5).
-
-## Phases, the scratch-size fix, and the decoder
-
-The generator now emits phases: a run of query-range launches is one phase (threads split it), and each whole-buffer
-launch is its own phase, with a barrier between phases. Two bugs found on the way:
-- Reordering a whole-buffer kernel ahead of a query-range kernel that reads the buffer first (a write-after-read
-  dependency) gives wrong results. Phases keep the launch order.
-- A scratch buffer is reused by tensors of different sizes (the decoder's [W, H] constant, then a 900-entry buffer). The
-  scratch array was sized from its first use, so the later writes overran it. It is now sized by its largest use.
-
-Phone, turbo, same session (one thread / four threads, DSP ms), all passing the reference check:
-
-| call | 1 thread | 4 threads | hand, 4 threads |
-|---|---:|---:|---:|
-| TSA | 54 ms | 16 ms | 4.6 ms |
-| SCA | 275 ms | 85 ms | 4.2 ms |
-| decoder (900 queries, one map) | 12.2 ms | 3.1 ms | 1.3 ms |
-
-`dump_decoder_msda.py` writes the decoder's cross-attention calls of real frame data as case directories.
