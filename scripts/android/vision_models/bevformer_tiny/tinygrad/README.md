@@ -343,6 +343,14 @@ LD_LIBRARY_PATH=<ncurses shim> <Tools>/bin/hexagon-sim --march v69 --timing --pa
 ```
 The driver reads the case from `/mnt/data/cache/claude-work/bevphase/cases/l0_sca` (hard-coded in `sim/sca_sim_main.c`).
 
+## Backbone on the phone: what the 359 s was (correction)
+
+The int8 backbone at 359 s per inference was captured without `HMX=1`, so its convolutions were lowered to the HVX
+dot-product path (`__WMMA`, 128-lane operands built from scalar lanes) instead of the HMX int8 tensor core. With
+`HMX=1` the 38 convolutions use HMX (`__hmx_i8_addq`), and the backbone runs at 436-437 ms per inference, bit-exact,
+with or without the fork's interleave rule (`DSP_INTERLEAVE`). An earlier note credited the interleave rule with the
+437 ms; that was wrong. The rule matters only for HVX-only captures: a hand-patched HVX build went from 352 s to 92 s.
+
 ## Reproduce
 
 Needs the tinygrad fork with DSP support (checkout of `dsp-consolidated`, commit `9a4680353` at the time of
