@@ -105,7 +105,7 @@ def sca_sparse(value: Tensor, hw: tuple[int, int], ref_cam: Tensor, off: Tensor,
   # realized: a lazy INDEX gather feeding the reference stack fails the rangeify verifier (weakint RANGE)
   if not getenv("SP_LAZY_GATHER", 0):   # the realize keeps the INDEX gathers out of the sampler's stack (see above)
     ref_e, off_e, att_e = ref_e.realize(), off_e.realize(), att_e.realize()
-  out_e = sample_entries(value, hw, ref_e, off_e, att_e, mapid)                          # (N, E)
+  out_e = sample_entries(value, hw, ref_e, off_e, att_e, mapid).realize()   # once: a lazy output was recomputed per use (the bool-splat fix of the fork exposed it)                          # (N, E)
   # reduce: each (camera, query) reads its slot's entry, or the zero row N where the camera does not see it
   if getenv("SP_NOCAT", 1):
     # no zero row (a cat here became a select over every lane of the sampler's output, which the vectorizer cannot
