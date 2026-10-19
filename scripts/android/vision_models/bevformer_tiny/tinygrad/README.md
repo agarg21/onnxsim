@@ -304,7 +304,24 @@ prefix 9 (`--dcachetrace`, 4.5 GB) puts the sample kernel's misses in one 4.5 MB
 realized coordinate table (4.9 MB) and the gathered per-entry tables (`off_e`, `att_e`, `ref_e`, about 3.4 MB). Lazy
 recomputation removes that traffic but adds more instructions than it saves, and the kernel is already limited by its
 instruction count (about 116 instructions per tap). So the next change is in the generated code, not the data layout:
-vectorise the tap offsets and weights over the sample lanes, as `msda_taps_hvx` does.
+the taps were summed one at a time.
+
+**Stacking the taps (`SP_STACK_TAPS`, default on) was the win.** Each tap was a separate reduce, and each reduce re-read the
+coordinate table, so the sampler had four loop nests per head. Stacking the four taps on one axis and summing over
+(point, tap) gives one loop nest. Phone, four threads, qfloat: 97.4 ms -> 60-62 ms; one thread 205 ms.
+Checked against the reference (max abs 1.1e-5 on the phone).
+
+Things tried after that, none of which helped (phone, qfloat, four threads):
+
+| change | ms |
+|---|---:|
+| guarded loads as `if` statements in the DSP renderer (`DSP_GUARD`) | 59.7 without, 61.0 with: no gain, reverted |
+| register accumulator in the generated sampler | 98.1 (baseline 97.4): no gain |
+| asm barriers removed | 97.5: the sampler has none |
+
+The hand-written sampler I tried (a simplified C version with the same layout, 54 ms) is not the hand MSDA. The hand SCA
+(`flags 4` in the same phone runs) is 7.6 ms on four threads, so the remaining gap is about 8x. The hand kernel
+vectorises across the sample lanes (`msda_taps_hvx`); the generated sampler does not, and that is the next target.
 
 Phone, four threads, qfloat: sparse SCA 98 ms, dense SCA 153 ms (same session, same tables).
 

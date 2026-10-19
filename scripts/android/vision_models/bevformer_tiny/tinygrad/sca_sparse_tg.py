@@ -55,6 +55,18 @@ def sample_entries(value: Tensor, hw: tuple[int, int], ref: Tensor, off: Tensor,
   head = Tensor.arange(B.HEADS, dtype=dtypes.int32).reshape(1, B.HEADS, 1)
   base = (mapid.cast(dtypes.int32) * S).reshape(N, 1, 1)
   rows = value.reshape(-1).realize()
+  if getenv("SP_STACK_TAPS", 1):
+    # the four taps on one axis, summed in one reduce over (point, tap): one loop nest instead of four, each of which
+    # re-reads the coordinates (the generated sampler had four such loops per head)
+    terms = []
+    for dx, dy in B.TAPS:
+      xt, yt = x0f + dx, y0f + dy
+      ok = (xt >= 0) & (xt < W) & (yt >= 0) & (yt < H)
+      w = ((fx if dx else 1.0 - fx) * (fy if dy else 1.0 - fy)) * att_s
+      idx = ((base + yt.cast(dtypes.int32) * W + xt.cast(dtypes.int32)) * B.HEADS + head)
+      val = B.gather_rows(rows, ok.where(idx, 0), B.D)                                  # (N, M, P, D)
+      terms.append(val * ok.where(w, 0.0).unsqueeze(-1))
+    return Tensor.stack(*terms, dim=3).sum(axis=(2, 3)).reshape(N, B.E)
   out = None
   for dx, dy in B.TAPS:
     xt, yt = x0f + dx, y0f + dy
