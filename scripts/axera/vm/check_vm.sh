@@ -145,8 +145,11 @@ s=$(cat /sys/module/ax_pcie_host_dev/parameters/slot_index_force 2>/dev/null)
   || { fail "slot_index_force is '${s:-unset}' (heartbeats get discarded)"; fix "options ax_pcie_host_dev slot_index_force=3 in /etc/modprobe.d, reload the stack"; }
 
 # `heartbeat_recv_thread ... timeout: 9000` is a per-heartbeat debug trace, not
-# an error; "dead!" is the real failure. axcl-smi hangs on a dead card.
-if dmesg | grep -q 'dead!'; then
+# an error; "dead!" is the real failure. axcl-smi hangs on a dead card. Only a
+# "dead!" after the last firmware load counts: the driver resets the card and
+# reloads its firmware ("Firmware loading") after one, and a module reload does
+# too, so an earlier "dead!" in the same boot is stale.
+if dmesg | awk '/Firmware loading/{d=0} /dead!/{d=1} END{exit !d}'; then
   fail "driver declared the card dead (dmesg 'dead!')"
   fix "modprobe -r axcl_host ax_pcie_mmb ax_pcie_msg ax_pcie_p2p_rc ax_pcie_host_dev, then reload (README 'Use it')"
   exit 0
