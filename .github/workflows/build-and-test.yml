@@ -182,7 +182,15 @@ jobs:
       - name: Install formal-verification test deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ninja sccache pytest onnxruntime ml_dtypes z3-solver
+          # Deliberately NOT pip-installing sccache here -- PyPI's sccache
+          # package bundles its own (older/mismatched) binary, which would
+          # shadow the mozilla-actions/sccache-action-provided one earlier on
+          # PATH. CMAKE_CXX_COMPILER_LAUNCHER then talks to a server started
+          # by a different sccache version than the action's own post-job
+          # `--show-stats` client expects, which fails the whole job with
+          # "failed to read response header" / "failed to fill whole buffer"
+          # even though the actual build and tests above it succeeded.
+          python -m pip install ninja pytest onnxruntime ml_dtypes z3-solver
       - name: Build and install onnxsim
         run: python -m pip install -v .
       # Run from a neutral directory (matching test_wheels_windows_cross's own
@@ -252,7 +260,11 @@ jobs:
       - name: Install test deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ninja sccache pytest onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors ml_dtypes
+          # Not pip-installing sccache here -- see the identical comment in
+          # test_formal_verification's own test-deps step for why that would
+          # shadow the mozilla-actions/sccache-action-provided binary and
+          # break its post-job --show-stats call.
+          python -m pip install ninja pytest onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors ml_dtypes
           python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
           # tests/test_axera_tinygrad_ax_backend.py runs the tinygrad UOp
           # lowerings, which need the onnxsim/tinygrad fork at
@@ -427,7 +439,12 @@ jobs:
       run: |
         # It's important to leave the project directory where a 'onnxsim' subdirectory exists
         cd dist
-        python3 -m pip install onnxruntime ninja sccache
+        # Not pip-installing sccache here -- see the identical comment in
+        # test_formal_verification's test-deps step for why that would
+        # shadow the mozilla-actions/sccache-action-provided binary and
+        # break its post-job --show-stats call; this step's pip install of
+        # the sdist below is the thing that actually compiles with it.
+        python3 -m pip install onnxruntime ninja
         python3 -m pip install onnxsim-*.tar.gz
         python3 -c "import onnxsim; print(dir(onnxsim))"
         python3 -m pip uninstall -y onnxsim
