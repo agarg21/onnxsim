@@ -106,17 +106,35 @@ def select_targets(releases: dict[str, list[dict]], keep: int, prune_tagged: boo
     return to_delete, kept_dev, tagged
 
 
+_REAUTH_TITLE_RE = re.compile(r"<title>\s*Confirm password", re.IGNORECASE)
+
+
+class ReauthRequired(RuntimeError):
+    """Raised when Warehouse demands a fresh password/2FA confirmation."""
+
+
 class TestPyPISession:
     def __init__(self, cookie: str, project: str):
         self.project = project
         self.s = requests.Session()
         self.s.headers["Cookie"] = cookie.strip()
         self.s.headers["User-Agent"] = "onnxsim-gc-testpypi/1.0"
+        self._csrf: str | None = None
+
+    def _releases_url(self) -> str:
+        # The per-version "release" URL below is POST-only (it 404s on GET),
+        # so the CSRF token has to come from the releases list page instead --
+        # that page embeds one hidden csrf_token input per release's delete
+        # form, all sharing the same session-wide token value.
+        return f"{BASE}/manage/project/{self.project}/releases/"
 
     def _manage_url(self, version: str) -> str:
         return f"{BASE}/manage/project/{self.project}/release/{version}/"
 
-    def _get_csrf(self, url: str) -> str:
+    def _ensure_csrf(self) -> str:
+        if self._csrf:
+            return self._csrf
+        url = self._releases_url()
         resp = self.s.get(url, timeout=30, allow_redirects=True)
         if "/account/login" in resp.url:
             raise RuntimeError(
@@ -124,39 +142,63 @@ class TestPyPISession:
                 "or expired. Re-copy it from a logged-in browser."
             )
         resp.raise_for_status()
+        if _REAUTH_TITLE_RE.search(resp.text):
+            raise ReauthRequired(
+                "TestPyPI wants a fresh password/2FA confirmation before it will "
+                f"show the releases page. Open {url} in your browser, complete "
+                "that prompt, then immediately re-copy the Cookie header and "
+                "retry -- a cookie from ordinary browsing isn't enough."
+            )
         m = _CSRF_RE.search(resp.text)
         if not m:
             raise RuntimeError(
                 f"Could not find a CSRF token on {url}. The page may not exist "
                 "or the cookie is not for a maintainer of this project."
             )
-        return m.group(1)
+        self._csrf = m.group(1)
+        return self._csrf
 
     def delete_release(self, version: str) -> None:
-        """Delete a single release via the web form. Raises on failure."""
+        """Submit the delete form for one release. Raises on failure.
+
+        Does NOT verify the release is actually gone afterwards -- the old
+        per-version GET used for that always 404s (it's a POST-only route)
+        regardless of deletion state, so it can't distinguish success from
+        failure. Verify via the public JSON API after the whole batch instead.
+        """
+        csrf = self._ensure_csrf()
         url = self._manage_url(version)
-        csrf = self._get_csrf(url)
         resp = self.s.post(
             url,
-            data={"csrf_token": csrf, "confirm_delete_version": version},
-            headers={"Referer": url, "Origin": BASE},
+            data={
+                "csrf_token": csrf,
+                "acknowledge_delete_files": "on",
+                "acknowledge_install_break": "on",
+                "acknowledge_no_reupload": "on",
+                "acknowledge_irreversible": "on",
+                "acknowledge_admins_cannot_undo": "on",
+                "confirm_delete_version": version,
+            },
+            headers={"Referer": self._releases_url(), "Origin": BASE},
             timeout=30,
             allow_redirects=True,
         )
+        if "/account/login" in resp.url:
+            raise RuntimeError(
+                "Redirected to the login page mid-run -- the session cookie "
+                "expired. Re-copy it from a logged-in browser and retry."
+            )
+        if _REAUTH_TITLE_RE.search(resp.text):
+            raise ReauthRequired(
+                f"Reauth lapsed while deleting {version} -- re-confirm your "
+                "password/2FA in the browser, re-copy the cookie, and retry."
+            )
         resp.raise_for_status()
         # Warehouse flashes an error (and does NOT delete) if the confirmation
         # value doesn't match, and redirects back to the release page instead
         # of the project page on some failures.
         if "Could not delete release" in resp.text:
             raise RuntimeError(f"Server refused to delete {version} (flash error).")
-        # Confirm it's really gone.
-        check = self.s.get(url, timeout=30, allow_redirects=False)
-        if check.status_code not in (404, 301, 302, 303):
-            # 404 => gone; a redirect to the project page is also acceptable.
-            if check.status_code == 200 and _CSRF_RE.search(check.text):
-                raise RuntimeError(
-                    f"{version} still present after delete attempt (HTTP 200)."
-                )
 
 
 def main(argv=None) -> int:
@@ -225,20 +267,40 @@ def main(argv=None) -> int:
             return 1
 
     session = TestPyPISession(args.cookie, args.project)
-    ok, failed = 0, 0
+    submitted, errored = [], 0
     for v in sorted(to_delete, key=_version_key):
         try:
             session.delete_release(v)
-            print(f"  deleted {v}")
-            ok += 1
+            print(f"  submitted {v}")
+            submitted.append(v)
+        except ReauthRequired as exc:
+            # The whole session shares one fresh-auth window -- once it
+            # lapses, every remaining attempt will fail the same way.
+            print(f"\nERROR: {exc}", file=sys.stderr)
+            break
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"  FAILED  {v}: {exc}", file=sys.stderr)
-            failed += 1
+            errored += 1
         time.sleep(1)  # be polite to the server
 
-    print(f"\nDone. {ok} deleted, {failed} failed. "
-          f"Freed ~{human(freed)} (best case).")
-    return 1 if failed else 0
+    # The old per-version GET used to "confirm" a delete always 404s
+    # regardless of outcome (it's a POST-only route), so verify against the
+    # public JSON API instead -- it's the only reliable signal of what's
+    # actually gone.
+    print("\nVerifying against the public index...")
+    still_present = set(fetch_releases(args.project)) & set(submitted)
+    deleted = [v for v in submitted if v not in still_present]
+
+    print(f"\nDone. {len(deleted)} deleted, {len(still_present)} submitted but "
+          f"still present, {errored} errored outright. "
+          f"Freed ~{human(freed - sum(size_of(v) for v in still_present))} "
+          "(best case).")
+    if still_present:
+        print("Still present despite a submitted delete (reauth likely "
+              "lapsed before the server processed it):", file=sys.stderr)
+        for v in sorted(still_present, key=_version_key):
+            print(f"  {v}", file=sys.stderr)
+    return 1 if (errored or still_present or len(deleted) < len(to_delete)) else 0
 
 
 if __name__ == "__main__":
