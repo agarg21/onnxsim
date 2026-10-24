@@ -849,3 +849,33 @@ the ONNX inputs in graph order (FLOAT or UINT8, exact sizes), leaves out inputs 
 ONNX output as float32 in graph order. `--threads N` overrides the DSP thread count baked into the program. `Summary`
 profiling reports the DSP-side run time; `Detailed` adds one event per kernel call. `onnx-remote-client --compile-run` drives
 compile, `load_compiled` and `run_compiled` against separate compiler and runner endpoints and can compare or dump the outputs.
+
+### v68+ cDSPs (`tghx-v69`: qfloat HVX, HMX)
+
+The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
+magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`), which captures any
+ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
+emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
+lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
+
+```sh
+HMX=1 QDQ_HMX=1 HMX_VTCM_KB=4096 TINYGRAD_ROOT=... HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... \
+onnx-remote-compiler --port 39503 --cache-dir ~/.cache/onnxsim-v69 --target hexagon-v69 \
+  --compiler-id "tinygrad-$(git -C "$TINYGRAD_ROOT" rev-parse --short HEAD)-hmx4096" --command '.../onnx_remote/compile_v69.sh {input} {output} {manifest}'
+CLIENT=build/onnx-remote/onnx-remote-client COMPILER_PORT=39503 .../openpilot_v65/e2e.sh out/onnx-remote-hexagon-worker backbone1.q8.onnx \
+  --input-raw 2:1,480,800,3:img.bin --dump out.bin --iters 5 --profile
+python3 .../onnx_remote/check_outputs.py backbone1.q8.onnx out.bin --input-raw 2:1,480,800,3:img.bin
+```
+
+The compiler service's environment is part of the program, so put it in `--compiler-id`: `HMX=1 QDQ_HMX=1` lowers int8 QDQ
+graphs onto HMX, `HMX_VTCM_KB` sets the tile pool, and `DSP_THREADS` (default 4) sets the HVX thread pool. HMX kernels always
+run on the graph thread. There is no compile-time check, so `check_outputs.py` compares the dumped outputs with
+onnxruntime. Measured on a Xiaomi 12S (V69, 4 threads):
+
+| model | compile (cache miss) | load | run, DSP / RPC-inclusive | vs onnxruntime |
+|---|---:|---:|---:|---|
+| BEVFormer-tiny int8 backbone, one camera (`backbone1.q8.onnx`, HMX) | 171 s | 0.85 s | 312 / 354 ms | 0 of 96000 differ |
+| one 3x3 float conv, 64 -> 64 channels, 30 x 50 | 2 s | 56 ms | 351 / 376 ms | max rel 8.6e-7 |
+
+Models with `GridSample` (BEVFormer's encoder and decoder) don't compile yet: tinygrad's ONNX importer has no `GridSample`.
