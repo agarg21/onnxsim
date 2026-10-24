@@ -112,11 +112,11 @@ def test_emit_linear_u16_equals_the_held_build(shape):
     """Other weights and output calibration: npu_params byte-equal, every
     decoded record equal (segment 0's slot table compared as a set)."""
     held = _tpl(shape, "held")
+    want = gs.load_model(_path(held))  # skips when the build is absent (CI)
     scales, zps = _quant(held)
     out = le.emit_linear_u16(
         gs.load_model(_path(_tpl(shape))), _weights(held, shape), scales, zps
     )
-    want = gs.load_model(_path(held))
     assert _params(out) == _params(want)
     assert set(gs.compare_models(out, want)) <= NOISE
 
