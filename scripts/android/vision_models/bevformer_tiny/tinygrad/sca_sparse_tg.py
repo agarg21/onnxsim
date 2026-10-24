@@ -40,7 +40,12 @@ def sample_entries(value: Tensor, hw: tuple[int, int], ref: Tensor, off: Tensor,
   H, W = hw
   N, R, P = ref.shape[0], ref.shape[1], off.shape[2]
   S = H * W
-  refp = Tensor.stack(*[ref[:, p % R] for p in range(P)], dim=1)                       # (N, P, 2)
+  if getenv("SP_REF_EXPAND", 1) and P % R == 0:
+    # point p uses reference p % R: an expand of the R references P // R times, not a stack (the stack became a chain of
+    # P selects on the point index in the coordinate kernel, which kept it scalar)
+    refp = ref.reshape(N, 1, R, 2).expand(N, P // R, R, 2).reshape(N, P, 2)
+  else:
+    refp = Tensor.stack(*[ref[:, p % R] for p in range(P)], dim=1)                     # (N, P, 2)
   wh = Tensor([float(W), float(H)], dtype=dtypes.float32)
   px = (refp.reshape(N, 1, P, 2) + off / wh) * wh - 0.5                                   # (N, M, P, 2)
   x, y = px[..., 0], px[..., 1]
@@ -105,7 +110,12 @@ def sca_sparse(value: Tensor, hw: tuple[int, int], ref_cam: Tensor, off: Tensor,
   # realized: a lazy INDEX gather feeding the reference stack fails the rangeify verifier (weakint RANGE)
   if not getenv("SP_LAZY_GATHER", 0):   # the realize keeps the INDEX gathers out of the sampler's stack (see above)
     ref_e, off_e, att_e = ref_e.realize(), off_e.realize(), att_e.realize()
-  out_e = sample_entries(value, hw, ref_e, off_e, att_e, mapid).realize()   # once: a lazy output was recomputed per use (the bool-splat fix of the fork exposed it)                          # (N, E)
+  out_e = sample_entries(value, hw, ref_e, off_e, att_e, mapid)
+  # realized once (a lazy output was recomputed per use: the bool-splat fix of the fork exposed it). SP_FLAT_OUT: into a 1-D
+  # buffer of its own. A realized (N, E) output, or even a realized reshape(-1) of it, keeps the (N, M, D) buffer under a
+  # view, and the reduce's gather unwrapped that view on every lane (a % N and a % N*E per lane load): 12.9 -> 8.5 ms
+  if getenv("SP_FLAT_OUT", 1): out_e = Tensor.empty(N * B.E, dtype=dtypes.float32).assign(out_e.reshape(-1)).realize()
+  else: out_e = out_e.realize()
   # reduce: each (camera, query) reads its slot's entry, or the zero row N where the camera does not see it
   if getenv("SP_NOCAT", 1):
     # no zero row (a cat here became a select over every lane of the sampler's output, which the vectorizer cannot
@@ -113,16 +123,17 @@ def sca_sparse(value: Tensor, hw: tuple[int, int], ref_cam: Tensor, off: Tensor,
     iv = inv.cast(dtypes.int32)
     vis_f = (iv < N).cast(dtypes.float32)                                              # (NV, Q)
     rows_i = iv * (iv < N).cast(dtypes.int32)
-    flat32 = _flat(out_e).reshape(N * (B.E // 32), 32)                                  # 32-channel rows
     if getenv("SP_CHUNK", 0):   # slower (103 ms against 50): the stacked gather is kept
       # eight aligned 32-lane gathers stacked over the channel chunks: a 256-lane gather came out as scalar lanes and
       # misaligned vector pieces (the reduce kernel was lane-scalar)
+      flat32 = _flat(out_e).reshape(N * (B.E // 32), 32)                                # 32-channel rows
       chunks = [B.gather_rows(flat32.reshape(-1), rows_i * (B.E // 32) + c, 32) for c in range(B.E // 32)]
       per_cam = Tensor.stack(*chunks, dim=2).reshape(NV, Q, B.E) * vis_f.reshape(NV, Q, 1)
     else:
-      per_cam = B.gather_rows(_flat(out_e), rows_i, B.E).reshape(NV, Q, B.E) * vis_f.reshape(NV, Q, 1)
+      flat_e = out_e if getenv("SP_FLAT_OUT", 1) else _flat(out_e)
+      per_cam = B.gather_rows(flat_e, rows_i, B.E).reshape(NV, Q, B.E) * vis_f.reshape(NV, Q, 1)
     return per_cam.sum(0) * (1.0 / count.maximum(1.0)).reshape(Q, 1)
   zero = Tensor.zeros(1, B.E, dtype=dtypes.float32)
-  out_pad = _flat(Tensor.cat(out_e, zero, dim=0))
+  out_pad = _flat(Tensor.cat(out_e.reshape(N, B.E), zero, dim=0))
   per_cam = B.gather_rows(out_pad, inv.cast(dtypes.int32).reshape(-1), B.E).reshape(NV, Q, B.E)
   return per_cam.sum(0) * (1.0 / count.maximum(1.0)).reshape(Q, 1)

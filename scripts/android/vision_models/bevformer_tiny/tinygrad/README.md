@@ -334,6 +334,54 @@ vectorises across the sample lanes (`msda_taps_hvx`); the generated sampler does
 
 Phone, four threads, qfloat: sparse SCA 98 ms, dense SCA 153 ms (same session, same tables).
 
+### Follow-up: the reduce, not the sampler, was the largest phase (30 -> 17.7 ms)
+
+Re-measured per phase at this branch's head (phone, v69 qfloat, four threads, turbo, `l0_sca`; a phase's time is the
+difference of two prefix runs): coordinates 5.5 ms, sampler 10.2 ms, **reduce 12.9 ms**, everything else 0.9 ms, 29.5 ms
+in all. The reduce gathers one 256-float row per (camera, query) and sums the six cameras; its source showed why it was
+slow:
+
+- **Every lane load unwrapped a view.** The sampler's output was realized as `(N, E)` and gathered through `reshape(-1)`.
+  The buffer underneath is the `(N, M, D)` kernel output, so every one of the 256 lane loads computed a `% N` and a
+  `% N*E` of its index. A realized `reshape(-1)` keeps the same buffer under a view, and clamping the index to the rows
+  (so its range is known) removed only some of the wraps (29.2 -> 29.2 ms). Assigning the output into a fresh 1-D buffer
+  (`SP_FLAT_OUT`, now the default) removes them: reduce 12.9 -> 8.5 ms.
+- **Lane 0 was split from its row.** The row is loaded in two 128-lane chunks. Lane 0's index rendered as `row + chunk`
+  and lanes 1..127 as `(chunk + row) + k`, the same sum with its operands in another order. The fork's `memory_coalescing`
+  keyed load groups on the exact UOp, so lane 0 was a group of its own and each chunk loaded as 1 + 64 + 32 + 16 + 8 + 4 +
+  1 + 1 + 1 misaligned pieces. Fixed in the fork (onnxsim/tinygrad `bevformer-dsp-patches`, commit `7bd278b30`, with a
+  render test that fails without it): the roots of ADDs are now keyed by their sorted terms. Reduce 8.5 -> 0.7 ms.
+- The reference stack (`ref[:, p % R]` for the 8 points) became a chain of 8 selects on the point index in the coordinate
+  kernel; an expand of the 4 references (`SP_REF_EXPAND`, now the default) removes the chain (30.2 -> 29.2 ms).
+
+| sparse SCA, phone, 4 threads | ms (DSP) |
+|---|---:|
+| this branch's head (#2198) | 30.2 |
+| + reference expand | 29.2 |
+| + sampler output in its own 1-D buffer | 25.2 |
+| + fork coalescing fix | **17.7** |
+| hand kernel (`flags 4`, same session) | 4.2 |
+
+All pass the bench client's check (max abs 1.06e-5). The fork fix doesn't change the dense calls: TSA 18.7 -> 18.3 ms,
+dense SCA 84.9 -> 84.7 ms (both pass). The fork's codegen tests (`test/opt/test_gen_float4.py`,
+`test/null/test_uops.py`, `test/null/test_simplify_valid_idx.py`, `test/backend/test_linearizer.py`) give the same result
+with and without it.
+
+Per phase now: coordinates 5.5 ms, sampler 10.5 ms, reduce 0.7 ms. Tried, and not kept:
+
+| change | ms | why it didn't help |
+|---|---:|---|
+| per-tap index and weight tables realized by an elementwise kernel, sampler = loads and multiply-adds | 47-52 | the coordinate table is realized and then read twice (index kernel, weight kernel), and those kernels stayed scalar: the stacked tap axis (4) was upcast as a masked axis, after which the heuristic never widens a unit-stride axis. Forcing a 128-lane upcast for such elementwise kernels vectorized the weight kernel but didn't recover the total |
+| offsets and references realized planar (`(2, N, M, P)`) so x and y are unit stride | 24.5 | the transposing gather costs 6.8 ms and the coordinate kernel stays at 4.9 ms |
+| `HVX_PREFETCH=0` (the sampler's `dcfetch` of row + 2048 is useless for random rows) | 30.0 | no change |
+
+What keeps the coordinate kernel and the sampler scalar is the renderer, not the layout. `floor()` is a `TRUNC`, rendered
+as a scalar bit-manipulating statement expression; the float -> int casts of the tap coordinates become
+`__builtin_convertvector`, which LLVM scalarizes on V69 (no vector sf -> w convert before V73); and the fork's HVX
+re-vectorizer leaves compares and `WHERE` scalar on purpose. The hand kernel does all three on 32 lanes with integer HVX
+ops (magic-number floor with a +-1 fix-up, `vmux` for the bounds). The next step is vector forms of those three in the fork's
+DSP renderer; both `TRUNC` (clear the fraction bits) and the int cast (shift the mantissa) have exact integer-only forms.
+
 ```bash
 # simulator: one binary per prefix, totals per prefix, then the per-phase differences
 GEN=<sca_sparse_capture.py output> TOOLS=<HEXAGON_Tools/19.0.04/Tools> SHIM=<ncurses shim> \
@@ -353,9 +401,12 @@ with or without the fork's interleave rule (`DSP_INTERLEAVE`). An earlier note c
 
 ## Reproduce
 
-Needs the tinygrad fork with DSP support (checkout of `dsp-consolidated`, commit `9a4680353` at the time of
-writing; upstream tinygrad was not tested) on `PYTHONPATH`, `clang-19`, and the msda case directories written by
-`../msda_hvx/split.py dump` (`~/.cache/onnxsim-bevformer/work/msda_io`).
+Needs the tinygrad fork with DSP support (onnxsim/tinygrad branch `bevformer-dsp-patches`, commit `7bd278b30` at the time
+of writing: `dsp-consolidated` at `9a4680353` plus this work's changes; upstream tinygrad was not tested) on `PYTHONPATH`,
+`clang-19`, and the msda case directories written by `../msda_hvx/split.py dump` (`~/.cache/onnxsim-bevformer/work/msda_io`).
+The `*.patch` names in the sections above are the commits on that branch now, not files in this directory. For v69 code,
+capture with `HVX_ARCH=v69 TRACE_ONLY=1`: qemu can't run v69 qfloat, so the capture records the launches only, and the
+phone's check is the correctness test.
 
 ```sh
 export PYTHONPATH=<tinygrad fork>:. CC=/usr/bin/clang-19 PARALLEL=0 CACHELEVEL=0
@@ -364,8 +415,10 @@ python3 check.py encoder --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work --
 G=<scratch>; K=$C/work/msda_io
 python3 capture_msda.py $K/l0_tsa --out $G/gen_l0_tsa
 python3 capture_msda.py $K/l0_sca --out $G/gen_l0_sca
-# with the fork patched: git -C <tinygrad fork> apply <this dir>/rangeify_index_gather.patch
 cd phone && GEN=$G OUT=$G/phone_build RUN=1 FLAGS=1,4,65536 TURBO=1 PHONE_LOCK_OWNER=<branch> ./build.sh
+# the sparse SCA (v69, four threads: flags 0x10000 + 4; the hand kernel is flags 4)
+cd .. && HVX_ARCH=v69 TRACE_ONLY=1 python3 sca_sparse_capture.py $K/l0_sca --out $G/sp/gen_l0_sca
+cd phone && GEN=$G/sp OUT=$G/sp/build TAGS=l0_sca RUN=1 FLAGS=4,65540 TURBO=1 PHONE_LOCK_OWNER=<branch> ./build.sh
 ```
 
 Phone runs go through `~/.cache/android-phone/phone-run` (set by `PHONE_RUN`), so they respect the shared
