@@ -248,3 +248,38 @@ steps. Run on the float reference input, each is within 0.4%..1.8% relative RMS 
 final norm + lm_head (16-bit RoPE, attention and SiLU programs from Pulsar2), the logits
 are within 0.98% relative RMS of float and the top-1 token agrees on 63 of 64 steps (all
 U8: 14.8%, 48 of 64). The card's health check read 0.0 throughout.
+
+## 16-bit single-op programs at a new calibration (`u16_retarget.py`)
+
+```python
+import u16_retarget as ur
+
+q = ur.calibrate(build_dir, "Mul")            # U16 MinMax from the program's samples
+model = ur.retarget(template, "Mul", ur.quant_of(template_dir), q, ("a", "b"))
+```
+
+`retarget` moves a native single-op U16 build (Mul, Add, Div, ReduceMean, Sqrt, Sigmoid,
+Softmax, dynamic MatMul) to another calibration. It finds each calibration record by value:
+an A1 record or `npu_params` word equal to one candidate formula on the template's calibration
+is rewritten with that formula on the target's. QUANT jobs may hold only input fields and
+DEQUANT jobs only output fields. The formulas are the U8 `graph_stitch` rules at 16 bits plus:
+Add's `0x1ea0 = 15 - k` shift with a `Q(15 - k)` offset, the dynamic MatMul lane blocks
+`zp_y, M, zp_y, 256 M`, and a 256-entry u16 Sigmoid table (one entry per 256 input codes).
+Pulsar2 leaves out a write of the value a register already holds; `retarget` drops writes that
+become redundant and re-pads the segment. It refuses a template whose zero points are below 256
+or shared between tensors, because such a template has already left out writes.
+
+`calibrate` reproduces Pulsar2's U16 MinMax on 23 of the 24 checked builds (zero point
+`65535 - rint(hi / s)`; dynamic MatMul inputs signed, `max|x| / 32767.5`). On the 24th, one
+ReduceMean output scale is two ulps off.
+
+Offline (`tests/test_axera_u16_retarget.py`, native builds as local scratch): across 15 op/shape
+groups (the SmolLM2-135M layer-0 programs plus calibration variants), every template-to-target
+pair either equals the native build of the target calibration or is refused for a stated reason.
+
+On the device (AX8850, 2026-10-24), the whole SmolLM2-135M layer 0 + final norm + lm_head ran as
+single-op programs with no Pulsar2 build per calibration. That covers 32 retarget programs, ten
+`emit_linear_u16` linears (RoPE's rotate-half folded into the q and k weights, an exact
+permutation) and two uncalibrated Concat programs. On 64 held-out decode steps, the logits are
+within 0.96% relative RMS of float and the top-1 token agrees on 63 of 64. The card's health
+check read 0.0 throughout.
