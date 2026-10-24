@@ -20,6 +20,7 @@ frames, then exported and run piece by piece on the phone's HTP through QNN.
 | `quantize.py` | int8 QDQ pieces with onnxsim's whole-graph quantizer (`onnxsim.full_qdq`): calibration set, backbone, mixed-precision encoder/decoder policies |
 | `bisect_precision.py`, `bisect_run.sh` | expose chosen intermediates as outputs, run on the HTP, per-tensor cosine vs ORT CPU |
 | `msda_hvx/` | the encoder split around the generic HVX MSDA kernel (`../../msda_hvx/`) and its phone runner: see "Encoder with the sampling on the HVX" below |
+| `tinygrad_port/` | the same encoder in tinygrad (`bevformer_tg.py`), its DSP codegen (`capture_msda.py`) and the phone build that runs the tinygrad MSDA beside the hand kernel: see `tinygrad_port/README.md` |
 
 Reproduce (each heavy step under `systemd-run --user --wait --collect --pipe -p MemoryMax=16G -p MemorySwapMax=0`):
 

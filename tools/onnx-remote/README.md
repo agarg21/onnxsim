@@ -849,3 +849,75 @@ the ONNX inputs in graph order (FLOAT or UINT8, exact sizes), leaves out inputs 
 ONNX output as float32 in graph order. `--threads N` overrides the DSP thread count baked into the program. `Summary`
 profiling reports the DSP-side run time; `Detailed` adds one event per kernel call. `onnx-remote-client --compile-run` drives
 compile, `load_compiled` and `run_compiled` against separate compiler and runner endpoints and can compare or dump the outputs.
+
+### v68+ cDSPs (`tghx-v69`: qfloat HVX, HMX)
+
+The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
+magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `7aa6a2c87` at the time of writing), which captures any
+ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
+emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
+lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
+
+```sh
+HMX=1 QDQ_HMX=1 HMX_VTCM_KB=4096 TINYGRAD_ROOT=... HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... \
+onnx-remote-compiler --port 39503 --cache-dir ~/.cache/onnxsim-v69 --target hexagon-v69 \
+  --compiler-id "tinygrad-$(git -C "$TINYGRAD_ROOT" rev-parse --short HEAD)-hmx4096" --command '.../onnx_remote/compile_v69.sh {input} {output} {manifest}'
+CLIENT=build/onnx-remote/onnx-remote-client COMPILER_PORT=39503 .../openpilot_v65/e2e.sh out/onnx-remote-hexagon-worker backbone1.q8.onnx \
+  --input-raw 2:1,480,800,3:img.bin --dump out.bin --iters 5 --profile
+python3 .../onnx_remote/check_outputs.py backbone1.q8.onnx out.bin --input-raw 2:1,480,800,3:img.bin
+```
+
+The compiler service's environment is part of the program, so put it in `--compiler-id`: `HMX=1 QDQ_HMX=1` lowers int8 QDQ
+graphs onto HMX, `HMX_VTCM_KB` sets the tile pool, and `DSP_THREADS` (default 4) sets the HVX thread pool. HMX kernels always
+run on the graph thread. There is no compile-time check, so `check_outputs.py` compares the dumped outputs with
+onnxruntime. Measured on a Xiaomi 12S (V69, 4 threads):
+
+| model | load | run, DSP / RPC-inclusive | vs onnxruntime |
+|---|---:|---:|---|
+| BEVFormer-tiny int8 backbone, one camera (`backbone1.q8.onnx`, HMX) | 0.81 s | 308 / 347 ms | 0 of 96000 differ |
+| BEVFormer-tiny encoder, 1 layer (`enc1.sim.onnx`, fp32, GridSample) | 0.29 s | 319 / 564 ms | max rel 8.0e-7 |
+| BEVFormer-tiny encoder, 3 layers (`enc3.sim.onnx`) | 0.47 s | 959 / 1198 ms | max rel 3.5e-6 |
+| BEVFormer-tiny decoder (`decoder.sim.onnx`, fp32, 6 GridSamples) | 0.71 s | 1151 / 1234 ms | max rel 3.1e-6 |
+| one 3x3 float conv, 64 -> 64 channels, 30 x 50 | 56 ms | 351 / 376 ms | max rel 8.6e-7 |
+
+The fork's ONNX importer has `GridSample` (2-D bilinear, zero padding) for these. The driver sets layout choices that keep the
+generated kernels' vector lanes on unit-stride axes; each is a tinygrad env flag, off in tinygrad itself, on in
+`dsp_graph_onnx.py` (`FLAG=0` turns one off). Each row shows the cumulative DSP time (decoder / encoder layer / 3-layer
+encoder) after adding that change, in the order they were added:
+
+| change | decoder | encoder layer | 3-layer encoder |
+|---|---:|---:|---:|
+| none (first working build) | 25.4 s | 11.3 s | |
+| `GEMM_PRETRANSPOSE`: constant `transB=1` Gemm weights stored transposed (kept (N, K), the output lanes read them one scalar at a time) | 3.39 s | 0.91 s | 3.55 s |
+| `SOFTMAX_CONTIGUOUS` + `HVX_UPCAST_ODD`: softmax not fused into P @ V; an axis like 900 takes a 100-lane upcast (largest divisor up to the lane budget) instead of 4 lanes, on unit-stride axes only | 1.84 s | 0.96 s | 3.71 s |
+| `MATMUL_CONTIGUOUS` + `TRANSPOSE_CONTIGUOUS`: Gemm products and Transposes realized, so consumers don't read them through strided views | 1.19 s | 0.39 s | 1.23 s |
+| `REDUCE_TWO_STAGE`: last-axis reductions (LayerNorm, softmax) as 32-lane partial sums, then the 32 | 1.12 s | 0.32 s | 0.97 s |
+
+Tried and not kept: `MATMUL_CONTIGUOUS` alone slowed the decoder (1.84 -> 3.18 s: Q @ K^T read K through the transpose view)
+until `TRANSPOSE_CONTIGUOUS` came with it; register blocking over a matmul's rows (5 rows x 128 lanes per step) made the Gemms
+and attention much slower (decoder 7.8 s). The float paths are still far from the hand-written MSDA pipeline
+(`scripts/android/vision_models/bevformer_tiny/msda_hvx`, about 90 ms per frame): the largest kernels now are the
+fp32 Gemms at about 12 GMAC/s.
+
+**fp16 Gemms on the HMX (`GEMM_FP16=1`, opt-in).** In the compiler service's environment, every fp32 Gemm runs on the HMX in
+fp16: the operands are cast to fp16 and padded to whole 32 x 32 tiles, HMX accumulates internally, and the product is rounded
+to fp16 once before the cast back and the bias add in fp32. It changes the numerics, so compare with a looser threshold
+(`check_outputs.py ... --rtol 2e-3`):
+
+| model | fp32 (HVX) | `GEMM_FP16=1` (HMX) | vs onnxruntime with `GEMM_FP16=1` |
+|---|---:|---:|---|
+| decoder | 1151 ms | 581 ms | max rel 6.0e-4, cos 1.000000 |
+| encoder, 1 layer | 319 ms | 143 ms | max rel 3.3e-4, cos 0.9999998 |
+| encoder, 3 layers | 959 ms | 450 ms | max rel 1.2e-3, cos 0.99999994 |
+
+A 2500x256x256 Gemm takes about 1.1 ms this way (0.7 ms of it on the HMX), against about 14 ms on the HVX in fp32. Getting
+there took several fixes in the fork; each of these was slow and/or wrong on the phone:
+- the casts fused into the HMX kernel's tile packing;
+- the cast back fused into its output epilogue;
+- tinygrad's own padding of a tensor-core axis;
+- the pad done in the same kernel as a fused ReLU;
+- the v65 qemu mock's fp16 workarounds leaking into v69 captures.
+
+One bug remains in the fork's HMX lowering: a single 32-row M tile with several K tiles gives wrong results (cos 0.71, in
+hexagon-sim too). `GEMM_FP16` avoids it by padding M to at least 64 rows.

@@ -1,5 +1,6 @@
-// Hexagon cDSP runner for compiled `tghx-v65` artifacts: tinygrad-generated standalone DSP programs made by
-// scripts/android/tinygrad_hexagon_bridge/openpilot_v65/compile_v65.sh behind onnx-remote-compiler.
+// Hexagon cDSP runner for compiled `tghx-v65` / `tghx-v69` artifacts: tinygrad-generated standalone DSP programs made by
+// scripts/android/tinygrad_hexagon_bridge/openpilot_v65/compile_v65.sh (v65: the SDM845 class, runs on newer cDSPs too) or
+// scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh (v68+: qfloat HVX, HMX) behind onnx-remote-compiler.
 //
 // Runs on the Android side of a Snapdragon (FastRPC to the cDSP, unsigned PD). Operations:
 //   capabilities                     the runner manifest
@@ -7,11 +8,13 @@
 //   run_compiled(id, tensors)        ONNX inputs in graph order -> ONNX outputs in graph order (in their program.txt dtypes)
 //                                    a recurrent-state input (program.txt "state") sent empty takes the previous run's output,
 //                                    and that output comes back empty: after the first call the state stays on the phone
-// An artifact is TGHXV65\0, u32 file count, then per file u32 name length, name, u64 size, bytes: tg_graph.so (the skel),
-// blob.bin (weights) and program.txt (the I/O contract; see tinygrad's examples/openpilot/dsp_graph_v65.py).
+// An artifact is TGHX<arch>\0 (TGHXV65\0, TGHXV69\0, ...: the DSP arch the skel is built for; the container and the tg_graph ABI
+// are the same), u32 file count, then per file u32 name length, name, u64 size, bytes: tg_graph.so (the skel), blob.bin (weights)
+// and program.txt (the I/O contract; see tinygrad's examples/openpilot/dsp_graph_v65.py and examples/dsp_graph_onnx.py).
 #include "remote_transport.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -74,11 +77,13 @@ template <typename T> bool take(const std::vector<uint8_t>& b, size_t& at, T& v)
 }
 
 bool unpack(const std::vector<uint8_t>& artifact, std::map<std::string, std::pair<size_t, size_t>>& files, std::string& error) {
-  static const char kMagic[8] = {'T', 'G', 'H', 'X', 'V', '6', '5', '\0'};
+  // TGHXV<two digits>\0: the arch only tells which cDSPs can load the skel (a too-new one fails at FastRPC open)
+  const uint8_t* m = artifact.data();
   size_t at = 8;
   uint32_t count = 0;
-  if (artifact.size() < 12 || std::memcmp(artifact.data(), kMagic, 8) != 0 || !take(artifact, at, count) || count > 16) {
-    error = "not a tghx-v65 artifact";
+  if (artifact.size() < 12 || std::memcmp(m, "TGHXV", 5) != 0 || !std::isdigit(m[5]) || !std::isdigit(m[6]) || m[7] != 0 ||
+      !take(artifact, at, count) || count > 16) {
+    error = "not a tghx artifact";
     return false;
   }
   for (uint32_t i = 0; i < count; ++i) {
@@ -206,7 +211,8 @@ Response execute(const Request& request) {
         "{\"schema_version\":1,\"protocol\":\"onnx-remote-v5\",\"runner_id\":\"hexagon-v65-runner\",\"ready\":true,"
         "\"graph_execution\":false,\"supported_ops\":[\"load_compiled\",\"run_compiled\"],"
         "\"supported_dtypes\":[\"FLOAT\",\"UINT8\"],\"profiling\":true,"
-        "\"artifact\":{\"format\":\"tghx-v65\",\"abi\":\"tg_graph-idl-1\"}}";
+        "\"artifact\":{\"format\":\"tghx-v65\",\"formats\":[\"tghx-v65\",\"tghx-v68\",\"tghx-v69\",\"tghx-v73\",\"tghx-v75\"],"
+        "\"abi\":\"tg_graph-idl-1\"}}";
     return response;
   }
   if (request.op != "load_compiled" && request.op != "run_compiled") {
