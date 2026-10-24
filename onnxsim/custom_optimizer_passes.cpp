@@ -60,6 +60,7 @@
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
+#include "passes/fuse_parallel_matmuls.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
 #include "passes/fuse_qkv.h"
 #include "passes/fuse_reduce_sum_into_conv.h"
@@ -128,6 +129,7 @@
 #include "passes/rewrite_trt_batched_nms.h"
 #include "passes/rewrite_trt_batched_rotated_nms.h"
 #include "passes/split_large_gather.h"
+#include "passes/stable_rms_norm.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
 #include "passes/static_quantize_int16_matmul.h"
@@ -260,6 +262,8 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::NVFP4Quantization>(registry);
     RegisterOrReplace<p::Olive>(registry);
     RegisterOrReplace<p::Pow2ToMul>(registry);
+    RegisterOrReplace<p::StableRMSNorm>(registry);
+    RegisterOrReplace<p::FuseParallelMatMuls>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
