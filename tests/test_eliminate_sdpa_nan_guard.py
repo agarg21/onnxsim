@@ -85,10 +85,19 @@ def _run(model, feeds):
 
 
 def _simplify(model, feeds, **kw):
+    # onnxsim's own check runs with the all-padding row (2) replaced by row 0:
+    # onnxruntime's Softmax over an all -inf row is platform-dependent (see
+    # _assert_matches_guarded), so that row is checked separately.
+    check = {}
+    for k, v in feeds.items():
+        if k not in "qkv":
+            v = v.copy()
+            v[2] = v[0]
+        check[k] = v
     out, ok = onnxsim.simplify(
         model,
         check_n=1,
-        input_data=feeds,
+        input_data=check,
         attention_fusion_backend="none",
         extra_optimizers=[PASS],
         **kw,
