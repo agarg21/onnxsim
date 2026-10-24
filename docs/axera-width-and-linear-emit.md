@@ -214,3 +214,37 @@ exact integer model (`q_x @ q_w`, one requantize per output channel):
 | 576x576 | mean 0.28 output steps, max 8.6 (4 of 46,080 codes saturate) | 100% equal |
 
 The card's health check read 0.0 after each model.
+
+## 16-bit activations (U16 linear layers)
+
+```python
+model = le.emit_linear_u16(template_u16, w, {"x": s_x, "y": s_y}, {"x": zp_x, "y": zp_y})
+```
+
+`template_u16` is a native build with `layer_configs: [{"op_types": ["FullyConnected"],
+"data_type": "U16"}]`. The weights stay s8 per output channel (same codes, same
+bias/multiplier formula); `x` and `y` are 16-bit, zero points `1..65535`. The differences
+from the U8 layer:
+
+| part | U16 rule | status |
+| --- | --- | --- |
+| table | per 32-output group, per input segment: 16 rows of `72·ceil(pairs/18)` bytes, then a 256-byte block (32 biases, 32 multipliers) | fitted |
+| code address | pair `j` at `72·(j//18) + j%18` in its row, high nibble plane at +18, outputs 16..31 at +36, unused slots code 128 | fitted |
+| segments | `k = 576`: one of 288 pairs; `k = 1536`: `[224, 272, 272]` | fitted, no other `k` built |
+| core `0x03d0` | low half = `zp_x` (upper half: mode bits), in segments other than the main engine | fitted on three real-calibration builds |
+| wide output | 576x49152: CORE / DEQUANT pairs after QUANT; only the first DEQUANT writes lanes and `zp_y`; 100-byte IO tail | template self-check |
+
+Checked offline (`tests/test_axera_linear_emit_u16.py`, native builds as local scratch,
+skipped when absent): from a template, held-out weights at 576x192, 576x576, 576x1536 and
+1536x576 give byte-equal `npu_params` and equal records; the three SmolLM2-135M layer-0
+MLP builds calibrated on real activations (another `zp_x`) are equal too; the 576x49152
+layer reproduces its own `npu_params`.
+
+On the device (AX8850, 2026-10-24) the eight SmolLM2-135M layer-0 + post linears were
+emitted at U16 with scales from real decode steps (range x2) and run on 64 held-out decode
+steps. Run on the float reference input, each is within 0.4%..1.8% relative RMS of float
+(the U8 emits of q, k and v, whose inputs carry almost no earlier error, were at
+3.3%..10.6% in the chained run). Chained with the other single-op programs of the layer and the
+final norm + lm_head (16-bit RoPE, attention and SiLU programs from Pulsar2), the logits
+are within 0.98% relative RMS of float and the top-1 token agrees on 63 of 64 steps (all
+U8: 14.8%, 48 of 64). The card's health check read 0.0 throughout.

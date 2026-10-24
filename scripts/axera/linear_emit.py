@@ -552,3 +552,214 @@ def emit_linear_from_samples(
     quants = pfc.calibrate(linear_float_model(w, x, y), {x: list(samples)})
     scales, zero_points, _ = pfc.stitch_calibration(quants, (x, y))
     return emit_linear(model, w, scales, zero_points), scales, zero_points
+
+
+# ---- 16-bit activations (U16) -------------------------------------------------------
+# A linear layer built with ``layer_configs: [{op_types: [FullyConnected], data_type: U16}]``
+# keeps s8 per-channel weights (same codes, same requantization formula) but has its own
+# table layout and two more calibration fields. Fitted on native U16 builds of 576 x 192,
+# 576 x 576, 576 x 1536, 576 x 49152 and 1536 x 576 (template and held-out weights), and on
+# three builds with real-activation calibration (another zp_x); see
+# ``tests/test_axera_linear_emit_u16.py``.
+#
+# * Table: the ``wide`` layout with half-size blocks. Per 32-output group, per input
+#   segment: 16 weight rows of ``72 * ceil(pairs / 18)`` bytes, then the group's 256-byte
+#   requantization block. Input pair ``j`` of a row sits in 72-byte block ``j // 18`` at
+#   ``j % 18``: low-nibble plane at +0, high plane at +18, outputs 16..31 of the group at
+#   +36; unused slots hold code 128.
+# * Segments (input pairs): ``k = 576`` is one segment of 288; ``k = 1536`` is
+#   ``[224, 272, 272]`` (the first holds ``pairs mod 272``). No other ``k`` was built.
+# * IO tail: 40 bytes, 100 for the 49152-wide layer (kept from the template).
+# * Main engine: QUANT and the first DEQUANT job as in the U8 layer, zero points up to
+#   65535; a wide output is split over CORE / DEQUANT pairs whose later DEQUANT jobs reuse
+#   the first one's lanes and zero point.
+# * Core (segments other than the main engine): ``0x03d0`` holds ``zp_x`` in its low half
+#   (the upper half is per-record mode bits), so another input calibration rewrites it.
+
+U16_K = (576, 1536)
+U16_BLOCK = 18  # input pairs per 72-byte block
+U16_SEGMENT = 272  # input pairs per segment (k = 1536)
+U16_TAILS = (40, 100)
+REG_CORE_ZP_X = 0x03D0
+
+
+def u16_segments(k: int) -> list[int]:
+    """Input pairs per segment of a U16 layer."""
+    if k not in U16_K:
+        raise ValueError(
+            f"U16 linear layer with k = {k}: only k in {list(U16_K)} was built"
+        )
+    pairs = k // 2
+    if k == 576:
+        return [pairs]
+    first = pairs % U16_SEGMENT or U16_SEGMENT
+    return [first] + [U16_SEGMENT] * ((pairs - first) // U16_SEGMENT)
+
+
+def _u16_row_bytes(pairs: int) -> int:
+    return 72 * -(-pairs // U16_BLOCK)
+
+
+def u16_layout(k: int) -> tuple[list[int], list[int], int]:
+    """``(segment pairs, segment offsets in a group, group bytes)`` of a U16 layer."""
+    segs, offs, off = u16_segments(k), [], 0
+    for pairs in segs:
+        offs.append(off)
+        off += 16 * _u16_row_bytes(pairs) + 256
+    return segs, offs, off
+
+
+def u16_table_bytes(k: int, n: int) -> int:
+    """Bytes of the U16 weight-and-requantization table (the IO tail excluded)."""
+    if n % 32 or n <= 0:
+        raise ValueError(
+            f"U16 linear layer {k}x{n}: n must be a positive multiple of 32"
+        )
+    return n // 32 * u16_layout(k)[2]
+
+
+def _u16_table(codes, bias, m) -> np.ndarray:
+    n, k = codes.shape
+    segs, offs, g_bytes = u16_layout(k)
+    u16_table_bytes(k, n)
+    ng = n // 32
+    t = np.zeros(ng * g_bytes, np.uint8)
+    o = np.arange(n)
+    g, op = o >> 5, o & 31
+    u = codes.astype(np.int64)
+    rq = np.concatenate(
+        [bias.reshape(ng, 32).view(np.uint8), m.reshape(ng, 32).view(np.uint8)], axis=1
+    )  # [group, 256]
+    start = 0
+    for pairs, off in zip(segs, offs):
+        s1 = _u16_row_bytes(pairs)
+        nslot = -(-pairs // U16_BLOCK) * U16_BLOCK
+        jp = np.arange(nslot)
+        slot = 72 * (jp // U16_BLOCK) + jp % U16_BLOCK
+        ue = np.full((n, nslot), 128, np.int64)
+        uo = np.full((n, nslot), 128, np.int64)
+        ue[:, :pairs] = u[:, 2 * start : 2 * (start + pairs) : 2]
+        uo[:, :pairs] = u[:, 2 * start + 1 : 2 * (start + pairs) : 2]
+        row = s1 * (op & 15) + 36 * ((op >> 4) & 1)
+        for p in (0, 1):
+            byte = (((ue >> (4 * p)) & 15) | (((uo >> (4 * p)) & 15) << 4)).astype(
+                np.uint8
+            )
+            t[
+                (g * g_bytes + off)[:, None]
+                + row[:, None]
+                + slot[None, :]
+                + U16_BLOCK * p
+            ] = byte
+        at = np.arange(ng) * g_bytes + off + 16 * s1
+        t[at[:, None] + np.arange(256)[None, :]] = rq
+        start += pairs
+    return t
+
+
+def linear_params_u16(
+    template_params: bytes,
+    w: np.ndarray,
+    s_x: float,
+    zp_x: int,
+    s_y: float,
+    zp_y: int,
+) -> bytes:
+    """``npu_params`` of a U16 layer for weights ``w [in, out]``; the IO tail is the
+    template's."""
+    w = np.asarray(w, np.float32)
+    if w.ndim != 2:
+        raise ValueError(f"expected weights [in, out], got {w.shape}")
+    k, n = w.shape
+    head = u16_table_bytes(k, n)
+    if len(template_params) - head not in U16_TAILS:
+        raise ValueError(
+            f"the template's npu_params hold {len(template_params)} bytes, a U16 "
+            f"{k}x{n} table {head} plus an IO tail of {' or '.join(map(str, U16_TAILS))}"
+        )
+    codes, s_w = weight_codes(w)
+    bias, m = _requant_f64(codes, s_w, s_x, zp_x, s_y, zp_y)
+    return _u16_table(codes, bias, m).tobytes() + template_params[head:]
+
+
+def emit_linear_u16(
+    template_model,
+    w: np.ndarray,
+    scales: Mapping[str, float],
+    zero_points: Mapping[str, int],
+) -> onnx.ModelProto:
+    """``emit_linear`` for a U16 template (a native U16 build of the same shape):
+    zero points ``1..65535``, the U16 table, and the core's copy of ``zp_x``."""
+    model = gs.load_model(template_model)
+    g = model.graph
+    (_, k), (_, n) = [
+        tuple(d.dim_value for d in v.type.tensor_type.shape.dim)
+        for v in (g.input[0], g.output[0])
+    ]
+    w = np.asarray(w, np.float32)
+    if w.shape != (k, n):
+        raise ValueError(f"the template is {k}x{n}; the weights are {w.shape}")
+    x, y = g.node[0].input[0], g.node[0].output[0]
+    missing = sorted({x, y} - (set(scales) & set(zero_points)))
+    if missing:
+        raise ValueError(f"no scale or zero point for tensors {missing}")
+    s_x, s_y = float(np.float32(scales[x])), float(np.float32(scales[y]))
+    zp_x, zp_y = int(zero_points[x]), int(zero_points[y])
+    if not (0 < zp_x <= 65535 and 0 < zp_y <= 65535):
+        raise ValueError(
+            f"zero points x={zp_x}, y={zp_y}: both must be in 1..65535 (with 0 the "
+            "native program leaves a zero-point write out; never built)"
+        )
+    if not (s_x > 0 and s_y > 0):
+        raise ValueError(f"scales must be positive: x={s_x}, y={s_y}")
+
+    mc = bytes(mre.mcode_initializer(model).raw_data)
+    segs = [gs.records(raw) for raw in suc.decode_segments(mc)]
+    main = segs[gs.MAIN]
+    jobs = _jobs(main)
+    roles = [j[0] for j in jobs]
+    deq = [i for i, r in enumerate(roles) if r == "DEQUANT"]
+    if (
+        roles[:3] != ["PARAM", "QUANT", "PARAM"]
+        or not deq
+        or set(roles[3:]) - {"CORE", "DEQUANT"}
+    ):
+        raise ValueError(f"the template's main-engine jobs are {roles}")
+    for j in deq[1:]:
+        _, a, b, _ = jobs[j]
+        if any(
+            main[i][0] == gs.A1 and gs._reg(main[i]) in (*gs.LANES_LO, gs.REG_ZP_A)
+            for i in range(a, b)
+        ):
+            raise ValueError("a later DEQUANT job writes its own lanes or zero point")
+    _, q0, q1, q_before = jobs[1]
+    zq = [
+        gs._val(main[i])
+        for i in range(q0, q1)
+        if main[i][0] == gs.A1 and gs._reg(main[i]) == gs.REG_ZP_OUT
+    ]
+    if len(zq) != 1:
+        raise ValueError("the template's QUANT job does not write zp_x exactly once")
+    hits = 0
+    for si, seg in enumerate(segs):
+        if si == gs.MAIN:
+            continue
+        for i, r in enumerate(seg):
+            if (
+                r[0] == gs.A1
+                and gs._reg(r) == REG_CORE_ZP_X
+                and gs._val(r) & 0xFFFF == zq[0]
+            ):
+                seg[i] = gs._rec(gs.A1, REG_CORE_ZP_X, (gs._val(r) & 0xFFFF0000) | zp_x)
+                hits += 1
+    if not hits:
+        raise ValueError(
+            f"no core {REG_CORE_ZP_X:#06x} record holds the template's zp_x {zq[0]}"
+        )
+    _, d0, d1, d_before = jobs[deq[0]]
+    _set_job(main, q0, q1, q_before, gs._f32bits(1 / s_x), gs.REG_ZP_OUT, zp_x, "QUANT")
+    _set_job(main, d0, d1, d_before, gs._f32bits(s_y), gs.REG_ZP_A, zp_y, "DEQUANT")
+    out = wr.with_segments(model, segs)
+    params = next(i for i in out.graph.initializer if i.name == "npu_params")
+    params.raw_data = linear_params_u16(bytes(params.raw_data), w, s_x, zp_x, s_y, zp_y)
+    return out
