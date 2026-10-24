@@ -264,3 +264,77 @@ def test_backends_that_cannot_take_the_mask_leave_it_unfused(backend):
         _run(simplified, feeds), _run(model, feeds), rtol=1e-4, atol=1e-5
     )
 
+
+
+def _torch_encoder_classifier(torch):
+    # Hugging Face's eager BERT attention and extended attention mask, in a
+    # few lines: what its PyTorch export emits, without needing transformers.
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q, self.k, self.v, self.o = (torch.nn.Linear(C, C) for _ in range(4))
+            self.ln1, self.ln2 = torch.nn.LayerNorm(C), torch.nn.LayerNorm(C)
+            self.ff1, self.ff2 = torch.nn.Linear(C, F), torch.nn.Linear(F, C)
+
+        def forward(self, x, ext):
+            b, s, _ = x.shape
+
+            def heads(t):
+                return t.view(b, s, H, D).transpose(1, 2)
+
+            q, k, v = heads(self.q(x)), heads(self.k(x)), heads(self.v(x))
+            scores = q @ k.transpose(-1, -2) / D**0.5 + ext
+            ctx = (torch.softmax(scores, -1) @ v).transpose(1, 2).reshape(b, s, C)
+            h = self.ln1(self.o(ctx) + x)
+            return self.ln2(self.ff2(torch.nn.functional.gelu(self.ff1(h))) + h)
+
+    class Classifier(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(VOCAB, C)
+            self.layers = torch.nn.ModuleList(Layer() for _ in range(2))
+            self.head = torch.nn.Linear(C, LABELS)
+
+        def forward(self, input_ids, attention_mask):
+            ext = (1.0 - attention_mask[:, None, None, :].float()) * FINFO_MIN
+            x = self.emb(input_ids)
+            for layer in self.layers:
+                x = layer(x, ext)
+            return torch.softmax(self.head(torch.tanh(x[:, 0])), -1)
+
+    torch.manual_seed(0)
+    return Classifier().eval()
+
+
+def _torch_export(torch, module, path, dynamo):
+    import contextlib
+    import io
+
+    feeds = _feeds()
+    args = tuple(torch.from_numpy(feeds[n]) for n in ("input_ids", "attention_mask"))
+    kwargs = dict(input_names=["input_ids", "attention_mask"], dynamo=dynamo)
+    if dynamo:
+        dims = {0: "batch", 1: "seq"}
+        kwargs.update(opset_version=18, dynamic_shapes={"input_ids": dims, "attention_mask": dims})
+    else:
+        kwargs.update(opset_version=17)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        torch.onnx.export(module, args, str(path), **kwargs)
+    return onnx.load(str(path))
+
+
+@pytest.mark.parametrize("dynamo", [True, False], ids=["dynamo_dynamic", "legacy_static"])
+def test_torch_exported_encoder_classifier(tmp_path, dynamo):
+    torch = pytest.importorskip("torch")
+    if dynamo:
+        pytest.importorskip("onnxscript")
+    module = _torch_encoder_classifier(torch)
+    model = _torch_export(torch, module, tmp_path / "m.onnx", dynamo)
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    _assert_masked_ms_attention(simplified, layers=2)
+    for batch, seq in [(B, S)] + ([(1, 3), (3, 6)] if dynamo else []):
+        feeds = {k: v for k, v in _feeds(batch, seq).items() if k != "token_type_ids"}
+        with torch.no_grad():
+            expected = module(*(torch.from_numpy(feeds[k]) for k in ("input_ids", "attention_mask")))
+        np.testing.assert_allclose(_run(simplified, feeds), expected.numpy(), rtol=1e-4, atol=1e-5)

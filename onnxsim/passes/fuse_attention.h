@@ -347,10 +347,46 @@ inline bool MatchScaledQKMatMul(Value* scores, Value*& q_side, Value*& k_side,
   return true;
 }
 
+// True iff `a` and `b` are the same sequence length: equal static ints, or one
+// symbolic dim_param (ONNX names one dimension value per dim_param).
+inline bool SameSeqDim(const Dimension& a, const Dimension& b) {
+  if (a.is_int && b.is_int) {
+    return a.dim == b.dim && a.dim > 0;
+  }
+  return !a.is_int && !b.is_int && !a.is_unknown && !b.is_unknown &&
+         !a.param.empty() && a.param == b.param;
+}
+
+// A head-split Reshape whose target shape is computed at run time (dynamic
+// batch/sequence exports build it as Concat(Shape(x)[0], Shape(x)[1], H, D)):
+// matched from inferred shapes instead, as [B, S, C] -> [B, S, H, D] with the
+// same B and S dims (equal ints or the same dim_param), static H and D, and
+// H * D == C when C is static. Whatever the target computes, a Reshape with
+// those input and output shapes is exactly the head split.
+inline bool MatchDynamicHeadSplitShape(Node* rs, int64_t& num_heads,
+                                       int64_t& head_size) {
+  Value* in = rs->input(0);
+  Value* out = rs->output();
+  if (!in->has_sizes() || !out->has_sizes() || in->sizes().size() != 3 ||
+      out->sizes().size() != 4) {
+    return false;
+  }
+  const auto& is = in->sizes();
+  const auto& os = out->sizes();
+  if (!SameSeqDim(is[0], os[0]) || !SameSeqDim(is[1], os[1]) ||
+      !os[2].is_int || !os[3].is_int) {
+    return false;
+  }
+  num_heads = os[2].dim;
+  head_size = os[3].dim;
+  return !is[2].is_int || is[2].dim == num_heads * head_size;
+}
+
 // Matches `transposed = Transpose(Reshape(proj_out, [B, S, num_heads,
 // head_size]), want_perm)`, both single-use, extracting num_heads/head_size
-// from the Reshape's constant target-shape input. Appends [transpose,
-// reshape] to `chain` (innermost/closest-to-consumer first).
+// from the Reshape's constant target-shape input (or, for a target computed
+// at run time, from inferred shapes: MatchDynamicHeadSplitShape). Appends
+// [transpose, reshape] to `chain` (innermost/closest-to-consumer first).
 inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
                                     int64_t& head_size, Value*& proj_out,
                                     const std::vector<int64_t>& want_perm,
@@ -372,11 +408,15 @@ inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
     return false;
   }
   std::vector<int64_t> shape;
-  if (!GetValueFromInput(rs->input(1), shape) || shape.size() != 4) {
+  if (GetValueFromInput(rs->input(1), shape)) {
+    if (shape.size() != 4) {
+      return false;
+    }
+    num_heads = shape[2];
+    head_size = shape[3];
+  } else if (!MatchDynamicHeadSplitShape(rs, num_heads, head_size)) {
     return false;
   }
-  num_heads = shape[2];
-  head_size = shape[3];
   if (num_heads <= 0 || head_size <= 0) {
     return false;
   }
@@ -794,16 +834,6 @@ inline bool FromConcat(Value* v) {
     v = v->node()->input(0);
   }
   return CheckKind(v, "Concat");
-}
-
-// True iff `a` and `b` are the same sequence length: equal static ints, or one
-// symbolic dim_param (ONNX names one dimension value per dim_param).
-inline bool SameSeqDim(const Dimension& a, const Dimension& b) {
-  if (a.is_int && b.is_int) {
-    return a.dim == b.dim && a.dim > 0;
-  }
-  return !a.is_int && !b.is_int && !a.is_unknown && !b.is_unknown &&
-         !a.param.empty() && a.param == b.param;
 }
 
 // Integer values of an int64 vector that is constant at match time: an
