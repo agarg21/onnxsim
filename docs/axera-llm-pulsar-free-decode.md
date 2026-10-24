@@ -147,6 +147,7 @@ and after every run.
 | llama-160m | Pulsar2 `llm_build` | 44/47, 1.89% (2.62%) | 46/47, 1.56% (2.03%) | 0.15 |
 | Qwen3-0.6B | Pulsar-free, round-to-nearest | 44/48, 4.4% | 46/48, 4.0% | 0.21-0.22 |
 | Qwen3-0.6B | Pulsar-free, GPTQ | 45/48, 3.36% (5.63%) | 44/48, 2.91% (3.99%) | 0.18 (card 163 ms) |
+| Qwen3-0.6B | Pulsar-free, GPTQ from `pf_gptq.py` | 43/48, 3.29% (5.16%) | 44/48, 2.89% (4.27%) | 0.19 (card 162 ms) |
 | Qwen3-0.6B | Pulsar2 `llm_build` | 45/48, 7.47% (9.73%) | 47/48, 7.27% (9.66%) | 0.29 |
 
 Notes on the table:
@@ -160,6 +161,11 @@ Notes on the table:
   `llm_layer_loop` (K / V caches uploaded per call). That path is slower than its RPC
   path with resident caches (`docs/axera-llm-rpc-decode.md`: Qwen3-0.6B at 224 ms per
   token).
+- **Qwen3 `pf_gptq.py` row.** The programs `pf_generate.py` emits from this repo's
+  `linear_emit.gptq_weight` weights (2026-10-25). The GPTQ row above used the scratch
+  GPTQ loop that `gptq_weight` reimplements. Its adaquant misses are at positions
+  0, 3, 10, 13 and 46, and its activation-memory-planning misses at 0, 13, 28 and 34.
+  Run back to back, both GPTQ sets take 162 ms of card time per token.
 - **Qwen3 round-to-nearest row.** These are the card results reported from the run before
   GPTQ. Its JSON was overwritten by the GPTQ run, so no p90 is given.
 
@@ -210,8 +216,8 @@ llama-160m's host estimate gives 45/47 and 46/47, 1.26% and 1.14%.
 - **GPTQ.** `pf_gptq.py` uses master's `linear_emit.gptq_weight`. That function is a
   reimplementation of the GPTQ loop the card runs used, and about 5% of its codes differ
   by a rounding step. Its host estimate is 44/48 and 45/48, 2.30% and 2.31%, against
-  44/48 and 43/48, 2.38% and 2.42% for the weights that ran on the card. A card run with
-  its weights has not been made.
+  44/48 and 43/48, 2.38% and 2.42% for the scratch weights. On the card its programs
+  give 43/48 and 44/48, 3.29% and 2.89% (the `pf_gptq.py` row of the results table).
 
 ## Limits
 
