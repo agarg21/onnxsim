@@ -114,6 +114,16 @@ def _has_value(model, pred):
     return False
 
 
+def _assert_matches_guarded(got, want):
+    # Rows with a kept key must match bit for bit. The all-padding batch row
+    # (2) must be the guard's zeros; it is checked against 0 rather than the
+    # reference because onnxruntime's Softmax over an all -inf row is
+    # platform-dependent (NaN on x86-64, not NaN on aarch64, where the guard
+    # then lets it through).
+    np.testing.assert_array_equal(got[:2], want[:2])
+    np.testing.assert_array_equal(got[2], 0)
+
+
 @pytest.mark.parametrize("scores_first", [True, False])
 def test_finite_finfo_min_mask_drops_guard(scores_first):
     # The dynamo exporter's form: Where(keep, 0, finfo.min).
@@ -171,17 +181,13 @@ def test_neg_inf_mask_rewritten_exactly(opset, inf_when_true):
     model = _model(_guarded(mask), f"{QKV}, bool[{B},1,1,{S}] {cond}", opset=opset)
     flag = ~KEEP if inf_when_true else KEEP
     feeds = _feeds(**{cond: flag})
-    want = _run(model, feeds)
-    assert not np.isnan(want).any()
-    np.testing.assert_array_equal(want[2], 0)
-
     simp = _simplify(model, feeds)
     ops = _ops(simp)
     assert "IsNaN" not in ops
     assert ("Not" in ops) == inf_when_true
     assert "ReduceMax" in ops
     assert not _has_value(simp, np.isinf)
-    np.testing.assert_array_equal(_run(simp, feeds), want)
+    _assert_matches_guarded(_run(simp, feeds), _run(model, feeds))
 
 
 def test_neg_inf_mask_shared_across_layers():
@@ -211,7 +217,7 @@ def test_neg_inf_mask_shared_across_layers():
     simp = _simplify(model, feeds)
     assert "IsNaN" not in _ops(simp)
     assert not _has_value(simp, np.isinf)
-    np.testing.assert_array_equal(_run(simp, feeds), _run(model, feeds))
+    _assert_matches_guarded(_run(simp, feeds), _run(model, feeds))
 
 
 def test_not_on_by_default():

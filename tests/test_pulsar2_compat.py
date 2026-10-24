@@ -295,9 +295,13 @@ def test_masked_encoder_simplifies_to_ax650_ops():
 
     ids = np.array([[5, 6, 7, 8, 9, 1, 1, 1]], dtype=np.int64)
     for mask in ((ids != 1).astype(np.int64), np.zeros_like(ids)):
-        np.testing.assert_allclose(
-            run(simp, ids, mask), run(model, ids, mask), rtol=1e-5, atol=1e-6
-        )
+        got, want = run(simp, ids, mask), run(model, ids, mask)
+        assert np.isfinite(got).all()
+        # onnxruntime's Softmax over an all -inf row is platform-dependent
+        # (the guard only zeroes it where it comes out NaN), so the
+        # all-padding reference is only comparable where it is finite.
+        if np.isfinite(want).all():
+            np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
 
 
 def test_simplify_kwargs_merges_extra_optimizers():
