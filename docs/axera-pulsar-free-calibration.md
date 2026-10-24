@@ -8,6 +8,8 @@ computed from the float ONNX graph and the calibration samples.
 - Code: `scripts/axera/pulsar_free_calibration.py` (`calibrate`, `stitch_calibration`,
   `calibrate_for_stitch`).
 - Tests (no device): `tests/test_axera_pulsar_free_calibration.py`.
+- The U16 counterpart (`u16_retarget.calibrate` / `calibrate_graph`) calibrates every program
+  of a whole-LLM decode: `docs/axera-llm-pulsar-free-decode.md`.
 - Fixtures: `scripts/axera/fixtures/pulsar_free_calibration/` (129 KB). `index.json`
   holds, per case, the oracle (the resolved `values` / `tensor_configs` entries of the
   native build's `quant_axmodel.json`: scale, zero point, signedness per tensor) and
