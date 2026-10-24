@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `7ad783f96` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `9965bb2dc` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -940,6 +940,25 @@ plain export (`<piece>.sim.onnx`) on the same inputs. With `GEMM_FP16=1` too:
 python3 .../bevformer_tiny/msda_hvx/export_msda_op.py enc3 --ckpt <checkpoint.pth> --work work
 python3 .../onnx_remote/check_outputs.py work/enc3.msda.onnx out.bin --input-raw ... --ref-model work/enc3.sim.onnx --rtol 2e-3
 ```
+
+**Attention on the HMX, with hand-written glue.** With `GEMM_FP16=1`, MatMul (batched too) also takes the fp16 HMX path. That
+alone made the decoder slower (528 -> 1194 ms). The two HMX products of each self-attention layer took 11 ms, but the glue
+around them was generated and slow. Zero-padding the 8 x 900 x 900 probabilities to whole tiles took 129 ms, and the softmax
+read the padded product through a slice view. Two hand-written HVX kernels in the fork replace that glue on the DSP:
+- a row copy for the zero pad;
+- an fp16 softmax: when a last-axis Softmax reads a `GEMM_FP16` product, it runs on the padded fp16 product and writes the
+  padded fp16 probabilities that the next product (P @ V) takes directly.
+
+Each decoder layer's attention glue went from about 45 ms to 3.6 ms:
+
+| model | `onnxsim::MSDA` (above) | + hand attention glue | vs onnxruntime on the plain export |
+|---|---:|---:|---|
+| decoder | 528 ms | 165 ms | max rel 1.4e-3, cos 1.000000 |
+| encoder, 1 layer | 77 ms | 77 ms | max rel 3.3e-4 |
+| encoder, 3 layers | 266 ms | 235 ms | max rel 8.7e-4 |
+
+The softmax computes exp in fp16 and the row sum in qf32. Probabilities below 2^-13 of the row's largest become 0. On
+hexagon-sim its maximum absolute error is 1e-3 against fp32 on the same fp16 inputs.
 
 The capture runs no kernels, so any value the importer reads on the host must exist before the capture. `dsp_graph_onnx.py`
 reads the small constants' values first (Gather indices, Split sizes). Before this, the 3-layer encoder's scalar Gather indices
