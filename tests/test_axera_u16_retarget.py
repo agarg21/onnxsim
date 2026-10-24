@@ -14,6 +14,7 @@ import os
 import sys
 
 import numpy as np
+import onnx
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -274,3 +275,78 @@ def test_sigmoid_table_is_monotonic_and_saturates():
 def test_unknown_op_refused():
     with pytest.raises(ValueError, match="not a retargetable"):
         ur.candidates("Conv", {"x": (1.0, 300), "y": (1.0, 300)}, ("x",))
+
+
+# ---- fused (multi-op) programs: u16_fused/<name>/v0..v3, four calibrations each ----------
+FUSED = {
+    "rms576": "RMSNorm x, g -> y (Mul x*x, ReduceMean, Add eps, Sqrt, Div, Mul gain)",
+    "silu1536": "SiLU gate, up -> y (Sigmoid, Mul, Mul)",
+    "rope576": "RoPE apply q, r, c, sn -> y (Mul, Mul, Add)",
+    "rope192": "RoPE apply at 192",
+}
+FUSED_PAIRS = [(g, t, n) for g in FUSED for t, n in itertools.permutations(range(4), 2)]
+
+
+def _fused(name, i):
+    return f"{B}/u16_fused/{name}/v{i}"
+
+
+@pytest.mark.parametrize("group,t,n", FUSED_PAIRS)
+def test_retarget_graph_equals_the_native_build_or_refuses(group, t, n):
+    td, nd = _fused(group, t), _fused(group, n)
+    template, want = _need(td), gs.load_model(_need(nd))
+    try:
+        got = ur.retarget_graph(
+            template, f"{td}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+        )
+    except ValueError as e:
+        assert any(r in str(e) for r in REFUSALS), e
+        return
+    assert ur.compare(got, want) == []
+
+
+@pytest.mark.parametrize("group", list(FUSED))
+def test_every_fused_group_has_a_working_template(group):
+    ok = 0
+    for t, n in itertools.permutations(range(4), 2):
+        td, nd = _fused(group, t), _fused(group, n)
+        _need(td), _need(nd)
+        try:
+            got = ur.retarget_graph(
+                f"{td}/out/compiled.axmodel",
+                f"{td}/model.onnx",
+                ur.quant_of(td),
+                ur.quant_of(nd),
+            )
+        except ValueError:
+            continue
+        ok += ur.compare(got, gs.load_model(f"{nd}/out/compiled.axmodel")) == []
+    assert ok >= 1
+
+
+@pytest.mark.parametrize("group,i", [(g, i) for g in FUSED for i in range(4)])
+def test_calibrate_graph_reproduces_pulsar2(group, i):
+    """Every zero point equal; scales equal except a fused RMSNorm's inner
+    scales, which can be one float32 ulp off."""
+    d = _fused(group, i)
+    _need(d)
+    mine, native = ur.calibrate_graph(d), ur.quant_of(d)
+    assert set(native) <= set(mine)
+    for t, (s, zp) in native.items():
+        assert mine[t][1] == zp, t
+        ulps = abs(
+            int(np.float32(mine[t][0]).view(np.int32))
+            - int(np.float32(s).view(np.int32))
+        )
+        assert ulps <= (1 if group == "rms576" else 0), (t, mine[t], (s, zp))
+
+
+def test_graph_nodes_reduce_mean_width():
+    model = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> '
+        "g (float[1,576] x) => (float[1,1] y) "
+        "{ sq = Mul(x, x) y = ReduceMean<axes=[-1], keepdims=1>(sq) }"
+    )
+    nodes = ur.graph_nodes(model)
+    assert [n[0] for n in nodes] == ["Mul", "ReduceMean"]
+    assert nodes[1][3] == {"count": 576}
