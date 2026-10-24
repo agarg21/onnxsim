@@ -260,9 +260,11 @@ model = le.emit_linear_u16(template_u16, w_gptq, scales, zero_points)
 round-to-nearest: per output channel `s = max|w| / 127.5`, the largest element's code fixed
 (it sets the scale `weight_codes` recomputes, so it also keeps its float value), every other
 code within +-127 (a -128 elsewhere would become the largest and move the scale). It needs
-no Pulsar2 build. `device` runs the float64 column loop in torch; the codes equal numpy's.
-On a GPU, Qwen3-0.6B's 112 layer linears and its 1024x151936 lm_head take 102 s, against
-minutes on about 22 CPU cores.
+no Pulsar2 build. Without `device` the float64 column loop runs in the C++ extension
+(`gptq_columns`, rows split over 4 threads); `device` runs it in torch. Both give numpy's
+codes. A 16384 x 1024 layer takes 0.60 s in C++ on 4 threads, 0.68 s in torch on a GPU,
+and 2.96 s in numpy with 4 BLAS threads. On a GPU, Qwen3-0.6B's 112 layer linears and its
+1024x151936 lm_head take 102 s, against minutes on about 22 CPU cores in numpy.
 
 On the card (Qwen3-0.6B, Pulsar-free decode, 48 teacher-forced steps per passage, 2026-10-24):
 

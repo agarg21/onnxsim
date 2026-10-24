@@ -275,8 +275,8 @@ def gptq_weight(
     largest element keeps its float value and its code (it sets the scale
     ``weight_codes`` recomputes); every other element is ``code * s`` with
     ``|code| <= 127``, since a -128 elsewhere would become the channel's
-    largest and move the scale. ``device`` (``"cuda"``) runs GPTQ in torch
-    (``onnxsim.gptq``). Qwen3-0.6B on the card: median logit error 4.4% ->
+    largest and move the scale. GPTQ runs in onnxsim's C++ column loop, or
+    in torch on ``device`` (``"cuda"``) (``onnxsim.gptq``). Qwen3-0.6B on the card: median logit error 4.4% ->
     3.4% and 4.0% -> 2.9% on two held-out passages."""
     from onnxsim.gptq import _gptq_quantize_columns
 

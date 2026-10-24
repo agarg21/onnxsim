@@ -3,6 +3,7 @@
  */
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -1304,6 +1306,54 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
+
+  // GPTQ's column loop alone (GptqColumns in gptq_entry.h) on float64
+  // arrays, for onnxsim.gptq._gptq_quantize_columns: w_nk [N, K],
+  // scale_blocks [N, G], hinv [K, K], optional per-element code bounds
+  // lo / hi [N, K]. Returns the [N, K] codes.
+  using F64Array = py::ndarray<const double, py::c_contig, py::device::cpu>;
+  m.def(
+      "gptq_columns",
+      [](F64Array w_nk, F64Array scale_blocks, int64_t quant_block_size,
+         F64Array hinv, int64_t proc_block_size, std::optional<F64Array> lo,
+         std::optional<F64Array> hi, double qmin, double qmax,
+         int num_threads) {
+        if (w_nk.ndim() != 2 || scale_blocks.ndim() != 2 || hinv.ndim() != 2) {
+          throw std::invalid_argument("gptq_columns: arrays must be 2-D");
+        }
+        const int64_t n = static_cast<int64_t>(w_nk.shape(0));
+        const int64_t k = static_cast<int64_t>(w_nk.shape(1));
+        const int64_t groups = static_cast<int64_t>(scale_blocks.shape(1));
+        if (static_cast<int64_t>(scale_blocks.shape(0)) != n ||
+            static_cast<int64_t>(hinv.shape(0)) != k ||
+            static_cast<int64_t>(hinv.shape(1)) != k || quant_block_size <= 0 ||
+            proc_block_size <= 0 || (k - 1) / quant_block_size >= groups ||
+            lo.has_value() != hi.has_value()) {
+          throw std::invalid_argument("gptq_columns: inconsistent shapes");
+        }
+        for (const auto* b : {&lo, &hi}) {
+          if (b->has_value() &&
+              ((*b)->ndim() != 2 || static_cast<int64_t>((*b)->shape(0)) != n ||
+               static_cast<int64_t>((*b)->shape(1)) != k)) {
+            throw std::invalid_argument("gptq_columns: lo / hi must be [N, K]");
+          }
+        }
+        auto* codes = new double[static_cast<size_t>(n * k)];
+        py::capsule owner(
+            codes, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+        {
+          py::gil_scoped_release release;
+          GptqColumns(w_nk.data(), n, k, scale_blocks.data(), groups,
+                      quant_block_size, hinv.data(), proc_block_size,
+                      lo ? lo->data() : nullptr, hi ? hi->data() : nullptr,
+                      qmin, qmax, num_threads, codes);
+        }
+        return py::ndarray<py::numpy, double, py::ndim<2>>(
+            codes, {static_cast<size_t>(n), static_cast<size_t>(k)}, owner);
+      },
+      "w_nk"_a, "scale_blocks"_a, "quant_block_size"_a, "hinv"_a,
+      "proc_block_size"_a, "lo"_a = py::none(), "hi"_a = py::none(),
+      "qmin"_a = -7.0, "qmax"_a = 7.0, "num_threads"_a = 4);
 #endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // GPTAQ (Li, Yin, Lee, Xiao, Panda, 2025): a small, closed-form

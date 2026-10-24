@@ -429,12 +429,71 @@ def test_gptq_code_bounds_equal_to_qmin_qmax_change_nothing():
 def test_gptq_torch_loop_matches_numpy():
     """``device`` runs the same float64 loop in torch: the same codes."""
     torch = pytest.importorskip("torch")
-    from onnxsim.gptq import _gptq_quantize_columns
+    from onnxsim.gptq import (
+        _gptq_columns_numpy,
+        _gptq_quantize_columns,
+        _inverse_hessian_cholesky,
+    )
 
     w, s, h = _columns_case(seed=2)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    a = _gptq_quantize_columns(w, s, w.shape[1], h, 0.01, 32, qmin=-127, qmax=127)
+    full = np.full(w.shape, 127.0)
+    hinv = _inverse_hessian_cholesky(h, 0.01)
+    a = _gptq_columns_numpy(w, s, w.shape[1], hinv, 32, -full, full)
     b = _gptq_quantize_columns(
         w, s, w.shape[1], h, 0.01, 32, qmin=-127, qmax=127, device=device
     )
     assert np.array_equal(a, b)
+
+
+def _cpp_columns():
+    import onnxsim.onnxsim_cpp2py_export as C
+
+    if not hasattr(C, "gptq_columns"):
+        pytest.skip("built without ONNXSIM_NON_CORE_FEATURES")
+    return C.gptq_columns
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_gptq_cpp_columns_match_numpy(bounded):
+    """The C++ column loop (the default without ``device``) gives the numpy
+    loop's codes, with and without per-element bounds."""
+    columns = _cpp_columns()
+    from onnxsim.gptq import _gptq_columns_numpy, _inverse_hessian_cholesky
+
+    w, s, h = _columns_case(n=40, k=96, seed=3)
+    hinv = _inverse_hessian_cholesky(h, 0.01)
+    full = np.full(w.shape, 127.0)
+    keep = np.abs(w) == np.abs(w).max(axis=1, keepdims=True)
+    pinned = np.where(w < 0, -128.0, 127.0)
+    lo = np.where(keep, pinned, -127.0) if bounded else -full
+    hi = np.where(keep, pinned, 127.0) if bounded else full
+    ref = _gptq_columns_numpy(w, s, w.shape[1], hinv, 32, lo, hi)
+    got = (
+        columns(w, s, w.shape[1], hinv, 32, lo, hi)
+        if bounded
+        else columns(w, s, w.shape[1], hinv, 32, qmin=-127.0, qmax=127.0)
+    )
+    assert np.array_equal(got, ref)
+
+
+def test_gptq_cpp_columns_thread_count_changes_nothing():
+    columns = _cpp_columns()
+    from onnxsim.gptq import _inverse_hessian_cholesky
+
+    w, s, h = _columns_case(n=37, k=64, seed=4)
+    hinv = _inverse_hessian_cholesky(h, 0.01)
+    a = columns(w, s, w.shape[1], hinv, 16, num_threads=1)
+    b = columns(w, s, w.shape[1], hinv, 16, num_threads=5)
+    assert np.array_equal(a, b)
+    assert np.abs(a).max() <= 7
+
+
+def test_gptq_cpp_columns_rejects_inconsistent_shapes():
+    columns = _cpp_columns()
+
+    w = np.zeros((4, 8))
+    with pytest.raises(ValueError, match="inconsistent shapes"):
+        columns(w, np.ones((4, 1)), 4, np.eye(8), 4)  # 2 groups needed, 1 given
+    with pytest.raises(ValueError, match=r"lo / hi must be \[N, K\]"):
+        columns(w, np.ones((4, 1)), 8, np.eye(8), 4, np.zeros((4, 4)), np.zeros((4, 4)))
