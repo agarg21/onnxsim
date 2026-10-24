@@ -611,21 +611,24 @@ def emit_linear_from_samples(
 # * Segments (input pairs): ``nseg = ceil(pairs / 288)`` segments, the first holding
 #   ``pairs - 272 * (nseg - 1)`` and the rest 272 each: ``k = 576`` is ``[288]``,
 #   ``768`` is ``[112, 272]``, ``1536`` is ``[224, 272, 272]`` and ``3072`` is
-#   ``[176, 272 x 5]``. Checked (native U16 template / held-out pairs, byte-equal
-#   emits) at those four ``k`` only; at any other ``k`` the template's ``npu_params``
+#   ``[176, 272 x 5]``; Qwen3-0.6B's ``1024`` is ``[240, 272]`` and ``2048`` is
+#   ``[208, 272 x 3]``. Checked (native U16 template / held-out pairs, byte-equal
+#   emits) at those six ``k`` only; at any other ``k`` the template's ``npu_params``
 #   size check (``linear_params_u16``) refuses a layout the rule gets wrong.
-# * IO tail: 40 bytes, 100 for the 49152-wide layer (kept from the template).
+# * IO tail: 40 bytes, 100 for the 49152-wide layer, 180 for Qwen3-0.6B's 1024 x 151936
+#   lm_head (its output split over 9 DEQUANT jobs); kept from the template.
 # * Main engine: QUANT and the first DEQUANT job as in the U8 layer, zero points up to
 #   65535; a wide output is split over CORE / DEQUANT pairs whose later DEQUANT jobs reuse
 #   the first one's lanes and zero point.
 # * Core (segments other than the main engine): ``0x03d0`` holds ``zp_x`` in its low half
 #   (the upper half is per-record mode bits), so another input calibration rewrites it.
 
-U16_K = (576, 768, 1536, 3072)  # input widths the segment rule was checked on
+#: input widths the segment rule was checked on
+U16_K = (576, 768, 1024, 1536, 2048, 3072)
 U16_BLOCK = 18  # input pairs per 72-byte block
 U16_SEGMENT = 272  # input pairs per segment after the first
 U16_FIRST_MAX = 288  # input pairs a single segment holds
-U16_TAILS = (40, 100)
+U16_TAILS = (40, 100, 180)
 REG_CORE_ZP_X = 0x03D0
 
 

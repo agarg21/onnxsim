@@ -162,6 +162,8 @@ def test_segments():
     assert le.u16_segments(768) == [112, 272]
     assert le.u16_segments(1536) == [224, 272, 272]
     assert le.u16_segments(3072) == [176] + [272] * 5
+    assert le.u16_segments(1024) == [240, 272]  # Qwen3-0.6B
+    assert le.u16_segments(2048) == [208] + [272] * 3
     for k in le.U16_K:
         segs = le.u16_segments(k)
         assert sum(segs) == k // 2 and max(segs) <= le.U16_FIRST_MAX

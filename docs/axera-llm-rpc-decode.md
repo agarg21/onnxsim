@@ -479,3 +479,11 @@ the device-to-device copy into an offset of an input buffer, the timings and the
 identity on real layers are still to be checked there (`run_llm_rpc.py` with and without
 `--no-resident-kv` on the same prompt; `--row-copy host` on the worker if the offset copy is
 refused).
+
+### Against a Pulsar-free program set
+
+`scripts/axera/llm_pulsar_free/pf_baseline_llm_build.py` runs an `llm_build` output through
+this loop's `DeviceBackend` (session path) on the teacher-forced steps that
+`docs/axera-llm-pulsar-free-decode.md` uses for its Pulsar-free program sets, as their
+reference point. On those steps, llama-160m's `llm_build` gave 44/47 and 46/47 top-1 at
+1.9% and 1.6% median logit error, and Qwen3-0.6B's 45/48 and 47/48 at 7.5% and 7.3%.

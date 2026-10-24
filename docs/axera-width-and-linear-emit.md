@@ -272,7 +272,7 @@ On the card (Qwen3-0.6B, Pulsar-free decode, 48 teacher-forced steps per passage
 | activation-memory-planning | 46/48, 4.0% | 44/48, 2.9% | 47/48, 7.3% |
 
 The top-1 flips sit at near-ties: in the host estimate, the float model's top two logits are
-0.006-0.2 apart at each of them.
+0.006-0.2 apart at each of them. The pipeline is `docs/axera-llm-pulsar-free-decode.md`.
 
 ## 16-bit single-op programs at a new calibration (`u16_retarget.py`)
 
@@ -330,3 +330,8 @@ whole SmolLM2-135M decode ran on the card (AX8850, 2026-10-24) with every progra
 Teacher-forced on 48 held-out steps of two passages, top-1 agreed with float on 45/48 and 45/48, with
 median logit error 2.0% and 3.5%. Pulsar2's own `llm_build` (s8 weights) on the same steps gave 42/48
 and 42/48, 3.3% and 6.2%. The decode ran at 4.2-4.6 s/token with 915 programs resident.
+
+The same program set, generalized to any llama / qwen3 checkpoint, run as one plan per token with
+fused attention and the K / V caches on the card, is `docs/axera-llm-pulsar-free-decode.md`
+(`scripts/axera/llm_pulsar_free/`): llama-160m and Qwen3-0.6B at 0.12 and 0.18 s/token, with a
+lower logit error than `llm_build` on both (Qwen3-0.6B: 3.4% / 2.9% against 7.5% / 7.3%).

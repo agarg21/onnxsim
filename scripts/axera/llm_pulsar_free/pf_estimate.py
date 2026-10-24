@@ -1,0 +1,202 @@
+"""Host estimate of a model's Pulsar-free program set: the plan's chain, every
+program evaluated as the card runs it (``pf_fake_quant``: inputs / inner
+tensors / outputs rounded at their U16 calibrations, linears with s8
+weights), K / V caches in the plan layout, position 0 skipped when it is zero
+(``zero_pos0``), position ``first_pos`` on the ``first`` set, later positions
+on ``rest``; compared with the float model, teacher-forced.
+
+--float: no rounding anywhere and float weights (a wiring check against
+``Config.float_step``). Ablations: --exact KEYS leaves those programs exact,
+--float-weights KEYS keeps those linears' float weights (activations still
+rounded).
+
+usage: MODEL=llama160m pf_estimate.py [--doc 0] [--prompt 48] [--float]
+       -> <out>/est_doc<d>[_float].json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import pf_layout as lay  # noqa: E402
+import pf_model  # noqa: E402
+from pf_fake_quant import AddEval, FusedEval, LinearEval  # noqa: E402
+
+F32 = np.float32
+
+
+def _exact_linear(w):
+    W = np.asarray(w, np.float64)
+    return lambda x: (np.asarray(x, np.float64) @ W).astype(F32)
+
+
+def _exact_add(a, b):
+    return (a + b).astype(F32)
+
+
+class Chain:
+    """One calibration set's programs as host functions (``root``: where the
+    manifests and the programs' float graphs are, default ``cfg.out``)."""
+
+    def __init__(
+        self, cfg, st, exact=False, exact_keys=(), float_weights=(), root=None
+    ):
+        self.cfg = cfg
+        root = root or cfg.out
+        man = json.load(open(os.path.join(root, f"manifest_{st}.json")))
+        self.f = {}
+        for wh, ents in man.items():
+            li = None if wh == "post" else int(wh[1:])
+            for k, e in ents.items():
+                ex = exact or k in exact_keys
+                if e["kind"] == "fused":
+                    self.f[(wh, k)] = FusedEval(
+                        os.path.join(root, e["model"]),
+                        {} if ex else e["calibration"],
+                        e["signed"],
+                    )
+                elif e["kind"] == "split":
+                    w = cfg.merged_weight(k, li, gptq=False)
+                    if ex:
+                        self.f[(wh, k)] = _exact_linear(w)
+                        continue
+                    _, r = cfg.split_weights(w)
+                    sp = e["split"]
+                    hi = LinearEval(
+                        w, sp["hi"]["calibration"]["x"], sp["hi"]["calibration"]["y"]
+                    )
+                    lo = LinearEval(
+                        r, sp["lo"]["calibration"]["x"], sp["lo"]["calibration"]["y"]
+                    )
+                    ad = AddEval(sp["add"]["calibration"])
+                    self.f[(wh, k)] = (lambda hi, lo, ad: lambda x: ad(hi(x), lo(x)))(
+                        hi, lo, ad
+                    )
+                elif e["kind"] == "linear":
+                    w = cfg.merged_weight(k, li)
+                    if ex:
+                        self.f[(wh, k)] = _exact_linear(w)
+                    else:
+                        c = e["calibration"]
+                        self.f[(wh, k)] = LinearEval(
+                            w, c["x"], c["y"], w8=k not in float_weights
+                        )
+                else:
+                    self.f[(wh, k)] = _exact_add if ex else AddEval(e["calibration"])
+
+    def layer(self, li, x, K, V, p):
+        cfg = self.cfg
+        nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
+
+        def f(k):
+            return self.f[(f"L{li}", k)]
+
+        t = cfg.rope_tiles(p, li)
+        g1, g2 = cfg.gains(li)
+        a = f("n1_rms")(x=f("n1_c")(x=x), g=g1)
+        y5 = f("qkv5")(a)
+        o = lay.offsets(cfg.QKV)
+
+        def sl(k, n):
+            return y5[:, o[k] : o[k] + n]
+
+        qr = f("rq")(
+            q=sl("q_proj", nh * hd), r=sl("q_rot", nh * hd), c=t["cos_q"], sn=t["sin_q"]
+        )
+        if cfg.qk_norm:  # two-pass k norm: kc's u, then qkrope normalizes it exactly
+            uk = f("kc")(
+                x=np.concatenate([sl("k_proj", kvd), sl("k_rot", kvd)], axis=-1)
+            )
+            kr = f("rk")(q=uk[:, :kvd], r=uk[:, kvd:], c=t["cos_k"], sn=t["sin_k"])
+        else:
+            kr = f("rk")(
+                q=sl("k_proj", kvd), r=sl("k_rot", kvd), c=t["cos_k"], sn=t["sin_k"]
+            )
+        K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
+        att = f("attn")(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
+        x1 = f("res1")(x, f("o_proj")(att))
+        m = f("n2_rms")(x=f("n2_c")(x=x1), g=g2)
+        gu = f("gu")(m)
+        og = lay.offsets(cfg.GU)
+        gate = gu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
+        up = gu[:, og["up_proj"] : og["up_proj"] + cfg.I]
+        act = f("silu_f")(gate=gate, up=up)
+        return f("res2")(x1, f("down_proj")(act))
+
+    def post(self, x):
+        u = self.f[("post", "nf_c")](x=x)
+        xn = self.f[("post", "nf_rms")](x=u, g=self.cfg.ln_f)
+        return self.f[("post", "lm_head")](xn).reshape(-1)
+
+
+def run(cfg, ids, chains) -> list[dict]:
+    """Teacher-forced steps over ``ids``; one row per step vs ``float_step``."""
+    K = [np.zeros((cfg.S + 1, cfg.kvd), F32) for _ in range(cfg.L)]
+    V = [np.zeros((cfg.S + 1, cfg.kvd), F32) for _ in range(cfg.L)]
+    fK, fV = cfg.new_cache()
+    rows = []
+    for p, tok in enumerate(ids):
+        if p == 0 and cfg.zero_pos0:
+            continue  # zero end to end (the float caches stay zero there too)
+        flg, _ = cfg.float_step(fK, fV, tok, p)
+        c = chains["first" if p == cfg.first_pos else "rest"]
+        x = cfg.model.embed([int(tok)]).reshape(1, cfg.H).astype(F32)
+        for li in range(cfg.L):
+            x = c.layer(li, x, K[li], V[li], p)
+        lg = c.post(x)
+        rows.append(
+            dict(
+                p=p,
+                top1=int(lg.argmax()),
+                float_top1=int(np.argmax(flg)),
+                rel=lay.rel_err(lg, flg),
+            )
+        )
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--doc", type=int, default=0)
+    ap.add_argument("--prompt", type=int, default=48)
+    ap.add_argument("--float", action="store_true")
+    ap.add_argument(
+        "--exact", default="", help="comma-separated program keys left exact"
+    )
+    ap.add_argument("--float-weights", default="", help="comma-separated linear keys")
+    a = ap.parse_args()
+    cfg = pf_model.load()
+    ids = cfg.passage_ids(lay.EVAL_DOCS[a.doc])[: a.prompt]
+    keys = set(filter(None, a.exact.split(",")))
+    fw = set(filter(None, a.float_weights.split(",")))
+    chains = {st: Chain(cfg, st, a.float, keys, fw) for st in ("first", "rest")}
+    rows = run(cfg, ids, chains)
+    res = dict(
+        model=cfg.name,
+        doc=lay.EVAL_DOCS[a.doc],
+        float=a.float,
+        **lay.summarize(rows),
+        steps=rows,
+    )
+    json.dump(
+        res,
+        open(
+            os.path.join(cfg.out, f"est_doc{a.doc}{'_float' if a.float else ''}.json"),
+            "w",
+        ),
+        indent=1,
+    )
+    print({k: v for k, v in res.items() if k != "steps"})
+
+
+if __name__ == "__main__":
+    main()
