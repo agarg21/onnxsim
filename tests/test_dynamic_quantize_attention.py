@@ -176,3 +176,28 @@ def test_quantize_attention_declines_old_opset():
     ops = _op_counts(quant)
     assert ops["Attention"] == 1
     assert ops["QAttention"] == 0
+
+
+def test_quantize_attention_declines_attention_bias():
+    # fuse_attention.h passes a run-time padding mask as input 5
+    # (attention_bias, with mask_index/past empty). QAttention has no such
+    # input, so quantizing would drop the mask: the node must stay float.
+    B, S, H, NH = 2, 5, 32, 4
+    rng = np.random.default_rng(0)
+    wqkv = _f32(rng.standard_normal((H, H * 3)) * 0.1, "wqkv")
+    bqkv = _f32(rng.standard_normal(H * 3) * 0.1, "bqkv")
+    model = _model(
+        f"""
+        g (float[{B},{S},{H}] x, float[{B},1,{S},{S}] bias) => (float[{B},{S},{H}] y)
+        {{
+          y = com.microsoft.Attention<num_heads = {NH}, qkv_hidden_sizes = [{H}, {H}, {H}]>(x, wqkv, bqkv, , , bias)
+        }}
+        """,
+        [wqkv, bqkv],
+    )
+    quant = onnxsim.quantize_attention_dynamic(model)
+    ops = _op_counts(quant)
+    assert ops["Attention"] == 1
+    assert ops["QAttention"] == 0
+    (attn,) = [n for n in quant.graph.node if n.op_type == "Attention"]
+    assert attn.input[5] == "bias"

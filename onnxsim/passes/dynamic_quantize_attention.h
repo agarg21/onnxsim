@@ -86,9 +86,21 @@ namespace ONNX_NAMESPACE {
 namespace optimization {
 namespace onnxsim_passes {
 
+// Only the plain 3-input (input, weights, bias) form: QAttention has no
+// `attention_bias` input, so an Attention carrying fuse_attention.h's padding
+// mask (input 5, with mask_index/past omitted) is left as it is rather than
+// quantized with its mask dropped.
 inline bool IsAttentionOp(Node* n) {
-  return CheckKind(n, "Attention") && n->has_domain() &&
-         n->domain() == "com.microsoft";
+  if (!CheckKind(n, "Attention") || !n->has_domain() ||
+      n->domain() != "com.microsoft") {
+    return false;
+  }
+  for (size_t i = 3; i < n->inputs().size(); ++i) {
+    if (n->input(i)->node()->kind() != kUndefined) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Verifies `attn`'s own `qkv_hidden_sizes` attribute (fuse_attention.h

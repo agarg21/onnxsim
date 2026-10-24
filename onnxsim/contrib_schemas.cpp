@@ -627,12 +627,13 @@ OpSchema MakeMatMulIntegerToFloatSchema() {
 
 // Real ONNX Runtime multi-head self-/cross-attention op (docs/
 // ContribOperators.md, onnxruntime/core/graph/contrib_ops/contrib_defs.cc).
-// Registered here so fuse_attention.h's fused output -- which only ever
-// emits inputs 0-2 (input, weights, bias) and attrs num_heads/scale/
-// qkv_hidden_sizes -- passes the ONNX checker and shape-inference sweeps the
-// rest of onnxsim's pipeline runs after any Fuse pass fires; the remaining
-// attrs/inputs (do_rotary, past/present KV cache, attention_bias,
-// mask_index, rotary_embedding_dim, past_present_share_buffer) are declared
+// Registered here so fuse_attention.h's fused output -- which emits inputs
+// 0-2 (input, weights, bias), input 5 (attention_bias, for a run-time padding
+// mask, with 3-4 left empty) and attrs num_heads/scale/qkv_hidden_sizes --
+// passes the ONNX checker and shape-inference sweeps the rest of onnxsim's
+// pipeline runs after any Fuse pass fires; the remaining attrs/inputs
+// (do_rotary, past/present KV cache, mask_index, rotary_embedding_dim,
+// past_present_share_buffer) are declared
 // for schema completeness/compatibility with externally-authored models,
 // not because this pass ever produces them.
 OpSchema MakeAttentionSchema() {
