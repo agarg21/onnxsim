@@ -266,9 +266,12 @@ def test_backends_that_cannot_take_the_mask_leave_it_unfused(backend):
 
 
 
-def _torch_encoder_classifier(torch):
-    # Hugging Face's eager BERT attention and extended attention mask, in a
-    # few lines: what its PyTorch export emits, without needing transformers.
+def _torch_encoder_classifier(torch, sdpa):
+    # Hugging Face's BERT attention and padding mask, in a few lines: what its
+    # PyTorch export emits, without needing transformers. Eager attention adds
+    # the finfo.min extended mask to the scores; SDPA (transformers' default)
+    # takes a bool mask, which the exporters turn into an additive one plus a
+    # Where(IsNaN(P), 0, P) guard after the Softmax.
     class Layer(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -283,8 +286,14 @@ def _torch_encoder_classifier(torch):
                 return t.view(b, s, H, D).transpose(1, 2)
 
             q, k, v = heads(self.q(x)), heads(self.k(x)), heads(self.v(x))
-            scores = q @ k.transpose(-1, -2) / D**0.5 + ext
-            ctx = (torch.softmax(scores, -1) @ v).transpose(1, 2).reshape(b, s, C)
+            if sdpa:
+                ctx = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=ext
+                )
+            else:
+                scores = q @ k.transpose(-1, -2) / D**0.5 + ext
+                ctx = torch.softmax(scores, -1) @ v
+            ctx = ctx.transpose(1, 2).reshape(b, s, C)
             h = self.ln1(self.o(ctx) + x)
             return self.ln2(self.ff2(torch.nn.functional.gelu(self.ff1(h))) + h)
 
@@ -296,7 +305,10 @@ def _torch_encoder_classifier(torch):
             self.head = torch.nn.Linear(C, LABELS)
 
         def forward(self, input_ids, attention_mask):
-            ext = (1.0 - attention_mask[:, None, None, :].float()) * FINFO_MIN
+            if sdpa:
+                ext = attention_mask[:, None, None, :].bool()
+            else:
+                ext = (1.0 - attention_mask[:, None, None, :].float()) * FINFO_MIN
             x = self.emb(input_ids)
             for layer in self.layers:
                 x = layer(x, ext)
@@ -323,18 +335,31 @@ def _torch_export(torch, module, path, dynamo):
     return onnx.load(str(path))
 
 
+@pytest.mark.parametrize("sdpa", [False, True], ids=["eager", "sdpa"])
 @pytest.mark.parametrize("dynamo", [True, False], ids=["dynamo_dynamic", "legacy_static"])
-def test_torch_exported_encoder_classifier(tmp_path, dynamo):
+def test_torch_exported_encoder_classifier(tmp_path, dynamo, sdpa):
     torch = pytest.importorskip("torch")
     if dynamo:
         pytest.importorskip("onnxscript")
-    module = _torch_encoder_classifier(torch)
+    module = _torch_encoder_classifier(torch, sdpa)
     model = _torch_export(torch, module, tmp_path / "m.onnx", dynamo)
     simplified, ok = onnxsim.simplify(model)
     assert ok
     _assert_masked_ms_attention(simplified, layers=2)
-    for batch, seq in [(B, S)] + ([(1, 3), (3, 6)] if dynamo else []):
-        feeds = {k: v for k, v in _feeds(batch, seq).items() if k != "token_type_ids"}
+    cases = [_feeds()] + ([_feeds(1, 3), _feeds(3, 6)] if dynamo else [])
+    for feeds in cases:
+        feeds = {k: feeds[k] for k in ("input_ids", "attention_mask")}
         with torch.no_grad():
-            expected = module(*(torch.from_numpy(feeds[k]) for k in ("input_ids", "attention_mask")))
-        np.testing.assert_allclose(_run(simplified, feeds), expected.numpy(), rtol=1e-4, atol=1e-5)
+            expected = module(*(torch.from_numpy(feeds[k]) for k in feeds))
+        np.testing.assert_allclose(
+            _run(simplified, feeds), expected.numpy(), rtol=1e-4, atol=1e-5
+        )
+    # An all-padding row: with the legacy SDPA export's -inf mask its
+    # probabilities are NaN, which the exported guard turns into zeros, and so
+    # must the fused graph. (Compared with the export rather than torch, whose
+    # kernels and exporters disagree on such a row.)
+    feeds = {k: v for k, v in _feeds().items() if k != "token_type_ids"}
+    feeds["attention_mask"][-1] = 0
+    expected = _run(model, feeds)
+    assert not np.isnan(expected).any()
+    np.testing.assert_allclose(_run(simplified, feeds), expected, rtol=1e-4, atol=1e-5)

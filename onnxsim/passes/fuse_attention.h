@@ -104,7 +104,18 @@
 // used when the ai.onnx one cannot be: below opset 23, or when the backend
 // excludes it (`ort_contrib`). `webgpu` never gets it (its kernel rejects
 // mask inputs), and constant masks keep their existing handling.
+//
+// Real PyTorch exports of such encoders (Hugging Face BERT, RoBERTa,
+// DistilBERT, ELECTRA, ...) spell the block in a few more ways, all matched:
+// a head-split Reshape whose target is computed at run time (dynamic batch/
+// sequence; MatchDynamicHeadSplitShape) or is the legacy exporter's folded
+// [B, S, -1, D]; the dynamo exporter's K-transpose round trip with
+// Shape-derived targets (MatchDynamicKSwapTargets); and the
+// `Where(IsNaN(P), 0, P)` guard `scaled_dot_product_attention` puts after
+// the Softmax (MatchNanGuardedSoftmax), re-applied to the fused output so an
+// all-padding row still comes out as zeros.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -387,11 +398,15 @@ inline bool MatchDynamicHeadSplitShape(Node* rs, int64_t& num_heads,
 // from the Reshape's constant target-shape input (or, for a target computed
 // at run time, from inferred shapes: MatchDynamicHeadSplitShape). Appends
 // [transpose, reshape] to `chain` (innermost/closest-to-consumer first).
+//
+// `uses` is how many uses `transposed` must have: 1, unless the caller also
+// tears down another consumer of it (MatchKTransposeSwapChain's Shape).
 inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
                                     int64_t& head_size, Value*& proj_out,
                                     const std::vector<int64_t>& want_perm,
-                                    std::vector<Node*>& chain) {
-  if (!CheckKind(transposed, kTranspose) || transposed->uses().size() != 1) {
+                                    std::vector<Node*>& chain,
+                                    size_t uses = 1) {
+  if (!CheckKind(transposed, kTranspose) || transposed->uses().size() != uses) {
     return false;
   }
   Node* tr = transposed->node();
@@ -414,6 +429,16 @@ inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
     }
     num_heads = shape[2];
     head_size = shape[3];
+    // A -1 (inferred) or 0 (copied) entry, as in the legacy exporter's
+    // [B, S, -1, D] once its shape arithmetic is folded: the value is the
+    // Reshape output's inferred size.
+    const Value* out = rs->output();
+    if ((num_heads <= 0 || head_size <= 0) && out->has_sizes() &&
+        out->sizes().size() == 4 && out->sizes()[2].is_int &&
+        out->sizes()[3].is_int) {
+      num_heads = out->sizes()[2].dim;
+      head_size = out->sizes()[3].dim;
+    }
   } else if (!MatchDynamicHeadSplitShape(rs, num_heads, head_size)) {
     return false;
   }
@@ -423,6 +448,117 @@ inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
   proj_out = rs->input(0);
   chain.push_back(tr);
   chain.push_back(rs);
+  return true;
+}
+
+// Whether `v` is Slice(Shape(of), ...) selecting exactly dims [lo, hi) of the
+// rank-`rank` value `of`, with Shape's own start/end attributes and Slice's
+// negative or clamped bounds resolved (axes, if given, must be [0] and steps
+// [1]).
+inline bool IsShapeDimsSlice(Value* v, Value* of, int64_t rank, int64_t lo,
+                             int64_t hi) {
+  if (!CheckKind(v, kSlice)) {
+    return false;
+  }
+  Node* sl = v->node();
+  const auto& ins = sl->inputs();
+  if (ins.size() < 3 || !CheckKind(ins[0], "Shape") ||
+      ins[0]->node()->input(0) != of) {
+    return false;
+  }
+  auto clamp = [](int64_t i, int64_t n) {
+    if (i < 0) {
+      i += n;
+    }
+    return std::min(std::max<int64_t>(i, 0), n);
+  };
+  Node* shape = ins[0]->node();
+  const int64_t s0 = clamp(
+      GetValueFromAttrWithDefault(shape, kstart, int64_t(0)), rank);
+  const int64_t e0 =
+      clamp(GetValueFromAttrWithDefault(shape, kend, rank), rank);
+  std::vector<int64_t> starts, ends, axes, steps;
+  if (!GetValueFromInput(ins[1], starts) || !GetValueFromInput(ins[2], ends) ||
+      starts.size() != 1 || ends.size() != 1) {
+    return false;
+  }
+  if (ins.size() > 3 && ins[3]->node()->kind() != kUndefined &&
+      (!GetValueFromInput(ins[3], axes) || axes != std::vector<int64_t>{0})) {
+    return false;
+  }
+  if (ins.size() > 4 && ins[4]->node()->kind() != kUndefined &&
+      (!GetValueFromInput(ins[4], steps) || steps != std::vector<int64_t>{1})) {
+    return false;
+  }
+  const int64_t len = std::max<int64_t>(e0 - s0, 0);
+  return s0 + clamp(starts[0], len) == lo && s0 + clamp(ends[0], len) == hi;
+}
+
+// Whether `v` is a constant int64 vector equal to `want`.
+inline bool IsConstInts(Value* v, const std::vector<int64_t>& want) {
+  std::vector<int64_t> got;
+  return GetValueFromInput(v, got) && got == want;
+}
+
+// The structural form of MatchKTransposeSwapChain's shape check, for when
+// shape inference could not resolve the intermediate sizes (a dynamic batch or
+// sequence length through the 3-D round trip): with `h` the [B, H, S, D] head
+// split, the first target must be Concat([-1], Shape(h)[2:3], [D]) -- which
+// keeps (S, D) and merges B*H -- and the second Concat(Shape(h)[0:2], [D],
+// Shape(h)[2:3]), which restores B and H in order with the last two swapped.
+// The Shape, Slices and Concats must have no other consumers, as the fusion
+// removes them with the chain: on success `bookkeeping` lists them in destroy
+// order (Concats, then Slices, then the Shape) and `head_size` is D.
+inline bool MatchDynamicKSwapTargets(Value* h, Value* inner_target,
+                                     Value* outer_target, int64_t& head_size,
+                                     std::vector<Node*>& bookkeeping) {
+  if (!CheckKind(inner_target, kConcat) || !CheckKind(outer_target, kConcat) ||
+      inner_target->uses().size() != 1 || outer_target->uses().size() != 1) {
+    return false;
+  }
+  const auto& in = inner_target->node()->inputs();
+  const auto& out = outer_target->node()->inputs();
+  std::vector<int64_t> d;
+  if (in.size() != 3 || out.size() != 3 || !GetValueFromInput(in[2], d) ||
+      d.size() != 1 || d[0] <= 0) {
+    return false;
+  }
+  head_size = d[0];
+  if (!IsConstInts(in[0], {-1}) || !IsShapeDimsSlice(in[1], h, 4, 2, 3) ||
+      !IsShapeDimsSlice(out[0], h, 4, 0, 2) ||
+      !IsConstInts(out[1], {head_size}) ||
+      !IsShapeDimsSlice(out[2], h, 4, 2, 3)) {
+    return false;
+  }
+  // Each Slice may only feed these two Concats, and the Shape only the Slices.
+  std::vector<Node*> slices;
+  for (Value* sv : {in[1], out[0], out[2]}) {
+    if (std::find(slices.begin(), slices.end(), sv->node()) == slices.end()) {
+      slices.push_back(sv->node());
+    }
+  }
+  Node* shape = slices[0]->input(0)->node();
+  for (Node* sl : slices) {
+    if (sl->input(0)->node() != shape) {
+      return false;
+    }
+    for (const Use& u : sl->output()->uses()) {
+      if (u.user != inner_target->node() && u.user != outer_target->node()) {
+        return false;
+      }
+    }
+  }
+  if (shape->output()->uses().size() != slices.size()) {
+    return false;
+  }
+  for (const Use& u : shape->output()->uses()) {
+    if (std::find(slices.begin(), slices.end(), u.user) == slices.end()) {
+      return false;
+    }
+  }
+  bookkeeping = {outer_target->node(), inner_target->node()};
+  bookkeeping.insert(bookkeeping.end(), slices.begin(), slices.end());
+  bookkeeping.push_back(shape);
   return true;
 }
 
@@ -458,8 +594,10 @@ inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
 // own: a chain that merges a *different* pair of leading dims (or merges in
 // the opposite order) can still land on the same final 4-D shape by
 // coincidence while actually computing a different permutation of the
-// underlying data. Declines (rather than guessing) whenever any shape isn't
-// statically known.
+// underlying data. When the shapes are not statically known (a dynamic batch
+// or sequence length), the two targets are instead decoded structurally as
+// the exact Shape-derived Concats the dynamo exporter emits (see
+// MatchDynamicKSwapTargets); anything else declines rather than guessing.
 inline bool MatchKTransposeSwapChain(Value* k_side, int64_t& num_heads,
                                      int64_t& head_size, Value*& proj_out,
                                      std::vector<Node*>& chain) {
@@ -490,6 +628,25 @@ inline bool MatchKTransposeSwapChain(Value* k_side, int64_t& num_heads,
   }
   Value* headsplit_out = inner_rs->input(0);
   std::vector<Node*> headsplit_chain;
+  std::vector<Node*> bookkeeping;
+  int64_t swap_head_size = 0;
+  if (MatchDynamicKSwapTargets(headsplit_out, inner_rs->input(1),
+                               outer_rs->input(1), swap_head_size,
+                               bookkeeping)) {
+    // The head split's own uses are the inner Reshape and the Shape.
+    if (!MatchAttentionHeadSplit(headsplit_out, num_heads, head_size, proj_out,
+                                 {0, 2, 1, 3}, headsplit_chain, 2) ||
+        head_size != swap_head_size) {
+      return false;
+    }
+    // Destroy order: each node after every consumer of its output.
+    chain.push_back(outer_rs);
+    chain.push_back(swap_tr);
+    chain.push_back(inner_rs);
+    for (Node* nd : bookkeeping) chain.push_back(nd);
+    for (Node* nd : headsplit_chain) chain.push_back(nd);
+    return true;
+  }
   if (!MatchAttentionHeadSplit(headsplit_out, num_heads, head_size, proj_out,
                                {0, 2, 1, 3}, headsplit_chain)) {
     return false;
@@ -581,6 +738,9 @@ struct AttentionMatch {
   // Q@K^T and the Softmax, when the caller allowed one; nullptr otherwise.
   // Not validated by MatchAttention itself: see MatchAttentionBias.
   Value* attention_bias = nullptr;
+  // The zero of a `Where(IsNaN(P), 0, P)` guard between the Softmax and the
+  // V MatMul (see MatchNanGuardedSoftmax); nullptr when there is none.
+  Value* nan_guard_zero = nullptr;
   // Every node strictly upstream of `n` (the ctx-producing Reshape the pass
   // anchors on) down to, but not including, the QKV inputs/weights,
   // ordered innermost (closest to `n`) first, so destroying them in this
@@ -590,6 +750,39 @@ struct AttentionMatch {
   // runTransform), the same idiom fuse_rms_norm.h uses for its own anchor.
   std::vector<Node*> dead_chain;
 };
+
+// Matches `p = Where(IsNaN(sm), 0, sm)` for a Softmax output `sm` used only by
+// that IsNaN and Where: the guard PyTorch's scaled_dot_product_attention
+// export puts after the Softmax, which zeroes the NaN rows a fully -inf
+// masked row produces. Returns `sm` and sets `zero` to the scalar 0 constant,
+// appending [Where, IsNaN] to `chain` in destroy order; nullptr otherwise.
+inline Value* MatchNanGuardedSoftmax(Value* p, Value*& zero,
+                                     std::vector<Node*>& chain) {
+  if (!CheckKind(p, "Where") || p->uses().size() != 1 ||
+      p->node()->inputs().size() != 3) {
+    return nullptr;
+  }
+  Node* where = p->node();
+  Value* sm = where->input(2);
+  Value* isnan = where->input(0);
+  if (!CheckKind(sm, kSoftmax) || !CheckKind(isnan, "IsNaN") ||
+      isnan->uses().size() != 1 || isnan->node()->input(0) != sm ||
+      sm->uses().size() != 2) {
+    return nullptr;
+  }
+  const Tensor* z = FetchConstantTensor(where->input(1));
+  if (z == nullptr || z->elem_type() != TensorProto_DataType_FLOAT) {
+    return nullptr;
+  }
+  const std::vector<float> zv = ReadFloatTensorFlat(*z);
+  if (zv.size() != 1 || zv[0] != 0.0f) {
+    return nullptr;
+  }
+  zero = where->input(1);
+  chain.push_back(where);
+  chain.push_back(isnan->node());
+  return sm;
+}
 
 // Anchors on `n` = the Reshape that produces `ctx` (the attention context,
 // [B,S,H*D]) -- i.e. Reshape(Transpose(V_mm_out, [0,2,1,3]), [B,S,H*D]) --
@@ -601,6 +794,8 @@ struct AttentionMatch {
 // With `allow_mask`, the Softmax input may also be Add(scores, mask) for any
 // `mask` operand: it is recorded in `m.attention_bias` and left for the caller
 // to validate (MatchAttentionBias), since that needs helpers defined below.
+// A masked Softmax output may also go through MatchNanGuardedSoftmax's guard,
+// which the caller re-applies to the fused output (see FuseAttention).
 inline bool MatchAttention(Node* n, AttentionMatch& m,
                            bool allow_mask = false) {
   if (!CheckKind(n, kReshape) || n->inputs().size() != 2 ||
@@ -628,13 +823,22 @@ inline bool MatchAttention(Node* n, AttentionMatch& m,
   }
   Value* softmax_out = nullptr;
   Value* v_t = nullptr;
+  std::vector<Node*> guard_chain;
   for (int i = 0; i < 2; ++i) {
     if (CheckKind(v_mm->input(i), kSoftmax)) {
       softmax_out = v_mm->input(i);
       v_t = v_mm->input(1 - i);
     }
   }
-  if (softmax_out == nullptr || softmax_out->uses().size() != 1) {
+  if (softmax_out == nullptr && allow_mask) {
+    for (int i = 0; i < 2 && softmax_out == nullptr; ++i) {
+      softmax_out = MatchNanGuardedSoftmax(v_mm->input(i), m.nan_guard_zero,
+                                           guard_chain);
+      v_t = v_mm->input(1 - i);
+    }
+  }
+  if (softmax_out == nullptr ||
+      softmax_out->uses().size() != (guard_chain.empty() ? 1u : 2u)) {
     return false;
   }
   Node* softmax = softmax_out->node();
@@ -735,8 +939,12 @@ inline bool MatchAttention(Node* n, AttentionMatch& m,
     return false;  // Attention has one merged bias input -- all or none.
   }
 
+  if (!guard_chain.empty() && m.attention_bias == nullptr) {
+    return false;  // Only a masked row can be fully -inf; see FuseAttention.
+  }
   m.dead_chain.push_back(tr_back);
   m.dead_chain.push_back(v_mm);
+  for (Node* nd : guard_chain) m.dead_chain.push_back(nd);
   m.dead_chain.push_back(softmax);
   if (mask_add != nullptr) {
     m.dead_chain.push_back(mask_add);
@@ -1746,6 +1954,25 @@ struct FuseAttention final : public PredicateBasedPass {
       graph.opset_versions_mutable().emplace_back("com.microsoft", 1);
     }
 
+    // A NaN guard on the probabilities (MatchNanGuardedSoftmax) zeroed every
+    // row whose mask was all -inf, so that row's context is 0. The fused
+    // kernel leaves such a row NaN (ORT's CPU Attention does), so the same
+    // guard on its output -- where each NaN row is exactly that head's slice
+    // of a fully masked query -- gives the source's zeros back; with a finite
+    // mask it never fires.
+    Value* attn_out = attn->output();
+    if (m.nan_guard_zero != nullptr) {
+      Node* isnan = graph.create(Symbol("IsNaN"), 1);
+      isnan->addInput(attn_out);
+      isnan->insertBefore(n);
+      Node* guard = graph.create(Symbol("Where"), 1);
+      guard->addInput(isnan->output());
+      guard->addInput(m.nan_guard_zero);
+      guard->addInput(attn_out);
+      guard->insertBefore(n);
+      attn_out = guard->output();
+    }
+
     // `n`'s own target shape (its second input) is reused, unchanged, to
     // reshape `attn`'s raw output into whatever shape `n`'s consumers
     // actually expect -- almost always identical to `attn`'s own natural
@@ -1761,7 +1988,7 @@ struct FuseAttention final : public PredicateBasedPass {
     // ctx data into.
     Value* n_shape = n->input(1);
     Node* reshape_out = graph.create(Symbol("Reshape"), 1);
-    reshape_out->addInput(attn->output());
+    reshape_out->addInput(attn_out);
     reshape_out->addInput(n_shape);
     reshape_out->insertBefore(n);
     reshape_out->output()->copyMetadata(n->output());
