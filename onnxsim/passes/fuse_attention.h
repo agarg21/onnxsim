@@ -384,8 +384,8 @@ inline bool MatchDynamicHeadSplitShape(Node* rs, int64_t& num_heads,
   }
   const auto& is = in->sizes();
   const auto& os = out->sizes();
-  if (!SameSeqDim(is[0], os[0]) || !SameSeqDim(is[1], os[1]) ||
-      !os[2].is_int || !os[3].is_int) {
+  if (!SameSeqDim(is[0], os[0]) || !SameSeqDim(is[1], os[1]) || !os[2].is_int ||
+      !os[3].is_int) {
     return false;
   }
   num_heads = os[2].dim;
@@ -473,8 +473,8 @@ inline bool IsShapeDimsSlice(Value* v, Value* of, int64_t rank, int64_t lo,
     return std::min(std::max<int64_t>(i, 0), n);
   };
   Node* shape = ins[0]->node();
-  const int64_t s0 = clamp(
-      GetValueFromAttrWithDefault(shape, kstart, int64_t(0)), rank);
+  const int64_t s0 =
+      clamp(GetValueFromAttrWithDefault(shape, kstart, int64_t(0)), rank);
   const int64_t e0 =
       clamp(GetValueFromAttrWithDefault(shape, kend, rank), rank);
   std::vector<int64_t> starts, ends, axes, steps;
@@ -832,8 +832,8 @@ inline bool MatchAttention(Node* n, AttentionMatch& m,
   }
   if (softmax_out == nullptr && allow_mask) {
     for (int i = 0; i < 2 && softmax_out == nullptr; ++i) {
-      softmax_out = MatchNanGuardedSoftmax(v_mm->input(i), m.nan_guard_zero,
-                                           guard_chain);
+      softmax_out =
+          MatchNanGuardedSoftmax(v_mm->input(i), m.nan_guard_zero, guard_chain);
       v_t = v_mm->input(1 - i);
     }
   }
@@ -1928,10 +1928,10 @@ struct FuseAttention final : public PredicateBasedPass {
         undef->output()->setUniqueName("");
         attn->addInput(undef->output());
       }
-      attn->addInput(expand_bias ? ExpandMaskToSequenceDims(
-                                       graph, n, m.attention_bias, m.q.input,
-                                       1, m.q.input, 1)
-                                 : m.attention_bias);
+      attn->addInput(expand_bias
+                         ? ExpandMaskToSequenceDims(graph, n, m.attention_bias,
+                                                    m.q.input, 1, m.q.input, 1)
+                         : m.attention_bias);
     }
     attn->i_(Symbol("num_heads"), m.num_heads);
     attn->f_(Symbol("scale"), static_cast<float>(m.scale));

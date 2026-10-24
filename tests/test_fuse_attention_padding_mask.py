@@ -52,7 +52,9 @@ def _ln(x, prefix, out):
 
 
 def _linear(x, prefix, out):
-    return f"{prefix}_mm = MatMul({x}, {prefix}_w)\n{out} = Add({prefix}_b, {prefix}_mm)\n"
+    return (
+        f"{prefix}_mm = MatMul({x}, {prefix}_w)\n{out} = Add({prefix}_b, {prefix}_mm)\n"
+    )
 
 
 def _layer(i, x, mask, mask_first):
@@ -62,7 +64,9 @@ def _layer(i, x, mask, mask_first):
         s += _linear(x, f"{p}{t}", f"{p}{t}_lin")
         s += f"{p}{t}_rs = Reshape({p}{t}_lin, heads)\n"
         s += f"{p}{t}_h = Transpose <perm=[0,2,1,3]> ({p}{t}_rs)\n"
-    scores = f"{p}msk = Add({mask}, {p}sc)" if mask_first else f"{p}msk = Add({p}sc, {mask})"
+    scores = (
+        f"{p}msk = Add({mask}, {p}sc)" if mask_first else f"{p}msk = Add({p}sc, {mask})"
+    )
     s += f"""
     {p}k_t = Transpose <perm=[0,1,3,2]> ({p}k_h)
     {p}qk = MatMul({p}q_h, {p}k_t)
@@ -105,8 +109,14 @@ def _encoder_classifier(opset=17, layers=2, batch=B, seq=S, mask_first=False):
     for prefix in ["emb_ln"] + [f"l{i}ln{j}" for i in range(layers) for j in (1, 2)]:
         inits += [_f32(rng, f"{prefix}_g", C), _f32(rng, f"{prefix}_b", C)]
     for i in range(layers):
-        for name, k, n in [("q", C, C), ("k", C, C), ("v", C, C), ("o", C, C),
-                           ("f1", C, F), ("f2", F, C)]:
+        for name, k, n in [
+            ("q", C, C),
+            ("k", C, C),
+            ("v", C, C),
+            ("o", C, C),
+            ("f1", C, F),
+            ("f2", F, C),
+        ]:
             inits += [_f32(rng, f"l{i}{name}_w", k, n), _f32(rng, f"l{i}{name}_b", n)]
 
     body = f"""
@@ -265,7 +275,6 @@ def test_backends_that_cannot_take_the_mask_leave_it_unfused(backend):
     )
 
 
-
 def _torch_encoder_classifier(torch, sdpa):
     # Hugging Face's BERT attention and padding mask, in a few lines: what its
     # PyTorch export emits, without needing transformers. Eager attention adds
@@ -327,16 +336,23 @@ def _torch_export(torch, module, path, dynamo):
     kwargs = dict(input_names=["input_ids", "attention_mask"], dynamo=dynamo)
     if dynamo:
         dims = {0: "batch", 1: "seq"}
-        kwargs.update(opset_version=18, dynamic_shapes={"input_ids": dims, "attention_mask": dims})
+        kwargs.update(
+            opset_version=18, dynamic_shapes={"input_ids": dims, "attention_mask": dims}
+        )
     else:
         kwargs.update(opset_version=17)
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
         torch.onnx.export(module, args, str(path), **kwargs)
     return onnx.load(str(path))
 
 
 @pytest.mark.parametrize("sdpa", [False, True], ids=["eager", "sdpa"])
-@pytest.mark.parametrize("dynamo", [True, False], ids=["dynamo_dynamic", "legacy_static"])
+@pytest.mark.parametrize(
+    "dynamo", [True, False], ids=["dynamo_dynamic", "legacy_static"]
+)
 def test_torch_exported_encoder_classifier(tmp_path, dynamo, sdpa):
     torch = pytest.importorskip("torch")
     if dynamo:
