@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `74e9614c4` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `7aa6a2c87` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -899,3 +899,25 @@ until `TRANSPOSE_CONTIGUOUS` came with it; register blocking over a matmul's row
 and attention much slower (decoder 7.8 s). The float paths are still far from the hand-written MSDA pipeline
 (`scripts/android/vision_models/bevformer_tiny/msda_hvx`, about 90 ms per frame): the largest kernels now are the
 fp32 Gemms at about 12 GMAC/s.
+
+**fp16 Gemms on the HMX (`GEMM_FP16=1`, opt-in).** In the compiler service's environment, every fp32 Gemm runs on the HMX in
+fp16: the operands are cast to fp16 and padded to whole 32 x 32 tiles, HMX accumulates internally, and the product is rounded
+to fp16 once before the cast back and the bias add in fp32. It changes the numerics, so compare with a looser threshold
+(`check_outputs.py ... --rtol 2e-3`):
+
+| model | fp32 (HVX) | `GEMM_FP16=1` (HMX) | vs onnxruntime with `GEMM_FP16=1` |
+|---|---:|---:|---|
+| decoder | 1151 ms | 581 ms | max rel 6.0e-4, cos 1.000000 |
+| encoder, 1 layer | 319 ms | 143 ms | max rel 3.3e-4, cos 0.9999998 |
+| encoder, 3 layers | 959 ms | 450 ms | max rel 1.2e-3, cos 0.99999994 |
+
+A 2500x256x256 Gemm takes about 1.1 ms this way (0.7 ms of it on the HMX), against about 14 ms on the HVX in fp32. Getting
+there took several fixes in the fork; each of these was slow and/or wrong on the phone:
+- the casts fused into the HMX kernel's tile packing;
+- the cast back fused into its output epilogue;
+- tinygrad's own padding of a tensor-core axis;
+- the pad done in the same kernel as a fused ReLU;
+- the v65 qemu mock's fp16 workarounds leaking into v69 captures.
+
+One bug remains in the fork's HMX lowering: a single 32-row M tile with several K tiles gives wrong results (cos 0.71, in
+hexagon-sim too). `GEMM_FP16` avoids it by padding M to at least 64 rows.
