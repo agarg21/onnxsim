@@ -28,9 +28,18 @@ if [ ! -f /etc/modprobe.d/blacklist-axcl-host.conf ]; then
   exit 1
 fi
 # stage what the guest installer needs
-cp -n "${AXCL_DEB:-$HOME/dev/archives/axclhost_x86_64_8G_V2.25.0_20250207.deb}" "$SHARE"/ 2>/dev/null || echo "note: put the axclhost .deb into $SHARE (AXCL_DEB=... to point at it)"
+# The guest runs the 3.x package (the 3.6 runtime + its matching firmware pac). Do not
+# stage a 2.25 deb here: its pac under the 3.6 runtime fails every command (0x80300909).
+AXCL_DEB=${AXCL_DEB:-$HOME/dev/archives/axclhost_3.6.6-m5stack1_amd64.deb}
+if [ -f "$AXCL_DEB" ]; then
+  cp -n "$AXCL_DEB" "$SHARE"/
+else
+  echo "ERROR: $AXCL_DEB not found. Fetch it from https://repo.llm.m5stack.com/m5stack-apt-repo/pool/axclhost/binary-amd64/axclhost_3.6.6-m5stack1_amd64.deb (or set AXCL_DEB=...)" >&2
+  exit 1
+fi
 rm -rf "$SHARE/host-driver-patches" && cp -r "$REPO/scripts/axera/host-driver-patches" "$SHARE"/
 cp "$REPO/scripts/axera/vm/guest_install_axcl.sh" "$SHARE"/
+cp "$REPO/scripts/axera/vm/axcl-3.6-slot-index.patch" "$SHARE"/
 
 if ! lxc info "$VM" >/dev/null 2>&1; then
   lxc launch ubuntu:24.04 "$VM" --vm -c limits.cpu=8 -c limits.memory=16GiB -c security.secureboot=false
