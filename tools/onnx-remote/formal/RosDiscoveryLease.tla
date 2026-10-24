@@ -14,12 +14,11 @@
 (* is the current announce(), which always says ready:true. ReflectHealth  *)
 (* =TRUE models announcing the worker's real state (a candidate fix).      *)
 (***************************************************************************)
-EXTENDS Naturals
+EXTENDS Naturals, RosDiscoveryParams   \* L: lease length in ticks, generated from ros2_bridge.cpp
 
 CONSTANTS
   Runners,        \* bridges that can announce a remote worker
   None,           \* model value: no runner selected (configured endpoint)
-  L,              \* lease length in ticks
   Verify,         \* verify_discovery
   ReflectHealth   \* TRUE: announce ready = worker health; FALSE: always ready
 
