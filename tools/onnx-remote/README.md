@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `4078d2b9c` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -876,6 +876,13 @@ onnxruntime. Measured on a Xiaomi 12S (V69, 4 threads):
 | model | compile (cache miss) | load | run, DSP / RPC-inclusive | vs onnxruntime |
 |---|---:|---:|---:|---|
 | BEVFormer-tiny int8 backbone, one camera (`backbone1.q8.onnx`, HMX) | 171 s | 0.85 s | 312 / 354 ms | 0 of 96000 differ |
+| BEVFormer-tiny encoder, 1 layer (`enc1.sim.onnx`, fp32, GridSample) | 15 s | 0.30 s | 912 / 1154 ms | max rel 8.0e-7 |
+| BEVFormer-tiny encoder, 3 layers (`enc3.sim.onnx`) | | 0.46 s | 3546 / 3792 ms | max rel 3.5e-6 |
+| BEVFormer-tiny decoder (`decoder.sim.onnx`, fp32, 6 GridSamples) | 10 s | 0.71 s | 3394 / 3456 ms | max rel 3.1e-6 |
 | one 3x3 float conv, 64 -> 64 channels, 30 x 50 | 2 s | 56 ms | 351 / 376 ms | max rel 8.6e-7 |
 
-Models with `GridSample` (BEVFormer's encoder and decoder) don't compile yet: tinygrad's ONNX importer has no `GridSample`.
+The fork's ONNX importer has `GridSample` (2-D bilinear, zero padding) for these. The compiler stores a constant `transB=1`
+Gemm weight transposed (`GEMM_PRETRANSPOSE`, default on): kept (N, K), the generated kernel's output lanes read it one
+scalar at a time from 128 rows, and the encoder layer took 11.3 s, the decoder 25.4 s. The float paths are correct but
+not fast yet; the hand-written MSDA pipeline (`scripts/android/vision_models/bevformer_tiny/msda_hvx`) runs a whole
+frame in about 90 ms.
