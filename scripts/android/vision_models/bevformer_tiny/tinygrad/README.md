@@ -379,8 +379,45 @@ What keeps the coordinate kernel and the sampler scalar is the renderer, not the
 as a scalar bit-manipulating statement expression; the float -> int casts of the tap coordinates become
 `__builtin_convertvector`, which LLVM scalarizes on V69 (no vector sf -> w convert before V73); and the fork's HVX
 re-vectorizer leaves compares and `WHERE` scalar on purpose. The hand kernel does all three on 32 lanes with integer HVX
-ops (magic-number floor with a +-1 fix-up, `vmux` for the bounds). The next step is vector forms of those three in the fork's
-DSP renderer; both `TRUNC` (clear the fraction bits) and the int cast (shift the mantissa) have exact integer-only forms.
+ops (magic-number floor with a +-1 fix-up, `vmux` for the bounds).
+
+### Vector floor / compare / select in the renderer: correct, but not the bottleneck
+
+The fork now has those vector forms (`bevformer-dsp-patches` commit `8fbc98b66`, both off by default):
+- `HVX_REVEC_CMP` re-vectorizes compares, bool logic, `WHERE` and `TRUNC` at multiples of 32 lanes. Compares become
+  int masks, `WHERE` a mask bit select, and `TRUNC` / float -> int32 are integer-only helpers. The helpers are exact for
+  every float32 bit pattern (trunc) and every |x| < 2^31 (cast), checked exhaustively on the host.
+- `HVX_UPCAST_ELEMWISE` widens elementwise kernels past a 4-wide masked upcast.
+
+On the qemu mock, floor, trunc, cast, where, bool -> float and bool stores match numpy, and hexagon-clang lowers them to
+`vcmp` / `vmux` / `vasl` / `vlsr`. On the phone they don't make the sparse SCA faster (4 threads, all pass the check):
+
+| variant | ms | note |
+|---|---:|---|
+| default (above) | 17.7 | |
+| `HVX_REVEC_CMP=1` | 19.6 -> 17.3 | at first it vectorized the sampler's *splatted* per-sample weight (the same work in every channel lane); with splats kept scalar the sampler source is unchanged |
+| tap tables (per-sample row indices and weights from elementwise kernels, `HVX_REVEC_CMP=1 HVX_UPCAST_ELEMWISE=1`) | 28.0-29.7 | the weight table is vector code (1.7 ms), the index table stays scalar (4.6 ms), the coordinates are recomputed per table (5 ms each), and the sampler is **still 10.8 ms** |
+| one 8-column tap table (indices bitcast to float) | 133 | the column became an outer loop with a select chain: every column computed for every plane |
+
+The tap-table sampler is 12 packets per sample against 43 for the default sampler (from the assembly), and both take
+10.5-10.8 ms. So the sampler isn't instruction-bound. It also scales linearly with threads (38 / 19.4 / 10.5 ms on 1 / 2 /
+4 threads; 13.3 ms on 6), so it isn't DDR-bandwidth-bound either. More things that didn't move it, all hand edits of the
+generated C:
+
+| change | ms (4 threads) | 1 thread |
+|---|---:|---:|
+| none | 17.7 | 60.8 |
+| `HVX_PREFETCH=0` | 17.7 | |
+| point loop fully unrolled (`#pragma clang loop unroll(full)`) | 17.8 | |
+| `l2fetch` of the coordinate table's 5 planes 16 entries ahead | 17.2 | 55.5 |
+
+The dense calls never reach the new path: their coordinate kernels are upcast 4 wide, below the 32-lane minimum.
+
+Not explained yet: why one thread of the generated sampler takes 38 ms for 245760 samples (about 215 cycles each) while the
+hand kernel's whole call is 14 ms on one thread. The next measurement is `hexagon-sim --timing` on the current sampler alone
+(the per-phase setup above) to see which stall dominates. Candidates: the in-order dependence of each row load on its
+scalar index, and the single accumulator (the hand kernel keeps 4 independent qf32 accumulators per head and never
+converts back to sf inside the loop).
 
 ```bash
 # simulator: one binary per prefix, totals per prefix, then the per-phase differences
@@ -401,7 +438,7 @@ with or without the fork's interleave rule (`DSP_INTERLEAVE`). An earlier note c
 
 ## Reproduce
 
-Needs the tinygrad fork with DSP support (onnxsim/tinygrad branch `bevformer-dsp-patches`, commit `7bd278b30` at the time
+Needs the tinygrad fork with DSP support (onnxsim/tinygrad branch `bevformer-dsp-patches`, commit `8fbc98b66` at the time
 of writing: `dsp-consolidated` at `9a4680353` plus this work's changes; upstream tinygrad was not tested) on `PYTHONPATH`,
 `clang-19`, and the msda case directories written by `../msda_hvx/split.py dump` (`~/.cache/onnxsim-bevformer/work/msda_io`).
 The `*.patch` names in the sections above are the commits on that branch now, not files in this directory. For v69 code,
