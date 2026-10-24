@@ -239,7 +239,7 @@ inline bool FetchScalarAsDouble(Value* v, double& out) {
 }
 
 // Matches `scores` (Softmax's sole input, already known single-use by the
-// caller) as a scaled Q@K^T dot product, in either of two shapes real
+// caller) as a scaled Q@K^T dot product, in any of three shapes real
 // exporters produce:
 //
 //  - "post-scaled": scores = Div(QK, c) or Mul(QK, c), where QK is itself a
@@ -253,6 +253,9 @@ inline bool FetchScalarAsDouble(Value* v, double& out) {
 //    value (within a small relative tolerance, since real graphs sometimes
 //    compute the same folded constant via two syntactically distinct nodes
 //    rather than sharing one Value*); an asymmetric split isn't this shape.
+//  - "one-sided": scores = MatMul(Div(q_side, c), k_side) or with Mul(., c),
+//    on either operand -- the scale applied to Q (or K) alone, as
+//    DistilBERT's eager attention does.
 //
 // On success sets `q_side`/`k_side` to the two (not yet head-split-matched)
 // operands and `scale` to the *combined* scale factor (already squared back
@@ -311,6 +314,55 @@ inline bool MatchScaledQKMatMul(Value* scores, Value*& q_side, Value*& k_side,
 
   if (!CheckKind(scores_node, kMatMul) || scores_node->inputs().size() != 2) {
     return false;
+  }
+  // One-sided: only Q (or only K) is scaled before the dot product, e.g.
+  // DistilBERT's `q = q / sqrt(head_size)` -- MatMul(Div(Q, c), K^T) or
+  // MatMul(Mul(Q, c), K^T). (c * Q) @ K^T == c * (Q @ K^T), so the scale is
+  // c (or 1/c), exactly as in the post-scaled shape.
+  auto scalar_scaled = [](Value* in, Value*& operand, double& scale) {
+    if (in->uses().size() != 1 || in->node()->inputs().size() != 2) {
+      return false;
+    }
+    Node* nd = in->node();
+    double v = 0.0;
+    if (CheckKind(nd, kDiv)) {
+      if (!FetchScalarAsDouble(nd->input(1), v) || v == 0.0) {
+        return false;
+      }
+      operand = nd->input(0);
+      scale = 1.0 / v;
+      return true;
+    }
+    if (!CheckKind(nd, kMul)) {
+      return false;
+    }
+    for (int j = 0; j < 2; ++j) {
+      if (FetchScalarAsDouble(nd->input(1 - j), v)) {
+        operand = nd->input(j);
+        scale = v;
+        return true;
+      }
+    }
+    return false;
+  };
+  {
+    Value* scaled_operand[2] = {nullptr, nullptr};
+    double side_scale[2] = {0.0, 0.0};
+    const bool scaled[2] = {
+        scalar_scaled(scores_node->input(0), scaled_operand[0], side_scale[0]),
+        scalar_scaled(scores_node->input(1), scaled_operand[1], side_scale[1])};
+    if (scaled[0] != scaled[1]) {
+      const int i = scaled[0] ? 0 : 1;
+      if (static_cast<float>(side_scale[i]) == 0.0f) {
+        return false;
+      }
+      dead_chain.push_back(scores_node);  // consumer of the scaling node.
+      dead_chain.push_back(scores_node->input(i)->node());
+      q_side = i == 0 ? scaled_operand[0] : scores_node->input(0);
+      k_side = i == 1 ? scaled_operand[1] : scores_node->input(1);
+      scale = side_scale[i];
+      return true;
+    }
   }
   double c[2] = {0.0, 0.0};
   Value* operand[2] = {nullptr, nullptr};
@@ -741,6 +793,12 @@ struct AttentionMatch {
   // The zero of a `Where(IsNaN(P), 0, P)` guard between the Softmax and the
   // V MatMul (see MatchNanGuardedSoftmax); nullptr when there is none.
   Value* nan_guard_zero = nullptr;
+  // Set when the mask came from a masked_fill, Where(cond, fill, scores):
+  // `attention_bias` is then that bool `cond`, and the additive form
+  // Where(cond, fill, 0) (operands swapped when `fill_when_cond_true` is
+  // false) is built at emission. nullptr for an additive mask.
+  Value* mask_fill = nullptr;
+  bool fill_when_cond_true = true;
   // Every node strictly upstream of `n` (the ctx-producing Reshape the pass
   // anchors on) down to, but not including, the QKV inputs/weights,
   // ordered innermost (closest to `n`) first, so destroying them in this
@@ -750,6 +808,21 @@ struct AttentionMatch {
   // runTransform), the same idiom fuse_rms_norm.h uses for its own anchor.
   std::vector<Node*> dead_chain;
 };
+
+// Whether `v` is a float32 scalar constant <= -1e30 (finfo.min, -inf, ...):
+// the fill of a masked_fill padding mask. For such a fill F,
+// Where(cond, F, s) == s + Where(cond, F, 0) wherever cond is false, and where
+// it is true both are F to float precision (s + F rounds to F for any |s|
+// below F's ulp, ~1e22 for -1e30, far beyond real attention scores; for
+// -inf both are -inf), so the masked_fill becomes an additive mask.
+inline bool IsMaskFill(Value* v) {
+  const Tensor* t = FetchConstantTensor(v);
+  if (t == nullptr || t->elem_type() != TensorProto_DataType_FLOAT) {
+    return false;
+  }
+  const std::vector<float> f = ReadFloatTensorFlat(*t);
+  return f.size() == 1 && f[0] <= -1e30f;
+}
 
 // Matches `p = Where(IsNaN(sm), 0, sm)` for a Softmax output `sm` used only by
 // that IsNaN and Where: the guard PyTorch's scaled_dot_product_attention
@@ -792,8 +865,10 @@ inline Value* MatchNanGuardedSoftmax(Value* p, Value*& zero,
 // everything transitively upstream of the Transpose are examined.
 //
 // With `allow_mask`, the Softmax input may also be Add(scores, mask) for any
-// `mask` operand: it is recorded in `m.attention_bias` and left for the caller
-// to validate (MatchAttentionBias), since that needs helpers defined below.
+// `mask` operand, or a masked_fill Where(cond, fill, scores) with an IsMaskFill
+// fill: the mask (or `cond`) is recorded in `m.attention_bias` and left for the
+// caller to validate (MatchAttentionBias), since that needs helpers defined
+// below.
 // A masked Softmax output may also go through MatchNanGuardedSoftmax's guard,
 // which the caller re-applies to the fused output (see FuseAttention).
 inline bool MatchAttention(Node* n, AttentionMatch& m,
@@ -859,6 +934,11 @@ inline bool MatchAttention(Node* n, AttentionMatch& m,
       scores->node()->inputs().size() == 2) {
     mask_add = scores->node();
   }
+  Node* mask_where = nullptr;
+  if (allow_mask && CheckKind(scores, "Where") &&
+      scores->node()->inputs().size() == 3) {
+    mask_where = scores->node();
+  }
 
   std::vector<Node*> v_head_chain;
   Value* v_proj_out = nullptr;
@@ -881,6 +961,22 @@ inline bool MatchAttention(Node* n, AttentionMatch& m,
       if (cand->uses().size() == 1 &&
           MatchScaledQKMatMul(cand, q_side, k_side, m.scale, scale_chain)) {
         m.attention_bias = mask_add->input(1 - i);
+      }
+    }
+    if (m.attention_bias == nullptr) {
+      return false;
+    }
+  } else if (mask_where != nullptr) {
+    // Where(cond, fill, scores) fills where cond is true, Where(cond, scores,
+    // fill) where it is false; the scores operand is the non-fill one.
+    for (int f = 1; f <= 2 && m.attention_bias == nullptr; ++f) {
+      Value* cand = mask_where->input(3 - f);
+      scale_chain.clear();
+      if (IsMaskFill(mask_where->input(f)) && cand->uses().size() == 1 &&
+          MatchScaledQKMatMul(cand, q_side, k_side, m.scale, scale_chain)) {
+        m.attention_bias = mask_where->input(0);
+        m.mask_fill = mask_where->input(f);
+        m.fill_when_cond_true = f == 1;
       }
     }
     if (m.attention_bias == nullptr) {
@@ -948,6 +1044,9 @@ inline bool MatchAttention(Node* n, AttentionMatch& m,
   m.dead_chain.push_back(softmax);
   if (mask_add != nullptr) {
     m.dead_chain.push_back(mask_add);
+  }
+  if (mask_where != nullptr) {
+    m.dead_chain.push_back(mask_where);
   }
   for (Node* nd : v_head_chain) m.dead_chain.push_back(nd);
   for (Node* nd : m.v.chain) m.dead_chain.push_back(nd);
@@ -1679,8 +1778,9 @@ inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
 }
 
 // Validates MatchAttention's `m.attention_bias` (a no-op success when there is
-// none) for com.microsoft `Attention`'s `attention_bias` input: a float32,
-// rank-4 run-time value (computed from a graph input, like the padding mask
+// none) for com.microsoft `Attention`'s `attention_bias` input: a float32
+// (or, for a masked_fill, the bool condition it is built from) rank-4 run-time
+// value (computed from a graph input, like the padding mask
 // derived from `attention_mask`; a constant one keeps its existing handling).
 // The source graph's own Add requires it to broadcast with the [B, H, S, S]
 // scores, so each dim is 1 or the scores' size -- the (batch or 1, num_heads
@@ -1701,8 +1801,9 @@ inline bool MatchAttentionBias(const AttentionMatch& m, bool& expand) {
   if (FetchConstantTensor(b) != nullptr || !DependsOnGraphInput(b, budget)) {
     return false;
   }
-  if (b->elemType() != TensorProto_DataType_FLOAT || !b->has_sizes() ||
-      b->sizes().size() != 4) {
+  const int32_t want_type = m.mask_fill != nullptr ? TensorProto_DataType_BOOL
+                                                   : TensorProto_DataType_FLOAT;
+  if (b->elemType() != want_type || !b->has_sizes() || b->sizes().size() != 4) {
     return false;
   }
   const auto& bs = b->sizes();
@@ -1928,10 +2029,24 @@ struct FuseAttention final : public PredicateBasedPass {
         undef->output()->setUniqueName("");
         attn->addInput(undef->output());
       }
+      Value* bias = m.attention_bias;
+      if (m.mask_fill != nullptr) {
+        // masked_fill -> additive mask: Where(cond, fill, 0) (see IsMaskFill).
+        Tensor zero_t;
+        zero_t.elem_type() = TensorProto_DataType_FLOAT;
+        zero_t.floats() = {0.0f};
+        Value* zero = graph.addInitializerAndCreateValue(zero_t);
+        Node* additive = graph.create(Symbol("Where"), 1);
+        additive->addInput(m.attention_bias);
+        additive->addInput(m.fill_when_cond_true ? m.mask_fill : zero);
+        additive->addInput(m.fill_when_cond_true ? zero : m.mask_fill);
+        additive->insertBefore(n);
+        bias = additive->output();
+      }
       attn->addInput(expand_bias
-                         ? ExpandMaskToSequenceDims(graph, n, m.attention_bias,
-                                                    m.q.input, 1, m.q.input, 1)
-                         : m.attention_bias);
+                         ? ExpandMaskToSequenceDims(graph, n, bias, m.q.input,
+                                                    1, m.q.input, 1)
+                         : bias);
     }
     attn->i_(Symbol("num_heads"), m.num_heads);
     attn->f_(Symbol("scale"), static_cast<float>(m.scale));

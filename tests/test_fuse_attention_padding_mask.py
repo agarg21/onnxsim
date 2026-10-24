@@ -57,7 +57,10 @@ def _linear(x, prefix, out):
     )
 
 
-def _layer(i, x, mask, mask_first):
+def _layer(i, x, mask, mask_first, masked_fill=None):
+    # masked_fill: DistilBERT's eager shape instead -- Q alone scaled before
+    # the dot product, and Where(pad, fill, scores) with `mask` the bool pad
+    # condition and `masked_fill` the fill constant's name.
     p = f"l{i}"
     s = ""
     for t in "qkv":
@@ -67,10 +70,19 @@ def _layer(i, x, mask, mask_first):
     scores = (
         f"{p}msk = Add({mask}, {p}sc)" if mask_first else f"{p}msk = Add({p}sc, {mask})"
     )
-    s += f"""
-    {p}k_t = Transpose <perm=[0,1,3,2]> ({p}k_h)
+    scaled = f"""
     {p}qk = MatMul({p}q_h, {p}k_t)
     {p}sc = Div({p}qk, sqrt_d)
+    """
+    if masked_fill is not None:
+        scores = f"{p}msk = Where({mask}, {masked_fill}, {p}sc)"
+        scaled = f"""
+    {p}q_s = Div({p}q_h, sqrt_d)
+    {p}sc = MatMul({p}q_s, {p}k_t)
+    """
+    s += f"""
+    {p}k_t = Transpose <perm=[0,1,3,2]> ({p}k_h)
+    {scaled}
     {scores}
     {p}p = Softmax <axis=-1> ({p}msk)
     {p}ctx4 = MatMul({p}p, {p}v_h)
@@ -94,7 +106,9 @@ def _layer(i, x, mask, mask_first):
     return s, f"{p}out"
 
 
-def _encoder_classifier(opset=17, layers=2, batch=B, seq=S, mask_first=False):
+def _encoder_classifier(
+    opset=17, layers=2, batch=B, seq=S, mask_first=False, masked_fill=None
+):
     """A BERT-style sequence classifier. `batch`/`seq` may be dim_param names."""
     rng = np.random.default_rng(0)
     inits = [
@@ -127,6 +141,7 @@ def _encoder_classifier(opset=17, layers=2, batch=B, seq=S, mask_first=False):
     one = Constant <value = float {{1.0}}> ()
     half = Constant <value = float {{0.5}}> ()
     fmin = Constant <value = float {{{FINFO_MIN!r}}}> ()
+    ninf = Constant <value = float {{-inf}}> ()
     ax1 = Constant <value = int64[1] {{1}}> ()
     ax2 = Constant <value = int64[1] {{2}}> ()
     zero = Constant <value = int64[1] {{0}}> ()
@@ -148,10 +163,15 @@ def _encoder_classifier(opset=17, layers=2, batch=B, seq=S, mask_first=False):
     mf = Cast <to=1> (m2)
     inv = Sub(one, mf)
     ext = Mul(inv, fmin)
+    zero_m = Constant <value = int64 {{0}}> ()
+    pad2 = Equal(attention_mask, zero_m)
+    pad3 = Unsqueeze(pad2, ax1)
+    pad = Unsqueeze(pad3, ax2)
     """
     x = "h0"
     for i in range(layers):
-        s, x = _layer(i, x, "ext", mask_first)
+        mask = "ext" if masked_fill is None else "pad"
+        s, x = _layer(i, x, mask, mask_first, masked_fill)
         body += s
     body += f"""
     first = Gather <axis=1> ({x}, cls)
@@ -231,6 +251,19 @@ def test_padding_mask_is_expanded_once_per_layer_to_the_score_block():
 
 def test_mask_as_first_add_operand():
     model = _encoder_classifier(mask_first=True)
+    simplified, _ = onnxsim.simplify(model)
+    _assert_masked_ms_attention(simplified, layers=2)
+    feeds = _feeds()
+    np.testing.assert_allclose(
+        _run(simplified, feeds), _run(model, feeds), rtol=1e-4, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("fill", ["fmin", "ninf"])
+def test_masked_fill_with_one_sided_q_scale(fill):
+    # DistilBERT's eager attention: q / sqrt(head_size) before the dot product
+    # and scores.masked_fill(pad, fill), i.e. Where(pad, fill, scores).
+    model = _encoder_classifier(masked_fill=fill)
     simplified, _ = onnxsim.simplify(model)
     _assert_masked_ms_attention(simplified, layers=2)
     feeds = _feeds()
