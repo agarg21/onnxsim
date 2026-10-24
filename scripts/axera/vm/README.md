@@ -167,3 +167,30 @@ utilisation, and device runs at the same latency as on the host.
   weight table (a 12 MB resnet18d `.axmodel` is fine; a 250 MB LLM head is
   noticeable). Keep large models in `/mnt/share` and pass that path when it
   matters.
+
+## Many small models per step: plan mode
+
+`AXSession.run` costs about 1.0-1.7 ms of host round trip per call (input and output files on the
+share, one command line), on top of about 0.3 ms of device time for a small model. For a chain of
+hundreds of small models per step, use plan mode (`axcl_batch_runner.c` `BUF` / `BIND` / `PLAN`):
+
+```python
+from axcl_session import AXSession, Plan
+
+with AXSession() as s:
+    a, b = s.load(model_a), s.load(model_b)
+    x, mid, y = s.buffer(nx), s.buffer(nmid), s.buffer(ny)      # device buffers
+    s.bind(a, "I", 0, x); s.bind(a, "O", 0, mid)                 # a writes mid ...
+    s.bind(b, "I", 0, mid); s.bind(b, "O", 0, y)                 # ... b reads it: no copy
+    plan = Plan(s)
+    plan.write(x, inputs).execute(a).execute(b)
+    key = plan.read(y, ny)
+    s.run_plan(plan)                                             # one command
+    out = plan.result(key, np.float32, shape)
+```
+
+A binding can point at an offset inside a buffer, so slices of a tensor (for example one attention
+head's row) need no copy; `Plan.bind` rebinds inside a plan, and `Plan.copy` does a device-to-device
+copy (about 0.16 ms). Inside a plan, a small model costs only its device time (about 0.27 ms). The
+SmolLM2-135M Pulsar-free decode (about 1900 model runs per token) went from 4.3 s/token with `run`
+to 0.6 s/token with one plan per token. `tests/test_axcl_plan_hardware.py` checks it on the card.
