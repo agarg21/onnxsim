@@ -262,6 +262,47 @@ def weight_codes(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return emitter.codes_of(w.T, axis=0), emitter.weight_scales(w.T, axis=0)
 
 
+def gptq_weight(
+    w: np.ndarray,
+    x: np.ndarray,
+    percdamp: float = 0.01,
+    device: str | None = None,
+) -> np.ndarray:
+    """GPTQ rounding of float weights ``w [in, out]`` on the card's own s8
+    grid, with layer inputs ``x [samples, in]``: weights ``w'`` whose
+    ``weight_codes`` are GPTQ's codes at ``w``'s own scales
+    (``max|w_c| / 127.5``), for ``emit_linear_u16``. Each output channel's
+    largest element keeps its float value and its code (it sets the scale
+    ``weight_codes`` recomputes); every other element is ``code * s`` with
+    ``|code| <= 127``, since a -128 elsewhere would become the channel's
+    largest and move the scale. ``device`` (``"cuda"``) runs GPTQ in torch
+    (``onnxsim.gptq``). Qwen3-0.6B on the card: median logit error 4.4% ->
+    3.4% and 4.0% -> 2.9% on two held-out passages."""
+    from onnxsim.gptq import _gptq_quantize_columns
+
+    w = np.asarray(w, np.float32)
+    codes0, s_w = weight_codes(w)
+    w_nk = w.T.astype(np.float64)
+    keep = np.abs(w_nk) == np.abs(w_nk).max(axis=1, keepdims=True)
+    fixed = codes0.astype(np.float64) - 128
+    lo = np.where(keep, fixed, -127.0)
+    hi = np.where(keep, fixed, 127.0)
+    xs = np.asarray(x, np.float64).reshape(-1, w.shape[0])
+    codes = _gptq_quantize_columns(
+        w_nk,
+        s_w.astype(np.float64)[:, None],
+        w.shape[0],
+        xs.T @ xs,
+        percdamp,
+        128,
+        code_bounds=(lo, hi),
+        device=device,
+    )
+    out = (codes * s_w[:, None].astype(np.float64)).astype(np.float32)
+    out[keep] = w_nk[keep].astype(np.float32)
+    return out.T.copy()
+
+
 def _requant_f64(codes, s_w, s_x, zp_x, s_y, zp_y):
     """``(bias, M)`` float32 per output channel, computed in float64 and cast
     once (float32 arithmetic is an ulp off on about a third of the channels)."""

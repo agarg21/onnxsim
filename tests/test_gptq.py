@@ -386,3 +386,55 @@ def test_gptq_flattening_matches_an_equivalent_2d_calibration():
     w3 = next(t for t in out3.graph.initializer if t.data_type == onnx.TensorProto.INT4)
     w2 = next(t for t in out2.graph.initializer if t.data_type == onnx.TensorProto.INT4)
     assert w3.raw_data == w2.raw_data
+
+
+def _columns_case(n=48, k=96, seed=0):
+    """Low-rank correlated inputs (GPTQ's error propagation matters) and an
+    s8 per-channel scale ``max|w| / 127.5``."""
+    rng = np.random.default_rng(seed)
+    base = rng.standard_normal((256, 12))
+    x = base @ rng.standard_normal((12, k)) + 0.05 * rng.standard_normal((256, k))
+    w = rng.standard_normal((n, k)) * 0.1
+    s = np.abs(w).max(axis=1, keepdims=True) / 127.5
+    return w, s, x.T @ x
+
+
+def test_gptq_per_element_code_bounds():
+    """``code_bounds`` bounds each element's code separately: a pinned
+    element (lo == hi) keeps its code, the others stay inside their own
+    bounds, and the defaults' qmin/qmax are ignored."""
+    from onnxsim.gptq import _gptq_quantize_columns
+
+    w, s, h = _columns_case()
+    keep = np.abs(w) == np.abs(w).max(axis=1, keepdims=True)
+    pinned = np.where(w < 0, -128.0, 127.0)
+    lo = np.where(keep, pinned, -127.0)
+    hi = np.where(keep, pinned, 127.0)
+    codes = _gptq_quantize_columns(w, s, w.shape[1], h, 0.01, 32, code_bounds=(lo, hi))
+    assert np.array_equal(codes[keep], pinned[keep])
+    assert (codes >= lo).all() and (codes <= hi).all()
+    assert (np.abs(codes[~keep]) <= 127).all()
+
+
+def test_gptq_code_bounds_equal_to_qmin_qmax_change_nothing():
+    from onnxsim.gptq import _gptq_quantize_columns
+
+    w, s, h = _columns_case(seed=1)
+    a = _gptq_quantize_columns(w, s, w.shape[1], h, 0.01, 32, qmin=-127, qmax=127)
+    full = np.full(w.shape, 127.0)
+    b = _gptq_quantize_columns(w, s, w.shape[1], h, 0.01, 32, code_bounds=(-full, full))
+    assert np.array_equal(a, b)
+
+
+def test_gptq_torch_loop_matches_numpy():
+    """``device`` runs the same float64 loop in torch: the same codes."""
+    torch = pytest.importorskip("torch")
+    from onnxsim.gptq import _gptq_quantize_columns
+
+    w, s, h = _columns_case(seed=2)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    a = _gptq_quantize_columns(w, s, w.shape[1], h, 0.01, 32, qmin=-127, qmax=127)
+    b = _gptq_quantize_columns(
+        w, s, w.shape[1], h, 0.01, 32, qmin=-127, qmax=127, device=device
+    )
+    assert np.array_equal(a, b)

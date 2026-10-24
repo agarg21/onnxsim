@@ -204,3 +204,31 @@ def test_zero_points_are_checked_before_any_build_bytes():
             le.emit_linear_u16(model, w, {"x": 1e-4, "y": 1e-4}, {"x": zp, "y": 100})
     with pytest.raises(ValueError, match="the template is 576x192"):
         le.emit_linear_u16(model, w.T, {"x": 1e-4, "y": 1e-4}, {"x": 1, "y": 1})
+
+
+def test_gptq_weight_stays_on_the_card_grid():
+    """GPTQ weights for ``emit_linear_u16``: ``weight_codes`` recomputes the
+    same scales, each channel's largest element is untouched, every other
+    element is a code within +-127 times its channel's scale, and the layer's
+    output error is below plain rounding's."""
+    pytest.importorskip("onnxsim")
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((400, 12)) @ rng.standard_normal((12, 256))
+    x += 0.05 * rng.standard_normal(x.shape)
+    w = (rng.standard_normal((256, 64)) * 0.05).astype(np.float32)
+    g = le.gptq_weight(w, x)
+    c0, s0 = le.weight_codes(w)
+    c, s = le.weight_codes(g)
+    assert np.array_equal(s, s0)
+    keep = (np.abs(w) == np.abs(w).max(axis=0, keepdims=True)).T
+    assert np.array_equal(g.T[keep], w.T[keep])
+    assert np.array_equal(c[keep], c0[keep])
+    codes = c.astype(np.int64) - 128
+    assert (np.abs(codes[~keep]) <= 127).all()
+    assert np.allclose(g.T[~keep], (codes * s[:, None])[~keep], rtol=0, atol=1e-7)
+
+    def err(cc):
+        q = ((cc.astype(np.float64) - 128) * s0[:, None]).T
+        return np.linalg.norm(x @ (q - w)) / np.linalg.norm(x @ w)
+
+    assert err(c) < 0.8 * err(c0)
