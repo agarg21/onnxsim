@@ -89,6 +89,21 @@
 // mask was folded away) is also handled. It never uses `is_causal` when Sq !=
 // Skv, because `Attention`'s causal alignment for a non-square mask depends on
 // the `past_key` length, which this pass does not model.
+//
+// Below opset 23 there is no ai.onnx `Attention`, but encoder models
+// (BERT-style cross-encoders, rerankers, zero-shot/NLI and other sequence
+// classifiers) are still mostly exported at opset 14-18 with a padding mask
+// computed from the `attention_mask` graph input: `Add(scores, ext)` with
+// `ext = (1 - Cast(mask[:, None, None, :])) * finfo.min`, shape [B,1,1,S].
+// MatchAttention also accepts that run-time additive mask (see
+// MatchAttentionBias) and passes it through as com.microsoft `Attention`'s
+// `attention_bias` input (index 5), which adds it to the scaled Q@K^T exactly
+// as the source graph does, whatever the mask's values. `attention_bias` must
+// cover the whole [S, S] block, so a mask broadcasting over either sequence
+// axis is Expand-ed to it first (batch and head dims may stay 1). This form is
+// used when the ai.onnx one cannot be: below opset 23, or when the backend
+// excludes it (`ort_contrib`). `webgpu` never gets it (its kernel rejects
+// mask inputs), and constant masks keep their existing handling.
 
 #include <cmath>
 #include <cstdint>
@@ -522,6 +537,10 @@ struct AttentionMatch {
   AttentionProjectionInfo q, k, v;
   int64_t num_heads = 0;
   double scale = 0.0;
+  // The additive mask operand of an Add(scores, mask) between the scaled
+  // Q@K^T and the Softmax, when the caller allowed one; nullptr otherwise.
+  // Not validated by MatchAttention itself: see MatchAttentionBias.
+  Value* attention_bias = nullptr;
   // Every node strictly upstream of `n` (the ctx-producing Reshape the pass
   // anchors on) down to, but not including, the QKV inputs/weights,
   // ordered innermost (closest to `n`) first, so destroying them in this
@@ -538,7 +557,12 @@ struct AttentionMatch {
 // projection that consumes `ctx`. This keeps the output projection, whatever
 // shape it takes, entirely out of scope: only `n`'s own two inputs and
 // everything transitively upstream of the Transpose are examined.
-inline bool MatchAttention(Node* n, AttentionMatch& m) {
+//
+// With `allow_mask`, the Softmax input may also be Add(scores, mask) for any
+// `mask` operand: it is recorded in `m.attention_bias` and left for the caller
+// to validate (MatchAttentionBias), since that needs helpers defined below.
+inline bool MatchAttention(Node* n, AttentionMatch& m,
+                           bool allow_mask = false) {
   if (!CheckKind(n, kReshape) || n->inputs().size() != 2 ||
       n->outputs().size() != 1) {
     return false;
@@ -586,6 +610,11 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
   if (scores->uses().size() != 1) {
     return false;
   }
+  Node* mask_add = nullptr;
+  if (allow_mask && CheckKind(scores, kAdd) &&
+      scores->node()->inputs().size() == 2) {
+    mask_add = scores->node();
+  }
 
   std::vector<Node*> v_head_chain;
   Value* v_proj_out = nullptr;
@@ -599,7 +628,22 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
   Value* q_side = nullptr;
   Value* k_side = nullptr;
   std::vector<Node*> scale_chain;
-  if (!MatchScaledQKMatMul(scores, q_side, k_side, m.scale, scale_chain)) {
+  if (mask_add != nullptr) {
+    // Whichever Add operand is a scaled Q@K^T is the scores; the other one is
+    // the mask (Add is commutative, so either order computes the same sum).
+    for (int i = 0; i < 2 && m.attention_bias == nullptr; ++i) {
+      Value* cand = mask_add->input(i);
+      scale_chain.clear();
+      if (cand->uses().size() == 1 &&
+          MatchScaledQKMatMul(cand, q_side, k_side, m.scale, scale_chain)) {
+        m.attention_bias = mask_add->input(1 - i);
+      }
+    }
+    if (m.attention_bias == nullptr) {
+      return false;
+    }
+  } else if (!MatchScaledQKMatMul(scores, q_side, k_side, m.scale,
+                                  scale_chain)) {
     return false;
   }
 
@@ -654,6 +698,9 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
   m.dead_chain.push_back(tr_back);
   m.dead_chain.push_back(v_mm);
   m.dead_chain.push_back(softmax);
+  if (mask_add != nullptr) {
+    m.dead_chain.push_back(mask_add);
+  }
   for (Node* nd : v_head_chain) m.dead_chain.push_back(nd);
   for (Node* nd : m.v.chain) m.dead_chain.push_back(nd);
   for (Node* nd : scale_chain) m.dead_chain.push_back(nd);
@@ -1346,8 +1393,12 @@ inline bool MatchCausalAttention(Node* n, CausalAttentionMatch& m) {
 // takes the query and key lengths, so ORT's Attention gets a full [.., Sq, Skv]
 // block. Shapes come from q and k_t, which the emitted Attention keeps (the
 // scores' producers are removed by the rewrite).
-inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
-                                 Value* q, Value* k_t) {
+// ExpandMaskToSequenceDims is the general form, used directly by the
+// com.microsoft path: the query length is axis `sq_axis` of `sq_src` and the
+// key length axis `skv_axis` of `skv_src`.
+inline Value* ExpandMaskToSequenceDims(Graph& graph, Node* before, Value* mask,
+                                       Value* sq_src, int64_t sq_axis,
+                                       Value* skv_src, int64_t skv_axis) {
   auto make_ints = [&](std::vector<int64_t> v) {
     Tensor t;
     t.elem_type() = TensorProto_DataType_INT64;
@@ -1364,14 +1415,17 @@ inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
     return nd;
   };
   Node* mask_shape = insert(Symbol("Shape"), {mask});
-  Node* q_shape = insert(Symbol("Shape"), {q});
-  Node* kt_shape = insert(Symbol("Shape"), {k_t});
+  Node* q_shape = insert(Symbol("Shape"), {sq_src});
+  Node* kt_shape =
+      skv_src == sq_src ? q_shape : insert(Symbol("Shape"), {skv_src});
   Node* mask_bh = insert(Symbol("Slice"), {mask_shape->output(), make_ints({0}),
                                            make_ints({2}), make_ints({0})});
-  Node* sq = insert(Symbol("Slice"), {q_shape->output(), make_ints({2}),
-                                      make_ints({3}), make_ints({0})});
-  Node* skv = insert(Symbol("Slice"), {kt_shape->output(), make_ints({3}),
-                                       make_ints({4}), make_ints({0})});
+  Node* sq =
+      insert(Symbol("Slice"), {q_shape->output(), make_ints({sq_axis}),
+                               make_ints({sq_axis + 1}), make_ints({0})});
+  Node* skv =
+      insert(Symbol("Slice"), {kt_shape->output(), make_ints({skv_axis}),
+                               make_ints({skv_axis + 1}), make_ints({0})});
   Node* lengths = insert(Symbol("Concat"), {sq->output(), skv->output()});
   lengths->i_(Symbol("axis"), 0);
   Node* target =
@@ -1379,6 +1433,53 @@ inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
   target->i_(Symbol("axis"), 0);
   Node* expanded = insert(Symbol("Expand"), {mask, target->output()});
   return expanded->output();
+}
+
+inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
+                                 Value* q, Value* k_t) {
+  return ExpandMaskToSequenceDims(graph, before, mask, q, 2, k_t, 3);
+}
+
+// Validates MatchAttention's `m.attention_bias` (a no-op success when there is
+// none) for com.microsoft `Attention`'s `attention_bias` input: a float32,
+// rank-4 run-time value (computed from a graph input, like the padding mask
+// derived from `attention_mask`; a constant one keeps its existing handling)
+// whose dims are (batch or 1, num_heads or 1, S or 1, S or 1), S being X's
+// sequence length. ORT needs both sequence dims in full, so `expand` is set
+// when either one is 1 without being known to equal S.
+inline bool MatchAttentionBias(const AttentionMatch& m, bool& expand) {
+  expand = false;
+  Value* b = m.attention_bias;
+  if (b == nullptr) {
+    return true;
+  }
+  int budget = 64;
+  if (FetchConstantTensor(b) != nullptr || !DependsOnGraphInput(b, budget)) {
+    return false;
+  }
+  if (b->elemType() != TensorProto_DataType_FLOAT || !b->has_sizes() ||
+      b->sizes().size() != 4) {
+    return false;
+  }
+  const auto& bs = b->sizes();
+  const auto& xs = m.q.input->sizes();
+  auto is_one = [](const Dimension& d) { return d.is_int && d.dim == 1; };
+  if (!is_one(bs[0]) && !SameSeqDim(bs[0], xs[0])) {
+    return false;
+  }
+  if (!is_one(bs[1]) && !(bs[1].is_int && bs[1].dim == m.num_heads)) {
+    return false;
+  }
+  for (int i : {2, 3}) {
+    if (SameSeqDim(bs[i], xs[1])) {
+      continue;
+    }
+    if (!is_one(bs[i])) {
+      return false;
+    }
+    expand = true;
+  }
+  return true;
 }
 
 inline bool EmitCausalAttention(Node* n, Graph& graph,
@@ -1462,6 +1563,23 @@ struct FuseAttention final : public PredicateBasedPass {
                            PassOptimizationType::Compute) {}
   std::string getPassName() const override { return "fuse_attention"; }
 
+  // MatchAttention, plus the run-time additive mask form (see this file's
+  // top comment) wherever the ai.onnx form cannot take it: below opset 23 or
+  // when the backend excludes ai.onnx, and never for webgpu.
+  static bool MatchMicrosoftAttention(Node* n,
+                                      onnxsim::AttentionFusionBackend backend,
+                                      AttentionMatch& m, bool& expand_bias) {
+    if (!onnxsim::AttentionBackendAllowsMicrosoftForm(backend)) {
+      return false;
+    }
+    const bool allow_mask =
+        backend != onnxsim::AttentionFusionBackend::kWebGpu &&
+        (getOpsetVersion(*n->owningGraph()) < 23 ||
+         !onnxsim::AttentionBackendAllowsOnnxCausalForm(backend));
+    return MatchAttention(n, m, allow_mask) &&
+           MatchAttentionBias(m, expand_bias);
+  }
+
   // Which forms the attention_fusion_backend option allows (see
   // attention_fusion_backend.h). With the default kAuto both are tried, in the
   // same order as before the option existed.
@@ -1469,8 +1587,8 @@ struct FuseAttention final : public PredicateBasedPass {
     const onnxsim::AttentionFusionBackend backend =
         onnxsim::GetAttentionFusionBackend();
     AttentionMatch m;
-    if (onnxsim::AttentionBackendAllowsMicrosoftForm(backend) &&
-        MatchAttention(n, m)) {
+    bool expand_bias = false;
+    if (MatchMicrosoftAttention(n, backend, m, expand_bias)) {
       return true;
     }
     if (!onnxsim::AttentionBackendAllowsOnnxCausalForm(backend)) {
@@ -1490,8 +1608,8 @@ struct FuseAttention final : public PredicateBasedPass {
     const onnxsim::AttentionFusionBackend backend =
         onnxsim::GetAttentionFusionBackend();
     AttentionMatch m;
-    if (!(onnxsim::AttentionBackendAllowsMicrosoftForm(backend) &&
-          MatchAttention(n, m))) {
+    bool expand_bias = false;
+    if (!MatchMicrosoftAttention(n, backend, m, expand_bias)) {
       if (!onnxsim::AttentionBackendAllowsOnnxCausalForm(backend)) {
         return false;
       }
@@ -1564,6 +1682,20 @@ struct FuseAttention final : public PredicateBasedPass {
     attn->addInput(m.q.input);
     attn->addInput(weights_v);
     attn->addInput(bias_v);
+    if (m.attention_bias != nullptr) {
+      // mask_index and past are omitted: kUndefined outputs stand in for
+      // them (serialized back as empty input names, as in fuse_gqa.h).
+      for (int i = 0; i < 2; ++i) {
+        Node* undef = graph.create(kUndefined, 1);
+        undef->insertBefore(n);
+        undef->output()->setUniqueName("");
+        attn->addInput(undef->output());
+      }
+      attn->addInput(expand_bias ? ExpandMaskToSequenceDims(
+                                       graph, n, m.attention_bias, m.q.input,
+                                       1, m.q.input, 1)
+                                 : m.attention_bias);
+    }
     attn->i_(Symbol("num_heads"), m.num_heads);
     attn->f_(Symbol("scale"), static_cast<float>(m.scale));
     attn->is_(Symbol("qkv_hidden_sizes"), std::vector<int64_t>{nq, nk, nv});
