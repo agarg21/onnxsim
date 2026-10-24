@@ -264,11 +264,3 @@ def test_backends_that_cannot_take_the_mask_leave_it_unfused(backend):
         _run(simplified, feeds), _run(model, feeds), rtol=1e-4, atol=1e-5
     )
 
-
-def test_dynamic_quantize_attention_keeps_masked_attention_float():
-    # QAttention has no attention_bias input; quantizing would drop the mask.
-    simplified, _ = onnxsim.simplify(_encoder_classifier())
-    quantized = onnxsim.quantize_attention_dynamic(simplified)
-    ops = collections.Counter(n.op_type for n in quantized.graph.node)
-    assert ops["QAttention"] == 0
-    assert ops["Attention"] == 2

@@ -1443,10 +1443,16 @@ inline Value* ExpandMaskToScores(Graph& graph, Node* before, Value* mask,
 // Validates MatchAttention's `m.attention_bias` (a no-op success when there is
 // none) for com.microsoft `Attention`'s `attention_bias` input: a float32,
 // rank-4 run-time value (computed from a graph input, like the padding mask
-// derived from `attention_mask`; a constant one keeps its existing handling)
-// whose dims are (batch or 1, num_heads or 1, S or 1, S or 1), S being X's
-// sequence length. ORT needs both sequence dims in full, so `expand` is set
-// when either one is 1 without being known to equal S.
+// derived from `attention_mask`; a constant one keeps its existing handling).
+// The source graph's own Add requires it to broadcast with the [B, H, S, S]
+// scores, so each dim is 1 or the scores' size -- the (batch or 1, num_heads
+// or 1, ...) shape ORT accepts -- unless the mask is the larger side (say
+// [B, ...] against a batch-1 X, which makes the Add output larger than the
+// scores); a static dim that is neither 1 nor the scores' known size is
+// declined for that reason. Symbolic dims are taken as broadcast-compatible.
+// ORT needs both sequence dims in full, so `expand` is set unless both are
+// known to be S (a symbolic dim may still be 1 at run time, and expanding a
+// mask that is already [.., S, S] is a no-op).
 inline bool MatchAttentionBias(const AttentionMatch& m, bool& expand) {
   expand = false;
   Value* b = m.attention_bias;
@@ -1463,22 +1469,15 @@ inline bool MatchAttentionBias(const AttentionMatch& m, bool& expand) {
   }
   const auto& bs = b->sizes();
   const auto& xs = m.q.input->sizes();
-  auto is_one = [](const Dimension& d) { return d.is_int && d.dim == 1; };
-  if (!is_one(bs[0]) && !SameSeqDim(bs[0], xs[0])) {
+  auto fits = [](const Dimension& d, const Dimension& full) {
+    return !d.is_int || d.dim == 1 || !full.is_int || d.dim == full.dim;
+  };
+  Dimension heads(m.num_heads);
+  if (!fits(bs[0], xs[0]) || !fits(bs[1], heads) || !fits(bs[2], xs[1]) ||
+      !fits(bs[3], xs[1])) {
     return false;
   }
-  if (!is_one(bs[1]) && !(bs[1].is_int && bs[1].dim == m.num_heads)) {
-    return false;
-  }
-  for (int i : {2, 3}) {
-    if (SameSeqDim(bs[i], xs[1])) {
-      continue;
-    }
-    if (!is_one(bs[i])) {
-      return false;
-    }
-    expand = true;
-  }
+  expand = !SameSeqDim(bs[2], xs[1]) || !SameSeqDim(bs[3], xs[1]);
   return true;
 }
 
