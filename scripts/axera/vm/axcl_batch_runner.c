@@ -28,6 +28,19 @@
  *                                      one), by device-to-device copy: tensors
  *                                      pass between models without crossing the
  *                                      VM boundary
+ *   BUF <bytes>                     -> OK <buffer id>   (a zeroed device buffer)
+ *   BIND <id> I|O <idx> <buf> <off> -> OK; model <id>'s input / output <idx> reads /
+ *                                      writes <buf> + <off> bytes directly (no copy);
+ *                                      a later plain RUN puts its own buffers back
+ *   PLAN <file>                     -> OK <execute us> <total us>: runs the file's
+ *                                      lines in order, so a whole chain of models
+ *                                      costs one command:
+ *        X <id>                        execute model <id>
+ *        B <id> I|O <idx> <buf> <off>  bind (as BIND)
+ *        C <dbuf> <doff> <sbuf> <soff> <bytes>   device-to-device copy
+ *        W <buf> <off> <bytes> <file>  host file -> device
+ *        R <buf> <off> <bytes> <file>  device -> host file
+ *   FREEB <buf>                     -> OK
  *   QUIT
  *
  * Every error answers "ERR <text>" and keeps the process alive. Build in the
@@ -44,6 +57,7 @@
 
 #define MAX_MODELS 4096
 #define MAX_IO 64
+#define MAX_BUFS 65536
 
 typedef struct {
   int used;
@@ -60,6 +74,8 @@ typedef struct {
 } Model;
 
 static Model models[MAX_MODELS];
+static void *bufs[MAX_BUFS];
+static uint64_t buf_size[MAX_BUFS];
 static void *host_buf;
 static uint64_t host_cap;
 
@@ -381,6 +397,101 @@ static void cmd_runt(char *args) {
   printf("OK %ld\n", (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_usec - t0.tv_usec)));
 }
 
+/* ---- plan mode ------------------------------------------------------------------- */
+static void cmd_buf(const char *args) {
+  uint64_t n = strtoull(args, NULL, 10);
+  int b = -1;
+  for (int i = 0; i < MAX_BUFS; i++)
+    if (!bufs[i]) { b = i; break; }
+  if (b < 0 || !n) { printf("ERR buffer table full or size 0\n"); return; }
+  axclError e = axclrtMalloc(&bufs[b], n, AXCL_MEM_MALLOC_NORMAL_ONLY);
+  if (e) { bufs[b] = NULL; printf("ERR buffer alloc 0x%x\n", e); return; }
+  axclrtMemset(bufs[b], 0, n);
+  buf_size[b] = n;
+  printf("OK %d\n", b);
+}
+
+/* "<id> I|O <idx> <buf> <off>": 0 or an error text */
+static const char *bind(char *args) {
+  int id, idx, b; char io; unsigned long long off;
+  if (sscanf(args, "%d %c %d %d %llu", &id, &io, &idx, &b, &off) != 5) return "bad bind";
+  if (id < 0 || id >= MAX_MODELS || !models[id].used) return "bad model id";
+  if (b < 0 || b >= MAX_BUFS || !bufs[b]) return "bad buffer id";
+  Model *m = &models[id];
+  int in = io == 'I';
+  if (idx < 0 || (uint32_t)idx >= (in ? m->n_in : m->n_out)) return "bad io index";
+  uint64_t n = in ? m->in_size[idx] : m->out_size[idx];
+  if (off + n > buf_size[b]) return "binding past the buffer end";
+  void *p = (char *)bufs[b] + off;
+  axclError e = in ? axclrtEngineSetInputBufferByIndex(m->io, idx, p, n)
+                   : axclrtEngineSetOutputBufferByIndex(m->io, idx, p, n);
+  if (e) return "set buffer failed";
+  /* in_dev / out_dev stay the model's own buffers (freed on unload, rebound by a plain RUN);
+     the flags say the engine points elsewhere, as RUNT's tensor-store bindings do */
+  if (in) m->in_bound[idx] = 1; else m->out_bound[idx] = 1;
+  return 0;
+}
+
+static void cmd_plan(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) { printf("ERR open %s\n", path); return; }
+  static char ln[4096];
+  struct timeval t0, t1, a, b;
+  long exec_us = 0;
+  int lineno = 0;
+  gettimeofday(&t0, NULL);
+  while (fgets(ln, sizeof ln, f)) {
+    lineno++;
+    ln[strcspn(ln, "\r\n")] = 0;
+    char op = ln[0];
+    if (!op || op == '#') continue;
+    char *args = ln + 1;
+    if (op == 'X') {
+      int id = atoi(args);
+      if (id < 0 || id >= MAX_MODELS || !models[id].used) { fclose(f); printf("ERR plan %d: bad model\n", lineno); return; }
+      gettimeofday(&a, NULL);
+      axclError e = axclrtEngineExecute(models[id].model_id, models[id].ctx_id, 0, models[id].io);
+      gettimeofday(&b, NULL);
+      exec_us += (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_usec - a.tv_usec);
+      if (e) { fclose(f); printf("ERR plan %d: execute 0x%x\n", lineno, e); return; }
+    } else if (op == 'B') {
+      const char *err = bind(args);
+      if (err) { fclose(f); printf("ERR plan %d: %s\n", lineno, err); return; }
+    } else if (op == 'C') {
+      int db, sb; unsigned long long doff, soff, n;
+      if (sscanf(args, "%d %llu %d %llu %llu", &db, &doff, &sb, &soff, &n) != 5 ||
+          db < 0 || db >= MAX_BUFS || sb < 0 || sb >= MAX_BUFS || !bufs[db] || !bufs[sb] ||
+          doff + n > buf_size[db] || soff + n > buf_size[sb]) {
+        fclose(f); printf("ERR plan %d: bad copy\n", lineno); return;
+      }
+      axclError e = axclrtMemcpy((char *)bufs[db] + doff, (char *)bufs[sb] + soff, n, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+      if (e) { fclose(f); printf("ERR plan %d: d2d 0x%x\n", lineno, e); return; }
+    } else if (op == 'W' || op == 'R') {
+      int bi; unsigned long long off, n; char file[1024];
+      if (sscanf(args, "%d %llu %llu %1023s", &bi, &off, &n, file) != 4 || bi < 0 || bi >= MAX_BUFS ||
+          !bufs[bi] || off + n > buf_size[bi]) {
+        fclose(f); printf("ERR plan %d: bad transfer\n", lineno); return;
+      }
+      void *h = host(n);
+      axclError e = 0;
+      if (op == 'W') {
+        if (!h || read_file(file, h, n)) { fclose(f); printf("ERR plan %d: read %s\n", lineno, file); return; }
+        e = axclrtMemcpy((char *)bufs[bi] + off, h, n, AXCL_MEMCPY_HOST_TO_DEVICE);
+      } else {
+        if (!h) { fclose(f); printf("ERR plan %d: host buffer\n", lineno); return; }
+        e = axclrtMemcpy(h, (char *)bufs[bi] + off, n, AXCL_MEMCPY_DEVICE_TO_HOST);
+        if (!e && write_file(file, h, n)) { fclose(f); printf("ERR plan %d: write %s\n", lineno, file); return; }
+      }
+      if (e) { fclose(f); printf("ERR plan %d: transfer 0x%x\n", lineno, e); return; }
+    } else {
+      fclose(f); printf("ERR plan %d: unknown op %c\n", lineno, op); return;
+    }
+  }
+  fclose(f);
+  gettimeofday(&t1, NULL);
+  printf("OK %ld %ld\n", exec_us, (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_usec - t0.tv_usec)));
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IOLBF, 0);
   axclError e;
@@ -411,7 +522,16 @@ int main(void) {
     }
     else if (!strncmp(line, "RUNR ", 5)) cmd_run(line + 5, 1);
     else if (!strncmp(line, "RUN ", 4)) cmd_run(line + 4, 0);
-    else if (!strncmp(line, "UNLOAD ", 7)) {
+    else if (!strncmp(line, "BUF ", 4)) cmd_buf(line + 4);
+    else if (!strncmp(line, "BIND ", 5)) {
+      const char *err = bind(line + 5);
+      if (err) printf("ERR %s\n", err); else printf("OK\n");
+    } else if (!strncmp(line, "PLAN ", 5)) cmd_plan(line + 5);
+    else if (!strncmp(line, "FREEB ", 6)) {
+      int b = atoi(line + 6);
+      if (b >= 0 && b < MAX_BUFS && bufs[b]) { axclrtFree(bufs[b]); bufs[b] = NULL; printf("OK\n"); }
+      else printf("ERR bad buffer id\n");
+    } else if (!strncmp(line, "UNLOAD ", 7)) {
       int id = atoi(line + 7);
       if (id >= 0 && id < MAX_MODELS && models[id].used) { unload(&models[id]); printf("OK\n"); }
       else printf("ERR bad id\n");
@@ -421,6 +541,8 @@ int main(void) {
   for (int i = 0; i < MAX_TENSORS; i++) tensor_free(&tensors[i]);
   for (int i = 0; i < MAX_MODELS; i++)
     if (models[i].used) unload(&models[i]);
+  for (int i = 0; i < MAX_BUFS; i++)
+    if (bufs[i]) axclrtFree(bufs[i]);
   axclrtEngineFinalize();
   axclrtResetDevice(devs.devices[0]);
   axclFinalize();

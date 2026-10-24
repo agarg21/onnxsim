@@ -228,6 +228,54 @@ def _read_bytes(path: str) -> bytes:
         return f.read()
 
 
+class Plan:
+    """A chain of runner operations executed by ``AXSession.run_plan`` in one
+    command: model executions, (re)bindings, device-to-device copies, and
+    host transfers through files on the share. Build it once per step (or
+    reuse ``lines``); every tensor between models stays on the device."""
+
+    def __init__(self, session: AXSession, tag: str = ""):
+        self.s, self.tag, self.lines = session, tag, []
+        self._n = itertools.count()
+
+    def execute(self, m: Model) -> Plan:
+        self.lines.append(f"X {m.id}")
+        return self
+
+    def bind(self, m: Model, io: str, which, buf: int, offset: int = 0) -> Plan:
+        self.lines.append(
+            f"B {m.id} {io} {AXSession._io_index(m, io, which)} {buf} {int(offset)}"
+        )
+        return self
+
+    def copy(self, dst: int, dst_off: int, src: int, src_off: int, nbytes: int) -> Plan:
+        self.lines.append(f"C {dst} {int(dst_off)} {src} {int(src_off)} {int(nbytes)}")
+        return self
+
+    def write(self, buf: int, x: np.ndarray, offset: int = 0) -> Plan:
+        """Upload ``x`` into ``buf + offset`` when the plan runs."""
+        name = f"t/w{self.tag}_{next(self._n)}.bin"
+        data = np.ascontiguousarray(x)
+        data.tofile(os.path.join(self.s.host_dir, name))
+        self.lines.append(
+            f"W {buf} {int(offset)} {data.nbytes} {self.s.guest_dir}/{name}"
+        )
+        return self
+
+    def read(self, buf: int, nbytes: int, offset: int = 0) -> str:
+        """Download ``nbytes`` of ``buf + offset`` when the plan runs; returns
+        the key for ``result``."""
+        name = f"t/r{self.tag}_{next(self._n)}.bin"
+        self.lines.append(
+            f"R {buf} {int(offset)} {int(nbytes)} {self.s.guest_dir}/{name}"
+        )
+        return name
+
+    def result(self, key: str, dtype, shape=None) -> np.ndarray:
+        a = np.fromfile(os.path.join(self.s.host_dir, key), dtype=dtype)
+        return a.reshape(shape) if shape is not None else a
+
+
 class AXSession:
     def __init__(
         self,
@@ -422,6 +470,48 @@ class AXSession:
                     pass
                 raise
         return m
+
+    # -- plan mode: device buffers bound to model I/O, a whole chain per command --
+    def buffer(self, nbytes: int) -> int:
+        """A zeroed device buffer of ``nbytes``; returns its id."""
+        return int(self._cmd(f"BUF {int(nbytes)}").split()[1])
+
+    def free_buffer(self, buf: int) -> None:
+        self._cmd(f"FREEB {buf}")
+
+    @staticmethod
+    def _io_index(m: Model, io: str, which) -> int:
+        specs = m.inputs if io == "I" else m.outputs
+        if isinstance(which, int):
+            return which
+        return [s.name for s in specs].index(which)
+
+    def bind(self, m: Model, io: str, which, buf: int, offset: int = 0) -> None:
+        """Point model ``m``'s input (``io="I"``) or output (``"O"``) ``which``
+        (index or name) at ``buf + offset`` bytes: the model then reads / writes
+        that buffer directly, so a producer's output buffer can be a consumer's
+        input with no copy. A later plain ``run`` puts the model's own buffers
+        back."""
+        self._cmd(
+            f"BIND {m.id} {io} {self._io_index(m, io, which)} {buf} {int(offset)}"
+        )
+
+    def run_plan(self, plan: Plan) -> tuple[int, int]:
+        """Execute ``plan`` in the runner with one command. Returns
+        ``(execute microseconds, total microseconds)``; ``plan.result`` then
+        reads the plan's ``read`` outputs."""
+        path = os.path.join(self.host_dir, "t", f"plan{plan.tag}.txt")
+        with open(path, "w") as f:
+            f.write("\n".join(plan.lines) + "\n")
+        ex, total = (
+            int(v)
+            for v in self._cmd(f"PLAN {self.guest_dir}/t/plan{plan.tag}.txt").split()[
+                1:3
+            ]
+        )
+        self.exec_us += ex
+        self.runs += sum(1 for ln in plan.lines if ln.startswith("X "))
+        return ex, total
 
     # -- device tensor store: tensors that stay on the device between models --
     def tput(self, name: str, x: np.ndarray) -> None:
