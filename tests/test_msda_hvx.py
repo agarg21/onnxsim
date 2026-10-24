@@ -53,7 +53,11 @@ import split  # noqa: E402
 for _name in ("model", "split", "msda_ref"):
     sys.modules.pop(_name, None)
 for _p in (BEV, BEV / "msda_hvx", CORE):
-    sys.path.remove(str(_p))
+    # every copy: split.py inserts BEV (and CORE) again on import, and one left behind put bevformer_tiny/ on the
+    # session's path -- its tinygrad_port/ was once named tinygrad/, which then made find_spec("tinygrad") succeed
+    # (an empty namespace package) and the tinygrad-gated tests fail instead of skipping
+    while str(_p) in sys.path:
+        sys.path.remove(str(_p))
 
 KINDS = ["rtdetr_decoder", "bevformer_tsa", "bevformer_sca", "loc_small"]
 
