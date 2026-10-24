@@ -60,6 +60,27 @@ guest is survivable there too.
 
 ## Use it
 
+Before device work (and whenever the card stops answering), run the
+read-only preflight; it checks each failure mode below and prints the fix:
+
+```sh
+bash scripts/axera/vm/check_vm.sh [vm-name] [--health]
+```
+
+It catches: the host AXCL stack loaded or the blacklist missing; the card
+re-enumerated to a new PCI address the VM's `ax650` device no longer points at
+(Thunderbolt, `63:00.0` -> `03:00.0` on 2026-10-24); guest AXCL modules built
+for the wrong kernel (DKMS uses the *running* kernel's headers, so a module
+built during an unattended kernel upgrade fails to load after the reboot with
+"disagrees about version of symbol"); missing guest `iommu=pt` / non-identity
+IOMMU domain; card firmware (`/lib/firmware/axcl/ax650_card.pac`) from a
+different AXCL release than the installed `axclhost` -- a V2.25.0 pac under the
+3.6 runtime handshakes and heartbeats fine but every command fails `invalid
+response message payload` / `0x80300909`, and the card shows as `UNKNOWN`;
+`slot_index_force` unset; a dead card. `--health` also runs the native Relu
+health check. Note `heartbeat_recv_thread ... timeout: 9000` in the guest
+`dmesg` is a per-heartbeat debug trace, not an error.
+
 ```sh
 export AXCL_LXD_VM=axcl-vm
 python -m pytest tests/test_axera_mcode_structure.py -k on_device
