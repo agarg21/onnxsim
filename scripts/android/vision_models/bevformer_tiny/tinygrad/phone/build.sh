@@ -8,6 +8,8 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MSDA="$(cd "$HERE/../../../../msda_hvx" && pwd)"
+# the hand kernel headers (msda_kernel.h, msda_shape.h) live in the tinygrad fork; link them into msda_hvx/ first
+"$MSDA/../fetch_hand_kernels.sh" >/dev/null
 : "${GEN:?set GEN to the capture_msda.py output root}"
 HEXAGON_SDK_ROOT="${HEXAGON_SDK_ROOT:-/mnt/data/cache/tvm-hexagon/qualcomm/Hexagon_SDK/6.4.0.2}"
 HEXAGON_TOOLCHAIN="${HEXAGON_TOOLCHAIN:-$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.04/Tools}"

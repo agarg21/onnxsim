@@ -114,7 +114,7 @@ def trace(c: dict, fn=None) -> tuple[np.ndarray, dict]:
       out = fn(c)   # another graph over the same case arrays (the sparse SCA)
     else:
       vis = None if c["vis"] is None else Tensor(c["vis"].astype(np.float32))
-      out = ({"custom": T.msda_custom, "fused": T.msda_fused}.get(os.environ.get("MSDA_IMPL", ""), T.msda))(Tensor(c["value"].reshape(-1)), (c["H"], c["W"]), Tensor(c["ref"]), Tensor(c["off"]), Tensor(c["attw"]), vis)
+      out = {"custom": T.msda_custom}.get(os.environ.get("MSDA_IMPL", ""), T.msda)(Tensor(c["value"].reshape(-1)), (c["H"], c["W"]), Tensor(c["ref"]), Tensor(c["off"]), Tensor(c["attw"]), vis)
     out = out.realize()
     out_va = out.uop.buffer._buf.va_addr
     got = out.numpy()
