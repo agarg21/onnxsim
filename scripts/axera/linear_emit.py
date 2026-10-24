@@ -567,8 +567,12 @@ def emit_linear_from_samples(
 #   requantization block. Input pair ``j`` of a row sits in 72-byte block ``j // 18`` at
 #   ``j % 18``: low-nibble plane at +0, high plane at +18, outputs 16..31 of the group at
 #   +36; unused slots hold code 128.
-# * Segments (input pairs): ``k = 576`` is one segment of 288; ``k = 1536`` is
-#   ``[224, 272, 272]`` (the first holds ``pairs mod 272``). No other ``k`` was built.
+# * Segments (input pairs): ``nseg = ceil(pairs / 288)`` segments, the first holding
+#   ``pairs - 272 * (nseg - 1)`` and the rest 272 each: ``k = 576`` is ``[288]``,
+#   ``768`` is ``[112, 272]``, ``1536`` is ``[224, 272, 272]`` and ``3072`` is
+#   ``[176, 272 x 5]``. Checked (native U16 template / held-out pairs, byte-equal
+#   emits) at those four ``k`` only; at any other ``k`` the template's ``npu_params``
+#   size check (``linear_params_u16``) refuses a layout the rule gets wrong.
 # * IO tail: 40 bytes, 100 for the 49152-wide layer (kept from the template).
 # * Main engine: QUANT and the first DEQUANT job as in the U8 layer, zero points up to
 #   65535; a wide output is split over CORE / DEQUANT pairs whose later DEQUANT jobs reuse
@@ -576,24 +580,24 @@ def emit_linear_from_samples(
 # * Core (segments other than the main engine): ``0x03d0`` holds ``zp_x`` in its low half
 #   (the upper half is per-record mode bits), so another input calibration rewrites it.
 
-U16_K = (576, 1536)
+U16_K = (576, 768, 1536, 3072)  # input widths the segment rule was checked on
 U16_BLOCK = 18  # input pairs per 72-byte block
-U16_SEGMENT = 272  # input pairs per segment (k = 1536)
+U16_SEGMENT = 272  # input pairs per segment after the first
+U16_FIRST_MAX = 288  # input pairs a single segment holds
 U16_TAILS = (40, 100)
 REG_CORE_ZP_X = 0x03D0
 
 
 def u16_segments(k: int) -> list[int]:
-    """Input pairs per segment of a U16 layer."""
-    if k not in U16_K:
+    """Input pairs per segment of a U16 layer: ``ceil(pairs / 288)`` segments,
+    the first ``pairs - 272 * (n - 1)``, the rest 272 (checked at ``U16_K``)."""
+    if k <= 0 or k % 2:
         raise ValueError(
-            f"U16 linear layer with k = {k}: only k in {list(U16_K)} was built"
+            f"U16 linear layer with k = {k}: k must be a positive even number"
         )
     pairs = k // 2
-    if k == 576:
-        return [pairs]
-    first = pairs % U16_SEGMENT or U16_SEGMENT
-    return [first] + [U16_SEGMENT] * ((pairs - first) // U16_SEGMENT)
+    nseg = -(-pairs // U16_FIRST_MAX)
+    return [pairs - U16_SEGMENT * (nseg - 1)] + [U16_SEGMENT] * (nseg - 1)
 
 
 def _u16_row_bytes(pairs: int) -> int:

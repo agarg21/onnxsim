@@ -11,9 +11,11 @@ attention-mask Add), Div, ReduceMean, Sqrt, Sigmoid, Softmax and dynamic
 MatMul is a FullyConnected (``linear_emit.emit_linear_u16``).
 
 A fused program (several ops in one native build: an RMSNorm, a SiLU block,
-a RoPE apply) goes through ``retarget_graph(template, model, template_q,
-target_q)`` with ``calibrate_graph(directory)``: the same rules per graph
-node, node i's formulas only in the i-th CORE job of the main engine.
+a RoPE apply, a fused attention) goes through ``retarget_graph(template,
+model, template_q, target_q)`` with ``calibrate_graph(directory)``: the same
+rules per graph node; node i's formulas only in the i-th CORE job of the main
+engine when the template has one CORE job per node, in any CORE job
+otherwise.
 
 How a record is found
 ---------------------
@@ -30,10 +32,11 @@ template whose tensors differ).
 
 The formulas are the U8 rules of ``graph_stitch`` at 16 bits, plus:
 
-* Add: ``0x1ea0 = 15 - k``, with ``k`` the shift that brings both scale
-  ratios below 1 (``graph_stitch.add_const``), and the zero-point offset in
-  ``Q(15 - k)``; with a constant operand the U16 constant comes first in
-  ``npu_params`` and the ratio constant follows at byte 2.
+* Add: ``0x1ea0 = 15 - k``, with ``k`` the smallest shift that stores both
+  scale ratios as u16 ``Q(15 - k)`` (``add_shift``; a ratio of exactly 1.0
+  keeps ``k = 0``), and the zero-point offset in ``Q(15 - k)``; with a
+  constant operand the U16 constant comes first in ``npu_params`` and the
+  ratio constant follows at byte 2.
 * dynamic MatMul: ``npu_params`` holds lane blocks ``zp_y``, ``M``, ``zp_y``,
   ``256 M`` (``M = s_a s_b / s_y``).
 * Sigmoid: a 256-entry u16 table, one entry per 256 input codes
@@ -93,9 +96,37 @@ def _fbits(v) -> int:
     return int(np.asarray(F(v)).view(np.uint32))
 
 
+#: data-movement ops: no calibration of their own (Pulsar2's quant json can leave
+#: their output, e.g. a fused program's graph output, without an entry)
+PASS_THROUGH = ("Reshape", "Transpose", "Flatten", "Squeeze", "Unsqueeze")
+
+
+def propagate(
+    model, q: Mapping[str, tuple[float, int]]
+) -> dict[str, tuple[float, int]]:
+    """``q`` with every tensor that passes through a data-movement node without
+    a calibration of its own given its neighbour's."""
+    m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
+    q = dict(q)
+    moves = [
+        (n.input[0], n.output[0]) for n in m.graph.node if n.op_type in PASS_THROUGH
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for a, b in moves:
+            if a in q and b not in q:
+                q[b], changed = q[a], True
+            elif b in q and a not in q:
+                q[a], changed = q[b], True
+    return q
+
+
 def quant_of(directory: str) -> dict[str, tuple[float, int]]:
     """``{tensor: (scale, zero point)}`` of a build's ``quant_axmodel.json``
-    (per-tensor entries only)."""
+    (per-tensor entries only; entries without a scale, such as a Reshape's
+    shape constant, are skipped). With the build's ``model.onnx`` present, a
+    data-movement node's uncalibrated side takes its neighbour's (``propagate``)."""
     q = json.load(open(os.path.join(directory, "out", "quant", "quant_axmodel.json")))
     out = {}
     for tc in q["tensor_configs"].values():
@@ -103,19 +134,30 @@ def quant_of(directory: str) -> dict[str, tuple[float, int]]:
             v = q["values"].get(
                 str(c["hash"])
             )  # absent: an inner tensor's consumer side
-            if v is not None and len(v["scale"]) == 1:
+            if v is not None and v.get("scale") is not None and len(v["scale"]) == 1:
                 out[t] = (float(v["scale"][0]), int(v["zero_point"][0]))
-    return out
+    model = os.path.join(directory, "model.onnx")
+    return propagate(model, out) if os.path.exists(model) else out
 
 
 # ---- calibration --------------------------------------------------------------------
-def unsigned_minmax(lo: float, hi: float) -> tuple[float, int]:
-    """U16 MinMax of a range folded with 0: ``zp = rint(-lo / s)``, except a
-    symmetric range (``lo == -hi``, e.g. RoPE's sin table), where Pulsar2
-    gives 32767 although ``-lo / s`` rounds to 32768."""
+#: Pulsar2's smallest scale: an eps constant of 1e-6 gets float32(1e-10), not 1e-6 / 65535
+MIN_SCALE = F(1e-10)
+
+
+def unsigned_minmax(
+    lo: float, hi: float, symmetric_32767: bool = True
+) -> tuple[float, int]:
+    """U16 MinMax of a range folded with 0: ``zp = rint(-lo / s)``. At a
+    symmetric range (``lo == -hi``, where ``-lo / s`` is exactly 32767.5)
+    Pulsar2 gives 32767 for a Mul operand (RoPE's sin table) but rint's 32768
+    for an Add input (a [-1, 1] calibration); ``symmetric_32767`` picks the
+    former. Fitted on five such builds only; ``calibrate`` passes it per op.
+    The scale is at least ``MIN_SCALE`` (a tiny constant such as an RMSNorm's
+    eps)."""
     lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
-    s = F((hi - lo) / 65535.0)
-    if lo == -hi and hi > 0:
+    s = max(F((hi - lo) / 65535.0), MIN_SCALE)
+    if symmetric_32767 and lo == -hi and hi > 0:
         return float(s), 32767
     return float(s), int(np.clip(np.rint(-lo / float(s)), 0, 65535))
 
@@ -153,7 +195,7 @@ def calibrate(directory: str, op: str) -> dict[str, tuple[float, int]]:
         q[n] = (
             signed_absmax(np.abs(a).max())
             if op == "MatMul"
-            else unsigned_minmax(a.min(), a.max())
+            else unsigned_minmax(a.min(), a.max(), symmetric_32767=op == "Mul")
         )
     if op != "MatMul":
         for t in m.graph.initializer:
@@ -165,6 +207,18 @@ def calibrate(directory: str, op: str) -> dict[str, tuple[float, int]]:
 
 
 # ---- record formulas ----------------------------------------------------------------
+def add_shift(ra: float, rb: float) -> int:
+    """Add's shift ``k`` (``0x1ea0 = 15 - k``): the smallest ``k`` with
+    ``round(max(ra, rb) * 2^(15 - k)) <= 32768``, the ratios stored as u16
+    ``Q(15 - k)``. A ratio of exactly 1.0 (an eps Add whose input and output
+    share a scale) keeps ``k = 0`` and stores 32768; ``graph_stitch.add_const``'s
+    U8 rule (``ratio < 1``) would shift it."""
+    k = 0
+    while round(max(ra, rb) * 2.0 ** (15 - k)) > 32768:
+        k += 1
+    return k
+
+
 def candidates(
     op: str,
     q: Mapping[str, tuple[float, int]],
@@ -187,15 +241,16 @@ def candidates(
         c["mul_lane"] = _fbits(s[out] / (s[a] * s[b]))
     elif op == "Add":
         a, b = inputs
-        k = 0
-        while max(s[a] / s[out], s[b] / s[out]) * 2.0**-k >= 1.0:
-            k += 1
+        ra, rb = s[a] / s[out], s[b] / s[out]
+        k = add_shift(ra, rb)
         c[f"add_shift@{ADD_SHIFT:#06x}"] = 15 - k
         c["add_offset"] = int(
-            (z[out] - z[a] * gs._f32(s[a] / s[out]) - z[b] * gs._f32(s[b] / s[out]))
-            * 2 ** (15 - k)
+            (z[out] - z[a] * gs._f32(ra) - z[b] * gs._f32(rb)) * 2 ** (15 - k)
         )
-        c["add_const"] = struct.unpack("<I", gs.add_const(s[a], s[b], s[out]))[0]
+        c["add_const"] = struct.unpack(
+            "<I",
+            struct.pack("<2H", *[int(round(r * 2.0 ** (15 - k))) for r in (ra, rb)]),
+        )[0]
     elif op == "Div":
         a, b = inputs
         c["div_lane"] = _fbits(s[a] / (s[b] * s[out]))
@@ -370,14 +425,31 @@ def graph_nodes(model) -> list[tuple[str, tuple, str, dict]]:
     return out
 
 
+def _tensor_candidates(q) -> dict[str, int]:
+    """Per-tensor formulas only: a data-movement node's (it has none of its own)."""
+    c = {}
+    for t, (s, z) in q.items():
+        c[f"zp:{t}"], c[f"inv:{t}"], c[f"s:{t}"] = z, _fbits(1 / F(s)), _fbits(s)
+    return {k: v & 0xFFFFFFFF for k, v in c.items()}
+
+
 def _graph_candidates(nodes, q) -> dict[str, int]:
     c = {}
     for i, (op, ins, out, attrs) in enumerate(nodes):
-        sub = {t: q[t] for t in {*ins, out}}
-        used = ins[:1] if op in UNARY else ins
-        for k, v in candidates(op, sub, used, out, attrs).items():
+        sub = {t: q[t] for t in {*ins, out} if t in q}
+        if op in PASS_THROUGH:
+            got = _tensor_candidates(sub)
+        else:
+            used = ins[:1] if op in UNARY else ins
+            got = candidates(op, sub, used, out, attrs)
+        for k, v in got.items():
             c[f"n{i}|{k}"] = v
     return c
+
+
+def _core_jobs(template) -> int:
+    segs = _segs(gs.load_model(template))
+    return sum(1 for role, *_ in le._jobs(segs[gs.MAIN]) if role == "CORE")
 
 
 def retarget_graph(
@@ -389,41 +461,55 @@ def retarget_graph(
 ) -> onnx.ModelProto:
     """``retarget`` for a fused program (several ops in one native build).
     ``model`` is its float graph; the calibrations cover every tensor, inner
-    ones included (``quant_of`` / ``calibrate_graph``). Node i's formulas may
-    only sit in the i-th CORE job of the main engine (CORE jobs follow the
-    node order); QUANT jobs hold a graph input's ``1 / s`` and zero point,
-    the DEQUANT job the output's ``s`` and zero point; PARAM jobs and the
-    other segments any node's."""
+    ones included (``quant_of`` / ``calibrate_graph``).
+
+    When the template has one CORE job per graph node (RMSNorm, SiLU, RoPE
+    apply), node i's formulas may only sit in the i-th CORE job of the main
+    engine (CORE jobs follow the node order) and QUANT jobs hold a graph
+    input's ``1 / s`` and zero point: the strongest disambiguation. Otherwise
+    (fused attention: Softmax takes two CORE jobs, a Transpose quantizes its
+    own output; a whole-layer attention with Reshapes), any node's formulas
+    may sit in any CORE job and a QUANT job may hold any tensor's ``1 / s``
+    and zero point; a record matching two formulas with different targets is
+    still refused. The DEQUANT job holds the output's ``s`` and zero point;
+    PARAM jobs and the other segments any node's. Data-movement nodes
+    (``PASS_THROUGH``) contribute per-tensor formulas only."""
     m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
     nodes = graph_nodes(m)
     consts = {i.name for i in m.graph.initializer}
     graph_ins = [i.name for i in m.graph.input if i.name not in consts]
     out = out or m.graph.output[0].name
+    template_q, target_q = propagate(m, template_q), propagate(m, target_q)
     ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
+    strict = _core_jobs(template) == len(nodes)
 
     def allowed(tag, name, reg):
         node, base = name.split("|", 1)
         if "@" in base and int(base.split("@")[1], 16) != reg:
             return False
         if tag == "QUANT":
-            return base in {f"inv:{t}" for t in graph_ins} | {
-                f"zp:{t}" for t in graph_ins
-            }
+            if strict:
+                return base in {f"inv:{t}" for t in graph_ins} | {
+                    f"zp:{t}" for t in graph_ins
+                }
+            return base.split(":", 1)[0] in ("inv", "zp")
         if tag == "DEQUANT":
             return base in (f"s:{out}", f"zp:{out}")
-        if tag.startswith("CORE"):
+        if tag.startswith("CORE") and strict:
             return node == f"n{tag[4:]}"
         return True
 
-    return _rewrite(template, ct, cn, allowed, n_core=len(nodes))
+    return _rewrite(template, ct, cn, allowed, n_core=len(nodes) if strict else None)
 
 
 def calibrate_graph(directory: str) -> dict[str, tuple[float, int]]:
     """``calibrate`` for a fused program: U16 MinMax of every tensor (inputs,
     constants, inner tensors, output) over the float forward of the whole
-    graph. Pulsar2's inner scales can be a float32 ulp off this (seen on a
-    fused RMSNorm); the zero points agree."""
+    graph; both operands of every MatMul are signed (``signed_absmax``), as
+    Pulsar2 quantizes them. Pulsar2's inner scales can be a float32 ulp or two
+    off this (seen on fused RMSNorms and attention); the zero points agree."""
     m = onnx.load(os.path.join(directory, "model.onnx"))
+    signed = {t for n in m.graph.node if n.op_type == "MatMul" for t in n.input}
     consts = {i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer}
     ins = [i.name for i in m.graph.input if i.name not in consts]
     data = {n: _samples(os.path.join(directory, "dataset", f"{n}.tar")) for n in ins}
@@ -437,7 +523,14 @@ def calibrate_graph(directory: str) -> dict[str, tuple[float, int]]:
                 continue
             lo[k] = min(lo.get(k, np.inf), float(a.min()))
             hi[k] = max(hi.get(k, -np.inf), float(a.max()))
-    q = {k: unsigned_minmax(lo[k], hi[k]) for k in lo}
+    q = {
+        k: (
+            signed_absmax(max(abs(lo[k]), abs(hi[k])))
+            if k in signed
+            else unsigned_minmax(lo[k], hi[k])
+        )
+        for k in lo
+    }
     for k, a in consts.items():
         q[k] = unsigned_minmax(a.min(), a.max())
     return q
@@ -448,8 +541,17 @@ def compare(got, want) -> list[str]:
     programs: ``npu_params`` and, per segment, every record but the A8 ones in
     order (segment 0's slot table as a set) and the A8 records as a set. The
     IO names and their order (which flips between builds, with the A8 slot
-    records that follow it) are not compared."""
+    records that follow it) are not compared; when the two programs list their
+    inputs in different orders, their A8 slot records follow different orders
+    too (with more than two inputs even their multiset changes), so the A8
+    records are then not compared either."""
     diffs = []
+
+    def order(m):
+        blob = gs.parse_blob(bytes(mre.mcode_initializer(m).raw_data))
+        return [name for name, _ in blob["inputs"]]
+
+    same_io = order(got) == order(want)
     pa = next(i.raw_data for i in got.graph.initializer if i.name == "npu_params")
     pb = next(i.raw_data for i in want.graph.initializer if i.name == "npu_params")
     if pa != pb:
@@ -461,7 +563,7 @@ def compare(got, want) -> list[str]:
         lo, hi = gs.slot_table(rb) if si == 0 else (0, 0)
         if sorted(ra[lo:hi]) != sorted(rb[lo:hi]):
             diffs.append("segment 0 slot table")
-        if sorted(r for r in ra if r[0] == gs.A8) != sorted(
+        if same_io and sorted(r for r in ra if r[0] == gs.A8) != sorted(
             r for r in rb if r[0] == gs.A8
         ):
             diffs.append(f"segment {si}: A8 records")

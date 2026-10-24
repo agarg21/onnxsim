@@ -118,6 +118,8 @@ GROUPS = {
     "smx129": ("Softmax", ("x",), None, [(f"{RC}/smx16", "y")] + _v("smx129", 4)),
     "score": ("MatMul", ("a", "b"), None, [(f"{RC}/score16", "y")] + _v("score", 4)),
     "pv": ("MatMul", ("a", "b"), None, [(f"{RC}/pv16", "y")] + _v("pv", 4)),
+    # llama-160m's residual Add (an input over exactly [-1, 1]: zero point 32768)
+    "add768": ("Add", ("a", "b"), None, _v("add768", 4)),
 }
 PAIRS = [
     (g, t, n)
@@ -220,6 +222,9 @@ CALIBRATED = [
 CALIBRATED += [
     (f"{V}/madd129/v{i}", "Add") for i in range(4)
 ]  # v3: an exact .5 at an asymmetric range
+CALIBRATED += [
+    (f"{V}/add768/v{i}", "Add") for i in range(4)
+]  # an Add input over [-1, 1]: 32768, where a Mul operand gets 32767
 
 
 @pytest.mark.parametrize("directory,op", CALIBRATED)
@@ -283,6 +288,24 @@ FUSED = {
     "silu1536": "SiLU gate, up -> y (Sigmoid, Mul, Mul)",
     "rope576": "RoPE apply q, r, c, sn -> y (Mul, Mul, Add)",
     "rope192": "RoPE apply at 192",
+    "crms576": "coarse RMS x -> x / Sqrt(ReduceMean(x*x) + eps), no gain",
+    "attn3": "attention of one kv group: q3 [3,64], K, V [129,64], mask -> [3,64]; "
+    "7 CORE jobs for 5 nodes (Softmax takes two, Transpose quantizes its output)",
+    "attn_mha768": "llama-160m's whole-layer MHA attention: q [1,768], K, V [129,768], mask "
+    "-> [1,768], Reshape / Transpose inside; four inputs whose listing order flips",
+    "crms768": "coarse RMS at 768 (eps 1e-6: the eps constant gets MIN_SCALE)",
+    "rms768": "RMSNorm at 768",
+    "rope768": "RoPE apply at 768",
+    "silu3072": "SiLU at 3072",
+}
+# calibrate_graph's largest scale distance to Pulsar2's, in float32 ulps (zero points equal)
+FUSED_ULPS = {
+    "rms576": 1,
+    "attn3": 2,
+    "attn_mha768": 4,
+    "crms576": 2,
+    "crms768": 1,
+    "rms768": 2,
 }
 FUSED_PAIRS = [(g, t, n) for g in FUSED for t, n in itertools.permutations(range(4), 2)]
 
@@ -338,7 +361,7 @@ def test_calibrate_graph_reproduces_pulsar2(group, i):
             int(np.float32(mine[t][0]).view(np.int32))
             - int(np.float32(s).view(np.int32))
         )
-        assert ulps <= (1 if group == "rms576" else 0), (t, mine[t], (s, zp))
+        assert ulps <= FUSED_ULPS.get(group, 0), (t, mine[t], (s, zp))
 
 
 def test_graph_nodes_reduce_mean_width():
@@ -350,3 +373,40 @@ def test_graph_nodes_reduce_mean_width():
     nodes = ur.graph_nodes(model)
     assert [n[0] for n in nodes] == ["Mul", "ReduceMean"]
     assert nodes[1][3] == {"count": 576}
+
+
+def test_add_shift_keeps_an_exact_ratio_of_one():
+    """A ratio of exactly 1.0 (an eps Add whose input and output share a
+    scale) is stored as 32768 at shift 15; the U8 rule would shift it."""
+    assert ur.add_shift(1.0, 0.5) == 0
+    assert ur.add_shift(1.0 + 0.4 / 32768, 0.1) == 0  # still rounds to 32768
+    assert ur.add_shift(1.0 + 1.0 / 32768, 0.1) == 1
+    assert ur.add_shift(1.9, 0.1) == 1 and ur.add_shift(2.5, 0.1) == 2
+    q = {"x": (2e-5, 300), "eps": (1e-10, 0), "y": (2e-5, 300)}
+    c = ur.candidates("Add", q, ("x", "eps"))
+    assert c["add_shift@0x1ea0"] == 15 and c["add_const"] & 0xFFFF == 32768
+
+
+def test_symmetric_zero_point_depends_on_the_op():
+    assert ur.unsigned_minmax(-1.0, 1.0)[1] == 32767  # a Mul operand (RoPE's sin)
+    assert (
+        ur.unsigned_minmax(-1.0, 1.0, symmetric_32767=False)[1] == 32768
+    )  # an Add input
+    assert ur.unsigned_minmax(-1.0, 2.0, symmetric_32767=False)[1] == 21845
+
+
+def test_min_scale():
+    s, zp = ur.unsigned_minmax(0.0, 1e-6)
+    assert s == float(np.float32(1e-10)) and zp == 0
+    assert ur.unsigned_minmax(0.0, 1e-5)[0] > float(np.float32(1e-10))
+
+
+def test_propagate_through_data_movement():
+    model = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> '
+        "g (float[1,768] x) => (float[12,64] y) "
+        "{ t = Relu(x) shape = Constant<value = int64[2] {12, 64}>() "
+        "y = Reshape(t, shape) }"
+    )
+    q = ur.propagate(model, {"x": (1e-3, 100), "t": (2e-3, 0)})
+    assert q["y"] == (2e-3, 0)

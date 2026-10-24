@@ -36,8 +36,27 @@ SIZES = {
     (576, 1536): 897064,
     (1536, 576): 946984,
     (576, 49152): 28704868,
+    (576, 1728): 1009192,
+    (576, 3072): 1794088,
+    (768, 768): 648232,
+    (768, 3840): 3241000,
+    (768, 6144): 5185576,
+    (768, 32000): 27008040,
+    (3072, 768): 2525224,
 }
-HELD_SHAPES = [(576, 192), (576, 576), (576, 1536), (1536, 576)]
+HELD_SHAPES = [
+    (576, 192),
+    (576, 576),
+    (576, 1536),
+    (1536, 576),
+    (576, 1728),
+    (576, 3072),
+    (768, 768),
+    (768, 3840),
+    (768, 6144),
+    (768, 32000),
+    (3072, 768),
+]
 # real-calibration builds -> template shape
 REAL = {"gate": (576, 1536), "up": (576, 1536), "down": (1536, 576)}
 # compare_models differences that are not content (slot-table order shows up as stream bytes)
@@ -137,10 +156,17 @@ def test_emit_linear_u16_with_another_input_calibration(name):
 
 
 def test_segments():
+    """The general rule at every input width it was checked on (the native
+    builds' group bytes and byte-equal emits above)."""
     assert le.u16_segments(576) == [288]
+    assert le.u16_segments(768) == [112, 272]
     assert le.u16_segments(1536) == [224, 272, 272]
-    with pytest.raises(ValueError, match="only k in"):
-        le.u16_segments(768)
+    assert le.u16_segments(3072) == [176] + [272] * 5
+    for k in le.U16_K:
+        segs = le.u16_segments(k)
+        assert sum(segs) == k // 2 and max(segs) <= le.U16_FIRST_MAX
+    with pytest.raises(ValueError, match="positive even"):
+        le.u16_segments(577)
     with pytest.raises(ValueError, match="multiple of 32"):
         le.u16_table_bytes(576, 100)
 
