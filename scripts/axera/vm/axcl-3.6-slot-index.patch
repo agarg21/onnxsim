@@ -1,0 +1,34 @@
+--- a/drv/pcie/driver/host_dev/ax_pcie_dev_host.c	2026-10-24 10:27:15.535159174 +0900
++++ b/drv/pcie/driver/host_dev/ax_pcie_dev_host.c	2026-10-24 10:27:15.535894673 +0900
+@@ -36,6 +36,8 @@
+ #include "../include/ax_pcie_msg_transfer.h"
+ 
+ #define DRV_MODULE_NAME			"ax-pcie-dev-host"
++#define AX_SLOT_INDEX_AUTO 0xffffffffU
++
+ 
+ struct axera_dev *g_axera_dev_map[MAX_PCIE_DEVICES] = { 0 };
+ 
+@@ -44,6 +46,9 @@
+ struct ax_pcie_operation *g_axera_pcie_opt;
+ EXPORT_SYMBOL(g_axera_pcie_opt);
+ 
++unsigned int slot_index_force = AX_SLOT_INDEX_AUTO;
++module_param(slot_index_force, uint, S_IRUGO);
++
+ #ifdef SHMEM_FROM_MASTER
+ unsigned int shm_size;
+ module_param(shm_size, uint, S_IRUGO);
+@@ -340,7 +345,11 @@
+ #else
+ 	ax_dev->shm_size = ax_dev->bar_info[BAR_0].size;
+ #endif
+-	ax_dev->slot_index = ax_get_slot_index(pdev);
++	ax_dev->slot_index = (slot_index_force != AX_SLOT_INDEX_AUTO)
++			     ? slot_index_force : ax_get_slot_index(pdev);
++	if (slot_index_force != AX_SLOT_INDEX_AUTO)
++		axera_trace(AXERA_INFO, "slot index pinned to %u (bus %u)",
++			    ax_dev->slot_index, ax_get_slot_index(pdev));
+ 	ax_dev->domain = ax_get_bus_domain(pdev);
+ 	ax_dev->dev_slot = ax_get_dev_slot(pdev);
+ 	ax_dev->dev_func = ax_get_dev_func(pdev);
