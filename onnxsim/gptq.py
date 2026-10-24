@@ -35,11 +35,13 @@ activations" style.
 
 from __future__ import annotations
 
+import functools
 from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
 
+import onnxsim.onnxsim_cpp2py_export as C
 from onnxsim.calibration import Tensors
 
 
@@ -76,6 +78,7 @@ def _gptq_quantize_columns(
     qmax: float = 7.0,
     code_bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
     device: Optional[str] = None,
+    num_threads: int = 4,
 ) -> np.ndarray:
     """Returns GPTQ-optimized integer codes for ``w_nk`` ([N, K], output
     channel first), reusing ``scale_blocks``' existing per-(output channel,
@@ -101,9 +104,29 @@ def _gptq_quantize_columns(
     float64 like the numpy loop (the results agree up to summation order);
     torch is imported only then. A large layer (an LLM's vocabulary
     projection) is minutes of multi-core numpy and seconds on a GPU.
+    Without ``device`` the loop runs in the C++ extension
+    (``gptq_columns``, the same arithmetic as the numpy loop) on
+    ``num_threads`` threads, or in numpy when the extension was built
+    without it.
     """
     n, k = w_nk.shape
     hinv = _inverse_hessian_cholesky(h, percdamp)
+    columns = getattr(C, "gptq_columns", None)
+    if device is None and columns is not None:
+        f64 = functools.partial(np.ascontiguousarray, dtype=np.float64)
+        lo, hi = (None, None) if code_bounds is None else (f64(b) for b in code_bounds)
+        return columns(
+            f64(w_nk),
+            f64(scale_blocks),
+            quant_block_size,
+            f64(hinv),
+            proc_block_size,
+            lo,
+            hi,
+            qmin,
+            qmax,
+            num_threads,
+        )
     if code_bounds is None:
         lo, hi = np.full((n, k), qmin), np.full((n, k), qmax)
     else:
@@ -112,7 +135,16 @@ def _gptq_quantize_columns(
         return _gptq_columns_torch(
             w_nk, scale_blocks, quant_block_size, hinv, proc_block_size, lo, hi, device
         )
+    return _gptq_columns_numpy(
+        w_nk, scale_blocks, quant_block_size, hinv, proc_block_size, lo, hi
+    )
 
+
+def _gptq_columns_numpy(
+    w_nk, scale_blocks, quant_block_size, hinv, proc_block_size, lo, hi
+) -> np.ndarray:
+    """``_gptq_quantize_columns``' loop in numpy, float64."""
+    n, k = w_nk.shape
     codes_nk = np.zeros((n, k), dtype=np.float64)
     w_work = w_nk.copy()
 

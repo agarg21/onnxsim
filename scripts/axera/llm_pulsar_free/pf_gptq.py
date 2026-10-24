@@ -9,7 +9,8 @@ Writes ``<out>/gptq/L<l>.npz`` (qkv5, o_proj, gu, down_proj; merged layouts as
 ``pf_generate.py`` / ``pf_estimate.py`` / ``pf_plan.py`` use them. Split
 first-set linears keep the original weights (the split carries the precision).
 Run it on CUDA (``--device cuda``, the default when torch sees a GPU): the
-lm_head alone is a 1024 x 151936 GPTQ for Qwen3-0.6B.
+lm_head alone is a 1024 x 151936 GPTQ for Qwen3-0.6B. Without a GPU it runs
+in onnxsim's C++ column loop on 4 threads.
 
 usage: MODEL=qwen3_0.6b pf_gptq.py [--damp 0.01] [--device cuda]
 """

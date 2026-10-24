@@ -15,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -301,70 +302,35 @@ double RoundHalfToEven(double v) {
 }
 
 // GPTQ's sequential, Hessian-compensated integer-code search -- mirrors
-// gptq.py's own _gptq_quantize_columns scalar-loop-for-scalar-loop:
-// process input channels left to right in proc_block_size-wide blocks,
-// quantizing each column to its nearest grid point (reusing the
-// precomputed per-block scales, which never change) and charging its
-// rounding error to every not-yet-quantized channel through the
-// Cholesky-factored inverse Hessian. w_nk/scales_in are [N, K] /
-// [N, K/block]; returns the [N, K] code matrix (float64, integral
-// values in [-7, 7]).
+// gptq.py's own _gptq_quantize_columns on [N, K] / [N, K/block] input
+// (see GptqColumns in gptq_entry.h for the loop); returns the [N, K]
+// code matrix (float64, integral values in [-7, 7]).
 std::vector<std::vector<double>> GptqQuantizeColumns(
     const std::vector<std::vector<double>>& w_nk,
     const std::vector<std::vector<double>>& scale_blocks, int64_t block_size,
     const Matrix& h, double percdamp, int64_t proc_block_size) {
   const size_t n = w_nk.size();
   const size_t k = w_nk[0].size();
+  const size_t groups = scale_blocks[0].size();
   const Matrix hinv = InverseHessianCholesky(h, percdamp);
-
-  std::vector<std::vector<double>> codes(n, std::vector<double>(k, 0.0));
-  std::vector<std::vector<double>> w_work = w_nk;
-
-  for (int64_t block_start = 0; block_start < static_cast<int64_t>(k);
-       block_start += proc_block_size) {
-    const int64_t block_end =
-        std::min(block_start + proc_block_size, static_cast<int64_t>(k));
-    const size_t bs = static_cast<size_t>(block_end - block_start);
-    std::vector<std::vector<double>> w1(n, std::vector<double>(bs));
-    for (size_t i = 0; i < n; ++i) {
-      for (size_t j = 0; j < bs; ++j) {
-        w1[i][j] = w_work[i][static_cast<size_t>(block_start) + j];
-      }
-    }
-    std::vector<std::vector<double>> err1(n, std::vector<double>(bs, 0.0));
-
-    for (size_t i = 0; i < bs; ++i) {
-      const int64_t k_abs = block_start + static_cast<int64_t>(i);
-      const size_t group = static_cast<size_t>(k_abs / block_size);
-      for (size_t r = 0; r < n; ++r) {
-        const double s = scale_blocks[r][group];
-        const double w_col = w1[r][i];
-        double code = RoundHalfToEven(w_col / s);
-        code = std::min(7.0, std::max(-7.0, code));
-        codes[r][static_cast<size_t>(k_abs)] = code;
-        const double d = hinv[static_cast<size_t>(block_start) + i]
-                             [static_cast<size_t>(block_start) + i];
-        const double err = (w_col - code * s) / d;
-        err1[r][i] = err;
-        for (size_t j = i + 1; j < bs; ++j) {
-          w1[r][j] -= err * hinv[static_cast<size_t>(block_start) + i]
-                                [static_cast<size_t>(block_start) + j];
-        }
-      }
-    }
-
-    if (block_end < static_cast<int64_t>(k)) {
-      for (size_t r = 0; r < n; ++r) {
-        for (int64_t j = block_end; j < static_cast<int64_t>(k); ++j) {
-          double acc = 0.0;
-          for (size_t i = 0; i < bs; ++i) {
-            acc += err1[r][i] * hinv[static_cast<size_t>(block_start) + i]
-                                    [static_cast<size_t>(j)];
-          }
-          w_work[r][static_cast<size_t>(j)] -= acc;
-        }
-      }
-    }
+  std::vector<double> w_flat(n * k), s_flat(n * groups), hinv_flat(k * k);
+  for (size_t r = 0; r < n; ++r) {
+    std::copy(w_nk[r].begin(), w_nk[r].end(), w_flat.begin() + r * k);
+    std::copy(scale_blocks[r].begin(), scale_blocks[r].end(),
+              s_flat.begin() + r * groups);
+  }
+  for (size_t i = 0; i < k; ++i) {
+    std::copy(hinv[i].begin(), hinv[i].end(), hinv_flat.begin() + i * k);
+  }
+  std::vector<double> codes_flat(n * k);
+  GptqColumns(w_flat.data(), static_cast<int64_t>(n), static_cast<int64_t>(k),
+              s_flat.data(), static_cast<int64_t>(groups), block_size,
+              hinv_flat.data(), proc_block_size, nullptr, nullptr, -7.0, 7.0, 1,
+              codes_flat.data());
+  std::vector<std::vector<double>> codes(n);
+  for (size_t r = 0; r < n; ++r) {
+    codes[r].assign(codes_flat.begin() + r * k,
+                    codes_flat.begin() + (r + 1) * k);
   }
   return codes;
 }
@@ -486,6 +452,65 @@ void AccumulateActivationRows(
 }
 
 }  // namespace
+
+void GptqColumns(const double* w_nk, int64_t n, int64_t k,
+                 const double* scale_blocks, int64_t groups,
+                 int64_t quant_block_size, const double* hinv,
+                 int64_t proc_block_size, const double* lo, const double* hi,
+                 double qmin, double qmax, int num_threads, double* codes_nk) {
+  // Every output channel's loop reads only its own row (and the shared
+  // hinv), so rows split across threads with no change to the arithmetic.
+  auto rows = [&](int64_t r0, int64_t r1) {
+    std::vector<double> w(static_cast<size_t>(k));
+    std::vector<double> err(static_cast<size_t>(proc_block_size));
+    std::vector<double> acc(static_cast<size_t>(k));
+    for (int64_t r = r0; r < r1; ++r) {
+      std::copy(w_nk + r * k, w_nk + (r + 1) * k, w.begin());
+      for (int64_t b0 = 0; b0 < k; b0 += proc_block_size) {
+        const int64_t b1 = std::min(b0 + proc_block_size, k);
+        for (int64_t i = b0; i < b1; ++i) {
+          const double s = scale_blocks[r * groups + i / quant_block_size];
+          const double l = lo ? lo[r * k + i] : qmin;
+          const double u = hi ? hi[r * k + i] : qmax;
+          const double code =
+              std::min(u, std::max(l, RoundHalfToEven(w[i] / s)));
+          codes_nk[r * k + i] = code;
+          const double e = (w[i] - code * s) / hinv[i * k + i];
+          err[i - b0] = e;
+          for (int64_t j = i + 1; j < b1; ++j) {
+            w[j] -= e * hinv[i * k + j];
+          }
+        }
+        // acc[j] = sum over the block's columns i (in order) of
+        // err[i] * hinv[i, j], walked row by row so hinv is read
+        // contiguously; the same sums as one dot product per j.
+        std::fill(acc.begin() + b1, acc.end(), 0.0);
+        for (int64_t i = b0; i < b1; ++i) {
+          const double e = err[i - b0];
+          const double* hrow = hinv + i * k;
+          for (int64_t j = b1; j < k; ++j) {
+            acc[j] += e * hrow[j];
+          }
+        }
+        for (int64_t j = b1; j < k; ++j) {
+          w[j] -= acc[j];
+        }
+      }
+    }
+  };
+  const int64_t t = std::max<int64_t>(1, std::min<int64_t>(num_threads, n));
+  if (t == 1) {
+    rows(0, n);
+    return;
+  }
+  std::vector<std::thread> workers;
+  for (int64_t c = 0; c < t; ++c) {
+    workers.emplace_back(rows, n * c / t, n * (c + 1) / t);
+  }
+  for (auto& th : workers) {
+    th.join();
+  }
+}
 
 onnx::ModelProto ApplyGptq(
     const onnx::ModelProto& float_model,

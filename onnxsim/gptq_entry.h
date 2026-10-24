@@ -83,3 +83,19 @@ onnx::ModelProto ApplyGptq(
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
     double percdamp = 0.01, int64_t proc_block_size = 128);
+
+// GPTQ's column loop alone (gptq.py's _gptq_quantize_columns after its
+// inverse-Hessian factor), on flat row-major float64 buffers: `w_nk`
+// [n, k], `scale_blocks` [n, groups] (column i uses group
+// i / quant_block_size), `hinv` the [k, k] upper Cholesky factor of the
+// damped inverse Hessian. Columns go left to right in proc_block_size
+// blocks; each code is round-half-to-even(w / s) clipped to
+// [lo, hi] per element when `lo`/`hi` ([n, k]) are given, else to
+// [qmin, qmax], and its rounding error is charged to the channel's later
+// columns through `hinv`. Writes the [n, k] codes to `codes_nk`. Rows are
+// independent and split over `num_threads` threads.
+void GptqColumns(const double* w_nk, int64_t n, int64_t k,
+                 const double* scale_blocks, int64_t groups,
+                 int64_t quant_block_size, const double* hinv,
+                 int64_t proc_block_size, const double* lo, const double* hi,
+                 double qmin, double qmax, int num_threads, double* codes_nk);
