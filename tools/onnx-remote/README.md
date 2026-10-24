@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `4078d2b9c` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `74e9614c4` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -873,16 +873,29 @@ graphs onto HMX, `HMX_VTCM_KB` sets the tile pool, and `DSP_THREADS` (default 4)
 run on the graph thread. There is no compile-time check, so `check_outputs.py` compares the dumped outputs with
 onnxruntime. Measured on a Xiaomi 12S (V69, 4 threads):
 
-| model | compile (cache miss) | load | run, DSP / RPC-inclusive | vs onnxruntime |
-|---|---:|---:|---:|---|
-| BEVFormer-tiny int8 backbone, one camera (`backbone1.q8.onnx`, HMX) | 171 s | 0.85 s | 312 / 354 ms | 0 of 96000 differ |
-| BEVFormer-tiny encoder, 1 layer (`enc1.sim.onnx`, fp32, GridSample) | 15 s | 0.30 s | 912 / 1154 ms | max rel 8.0e-7 |
-| BEVFormer-tiny encoder, 3 layers (`enc3.sim.onnx`) | | 0.46 s | 3546 / 3792 ms | max rel 3.5e-6 |
-| BEVFormer-tiny decoder (`decoder.sim.onnx`, fp32, 6 GridSamples) | 10 s | 0.71 s | 3394 / 3456 ms | max rel 3.1e-6 |
-| one 3x3 float conv, 64 -> 64 channels, 30 x 50 | 2 s | 56 ms | 351 / 376 ms | max rel 8.6e-7 |
+| model | load | run, DSP / RPC-inclusive | vs onnxruntime |
+|---|---:|---:|---|
+| BEVFormer-tiny int8 backbone, one camera (`backbone1.q8.onnx`, HMX) | 0.81 s | 308 / 347 ms | 0 of 96000 differ |
+| BEVFormer-tiny encoder, 1 layer (`enc1.sim.onnx`, fp32, GridSample) | 0.29 s | 319 / 564 ms | max rel 8.0e-7 |
+| BEVFormer-tiny encoder, 3 layers (`enc3.sim.onnx`) | 0.47 s | 959 / 1198 ms | max rel 3.5e-6 |
+| BEVFormer-tiny decoder (`decoder.sim.onnx`, fp32, 6 GridSamples) | 0.71 s | 1151 / 1234 ms | max rel 3.1e-6 |
+| one 3x3 float conv, 64 -> 64 channels, 30 x 50 | 56 ms | 351 / 376 ms | max rel 8.6e-7 |
 
-The fork's ONNX importer has `GridSample` (2-D bilinear, zero padding) for these. The compiler stores a constant `transB=1`
-Gemm weight transposed (`GEMM_PRETRANSPOSE`, default on): kept (N, K), the generated kernel's output lanes read it one
-scalar at a time from 128 rows, and the encoder layer took 11.3 s, the decoder 25.4 s. The float paths are correct but
-not fast yet; the hand-written MSDA pipeline (`scripts/android/vision_models/bevformer_tiny/msda_hvx`) runs a whole
-frame in about 90 ms.
+The fork's ONNX importer has `GridSample` (2-D bilinear, zero padding) for these. The driver sets layout choices that keep the
+generated kernels' vector lanes on unit-stride axes; each is a tinygrad env flag, off in tinygrad itself, on in
+`dsp_graph_onnx.py` (`FLAG=0` turns one off). Each row shows the cumulative DSP time (decoder / encoder layer / 3-layer
+encoder) after adding that change, in the order they were added:
+
+| change | decoder | encoder layer | 3-layer encoder |
+|---|---:|---:|---:|
+| none (first working build) | 25.4 s | 11.3 s | |
+| `GEMM_PRETRANSPOSE`: constant `transB=1` Gemm weights stored transposed (kept (N, K), the output lanes read them one scalar at a time) | 3.39 s | 0.91 s | 3.55 s |
+| `SOFTMAX_CONTIGUOUS` + `HVX_UPCAST_ODD`: softmax not fused into P @ V; an axis like 900 takes a 100-lane upcast (largest divisor up to the lane budget) instead of 4 lanes, on unit-stride axes only | 1.84 s | 0.96 s | 3.71 s |
+| `MATMUL_CONTIGUOUS` + `TRANSPOSE_CONTIGUOUS`: Gemm products and Transposes realized, so consumers don't read them through strided views | 1.19 s | 0.39 s | 1.23 s |
+| `REDUCE_TWO_STAGE`: last-axis reductions (LayerNorm, softmax) as 32-lane partial sums, then the 32 | 1.12 s | 0.32 s | 0.97 s |
+
+Tried and not kept: `MATMUL_CONTIGUOUS` alone slowed the decoder (1.84 -> 3.18 s: Q @ K^T read K through the transpose view)
+until `TRANSPOSE_CONTIGUOUS` came with it; register blocking over a matmul's rows (5 rows x 128 lanes per step) made the Gemms
+and attention much slower (decoder 7.8 s). The float paths are still far from the hand-written MSDA pipeline
+(`scripts/android/vision_models/bevformer_tiny/msda_hvx`, about 90 ms per frame): the largest kernels now are the
+fp32 Gemms at about 12 GMAC/s.
