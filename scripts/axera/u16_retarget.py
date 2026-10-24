@@ -13,9 +13,11 @@ MatMul is a FullyConnected (``linear_emit.emit_linear_u16``).
 A fused program (several ops in one native build: an RMSNorm, a SiLU block,
 a RoPE apply, a fused attention) goes through ``retarget_graph(template,
 model, template_q, target_q)`` with ``calibrate_graph(directory)``: the same
-rules per graph node; node i's formulas only in the i-th CORE job of the main
-engine when the template has one CORE job per node, in any CORE job
-otherwise.
+rules per graph node; when the template has one CORE job per compute node,
+each job holds the formulas of the node its template records point to (Pulsar2
+does not run the jobs in ONNX node order), in any CORE job otherwise. Two Adds
+at one shift share one ``0x1ea0`` write, and a target whose Adds shift
+differently is refused: the elided write cannot be restored.
 
 How a record is found
 ---------------------
@@ -64,6 +66,7 @@ all but one of those builds (a ReduceMean output scale two ulps off).
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import os
 import struct
@@ -452,6 +455,69 @@ def _core_jobs(template) -> int:
     return sum(1 for role, *_ in le._jobs(segs[gs.MAIN]) if role == "CORE")
 
 
+#: calibration registers (lanes, zero points, the Sigmoid table, Add's shift and
+#: offset) all sit at or above this; below it are source / destination address
+#: writes, which a candidate value can coincide with
+MIN_CALIB_REG = 0x0F00
+#: brute-force bound of the CORE job -> node assignment (8! permutations)
+MAX_ASSIGN = 8
+
+
+def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
+    """CORE job j -> node ``n<i>``, one job per compute node. Pulsar2 orders
+    the jobs topologically, not in ONNX node order (a fused q / k norm + RoPE
+    runs ``x * x`` first), so each job is given the node whose template
+    formulas explain most of its calibration records (best one-to-one
+    assignment; ONNX order among equals)."""
+    cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
+    if len(comp) > MAX_ASSIGN:
+        return {j: f"n{i}" for j, i in enumerate(comp)}
+    by_node: dict[str, set[int]] = {}
+    for k, v in ct.items():
+        node, base = k.split("|", 1)
+        if not (base.startswith("zp:") and v < 256):
+            by_node.setdefault(node, set()).add(v)
+    score = np.zeros((len(cores), len(comp)))
+    for j, (a, b) in enumerate(cores):
+        vals = [
+            gs._val(main[r])
+            for r in range(a, b)
+            if main[r][0] == gs.A1 and gs._reg(main[r]) >= MIN_CALIB_REG
+        ]
+        for c, i in enumerate(comp):
+            score[j, c] = sum(v in by_node.get(f"n{i}", ()) for v in vals)
+    best = max(
+        itertools.permutations(range(len(comp))),
+        key=lambda pm: sum(score[j, pm[j]] for j in range(len(cores))),
+    )
+    return {j: f"n{comp[best[j]]}" for j in range(len(cores))}
+
+
+def _check_add_shift_writes(main, nodes, assign, cn) -> None:
+    """Refuse a template that elided an Add-shift write the target needs. Two
+    Adds at one shift share one ``0x1ea0`` write; a target whose Adds shift
+    differently needs both, and the elided one cannot be restored (the second
+    Add would run at the first one's shift)."""
+    cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
+    adds = sorted(j for j, n in assign.items() if nodes[int(n[1:])][0] == "Add")
+    need, cur = 0, None
+    for j in adds:
+        v = cn[f"{assign[j]}|add_shift@{ADD_SHIFT:#06x}"]
+        need, cur = need + (v != cur), v
+    have = sum(
+        1
+        for j in adds
+        for r in range(*cores[j])
+        if main[r][0] == gs.A1 and gs._reg(main[r]) == ADD_SHIFT
+    )
+    if need > have:
+        raise ValueError(
+            f"the template writes {ADD_SHIFT:#06x} {have} times, the target needs "
+            f"{need}: an elided Add-shift write; use a template whose Adds shift "
+            "differently"
+        )
+
+
 def retarget_graph(
     template,
     model,
@@ -463,17 +529,19 @@ def retarget_graph(
     ``model`` is its float graph; the calibrations cover every tensor, inner
     ones included (``quant_of`` / ``calibrate_graph``).
 
-    When the template has one CORE job per graph node (RMSNorm, SiLU, RoPE
-    apply), node i's formulas may only sit in the i-th CORE job of the main
-    engine (CORE jobs follow the node order) and QUANT jobs hold a graph
-    input's ``1 / s`` and zero point: the strongest disambiguation. Otherwise
-    (fused attention: Softmax takes two CORE jobs, a Transpose quantizes its
-    own output; a whole-layer attention with Reshapes), any node's formulas
-    may sit in any CORE job and a QUANT job may hold any tensor's ``1 / s``
-    and zero point; a record matching two formulas with different targets is
-    still refused. The DEQUANT job holds the output's ``s`` and zero point;
-    PARAM jobs and the other segments any node's. Data-movement nodes
-    (``PASS_THROUGH``) contribute per-tensor formulas only."""
+    When the template has one CORE job per compute node (RMSNorm, SiLU, RoPE
+    apply, a per-head q / k norm with RoPE; data-movement nodes have no job),
+    each CORE job holds one node's formulas only (``_assign_core_jobs``) and
+    QUANT jobs hold a graph input's ``1 / s`` and zero point: the strongest
+    disambiguation. Otherwise (fused attention: Softmax takes two CORE jobs, a
+    Transpose quantizes its own output; a whole-layer attention with
+    Reshapes), any node's formulas may sit in any CORE job and a QUANT job may
+    hold any tensor's ``1 / s`` and zero point; a record matching two formulas
+    with different targets is still refused. The DEQUANT job holds the
+    output's ``s`` and zero point; PARAM jobs and the other segments any
+    node's. Records below ``MIN_CALIB_REG`` are never rewritten.
+    Data-movement nodes (``PASS_THROUGH``) contribute per-tensor formulas
+    only."""
     m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
     nodes = graph_nodes(m)
     consts = {i.name for i in m.graph.initializer}
@@ -481,10 +549,17 @@ def retarget_graph(
     out = out or m.graph.output[0].name
     template_q, target_q = propagate(m, template_q), propagate(m, target_q)
     ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
-    strict = _core_jobs(template) == len(nodes)
+    main = _segs(gs.load_model(template))[gs.MAIN]
+    comp = [i for i, n in enumerate(nodes) if n[0] not in PASS_THROUGH]
+    strict = _core_jobs(template) == len(comp)
+    assign = _assign_core_jobs(main, comp, ct) if strict else {}
+    if strict:
+        _check_add_shift_writes(main, nodes, assign, cn)
 
     def allowed(tag, name, reg):
         node, base = name.split("|", 1)
+        if reg is not None and reg < MIN_CALIB_REG:
+            return False
         if "@" in base and int(base.split("@")[1], 16) != reg:
             return False
         if tag == "QUANT":
@@ -496,10 +571,10 @@ def retarget_graph(
         if tag == "DEQUANT":
             return base in (f"s:{out}", f"zp:{out}")
         if tag.startswith("CORE") and strict:
-            return node == f"n{tag[4:]}"
+            return node == assign[int(tag[4:])]
         return True
 
-    return _rewrite(template, ct, cn, allowed, n_core=len(nodes) if strict else None)
+    return _rewrite(template, ct, cn, allowed)
 
 
 def calibrate_graph(directory: str) -> dict[str, tuple[float, int]]:

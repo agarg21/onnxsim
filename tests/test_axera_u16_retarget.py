@@ -126,7 +126,12 @@ PAIRS = [
     for g, (_, _, _, members) in GROUPS.items()
     for t, n in itertools.permutations(range(len(members)), 2)
 ]
-REFUSALS = ("cannot be located", "ambiguous template", "repeats a write")
+REFUSALS = (
+    "cannot be located",
+    "ambiguous template",
+    "repeats a write",
+    "elided Add-shift write",
+)
 
 
 def _need(directory):
@@ -297,6 +302,16 @@ FUSED = {
     "rms768": "RMSNorm at 768",
     "rope768": "RoPE apply at 768",
     "silu3072": "SiLU at 3072",
+    # Qwen3-0.6B
+    "rms1024": "RMSNorm at 1024",
+    "crms1024": "coarse RMS at 1024",
+    "hcrms2048": "per-head coarse RMS of [k | k_rot]: Reshape to heads, 5 CORE jobs for 7 nodes",
+    "qkrope1024": "per-head k norm + RoPE: (q c + r sn) / rms_head(q), 8 CORE jobs for 11 "
+    "nodes, x*x runs first; both Adds shift 15, so 0x1ea0 is written once for them",
+    "qkrope2048": "per-head q norm + RoPE at 2048",
+    "qkrope1024t": "qkrope1024 with r ~ -q: the RoPE Add shifts 11-12, both 0x1ea0 writes kept",
+    "qkrope2048t": "qkrope2048 with r ~ -q",
+    "attn_gqa2048": "Qwen3's whole-layer GQA attention (16 q heads, 8 kv heads), 54 CORE jobs",
 }
 # calibrate_graph's largest scale distance to Pulsar2's, in float32 ulps (zero points equal)
 FUSED_ULPS = {
@@ -306,6 +321,14 @@ FUSED_ULPS = {
     "crms576": 2,
     "crms768": 1,
     "rms768": 2,
+    "rms1024": 2,
+    "crms1024": 2,
+    "hcrms2048": 2,
+    "qkrope1024": 2,
+    "qkrope2048": 2,
+    "qkrope1024t": 2,
+    "qkrope2048t": 2,
+    "attn_gqa2048": 4,
 }
 FUSED_PAIRS = [(g, t, n) for g in FUSED for t, n in itertools.permutations(range(4), 2)]
 
@@ -410,3 +433,38 @@ def test_propagate_through_data_movement():
     )
     q = ur.propagate(model, {"x": (1e-3, 100), "t": (2e-3, 0)})
     assert q["y"] == (2e-3, 0)
+
+
+# Qwen3-0.6B layer 11's k norm + RoPE, built natively at its own calibration: its RoPE
+# Add shifts 14 and its eps Add 15, so the native program writes 0x1ea0 for both
+NATIVE_QKROPE = f"{B}/gen_model/native_L11_rk"
+
+
+@pytest.mark.parametrize("i", range(4))
+def test_elided_add_shift_write_refused(i):
+    """qkrope1024's two Adds both shift 15, so Pulsar2 wrote 0x1ea0 once for
+    both; retargeted to layer 11 the eps Add would run at the RoPE Add's 14
+    (the card's k was 29% off). qkrope1024t's Adds shift differently, keeps
+    both writes and gives the native program."""
+    td, tt = _fused("qkrope1024", i), _fused("qkrope1024t", i)
+    _need(td), _need(tt), _need(NATIVE_QKROPE)
+    target = ur.quant_of(NATIVE_QKROPE)
+    with pytest.raises(ValueError, match="elided Add-shift write"):
+        ur.retarget_graph(_need(td), f"{td}/model.onnx", ur.quant_of(td), target)
+    got = ur.retarget_graph(_need(tt), f"{tt}/model.onnx", ur.quant_of(tt), target)
+    want = gs.load_model(_need(NATIVE_QKROPE))
+    assert ur.compare(got, want) == []
+
+
+def test_core_jobs_follow_the_records_not_the_node_order():
+    """qkrope runs x*x (node 4) first; an RMSNorm keeps the ONNX order."""
+    for name, first in (("qkrope1024", "n4"), ("rms576", "n0")):
+        d = _fused(name, 0)
+        template = _need(d)
+        nodes = ur.graph_nodes(f"{d}/model.onnx")
+        q = ur.propagate(onnx.load(f"{d}/model.onnx"), ur.quant_of(d))
+        comp = [i for i, n in enumerate(nodes) if n[0] not in ur.PASS_THROUGH]
+        main = ur._segs(gs.load_model(template))[gs.MAIN]
+        got = ur._assign_core_jobs(main, comp, ur._graph_candidates(nodes, q))
+        assert got[0] == first
+        assert sorted(got.values()) == sorted(f"n{i}" for i in comp)
