@@ -367,6 +367,12 @@ AX650_CONFIRMED_BROKEN_OPS: Dict[str, str] = {
         "reduction='mean' explicit, scores float[1,4] + labels int64[1] "
         "-> scalar)"
     ),
+    "IsNaN": (
+        "KeyError('dont support IsNaN opr in AXOPS/ONNXOPS/CUSTOM_OPS') at "
+        "frontend parsing (the SDPA export's Where(IsNaN(P), 0, P) guard; "
+        "build_w2v2_encoder_attn_step.py, and every BERT-style SDPA export) -- "
+        "onnxsim's eliminate_sdpa_nan_guard pass removes it exactly"
+    ),
 }
 
 # Confirmed (not guessed) against a real compiled `.axmodel` run on an AX650N:
@@ -513,6 +519,13 @@ AX650_CONFIRMED_WORKING_OPS: Dict[str, str] = {
         "single-node battery ([1,8] float over [0.5, 2.0)): builds, runs, "
         "max|diff| 0.004 vs ORT fp32; also exercised in composition inside "
         "the KD soft-loss head at max|diff| 0.012"
+    ),
+    "CumSum": (
+        "RoBERTa position ids (int32 CumSum over [1,64] in Equal/Not/Cast/"
+        "Mul/Add -> Gather, pulsar2:7.0-lite): builds into the NPU subgraph "
+        "and is exact on the card (0 error over 20 padded inputs); whole "
+        "RoBERTa classifiers build and run with it -- see "
+        "docs/axera-encoder-classifiers.md"
     ),
 }
 

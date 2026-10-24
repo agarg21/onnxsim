@@ -256,3 +256,59 @@ def test_ax650_build_risks_clears_confirmed_working_unlisted_ops():
     # ...but verified, so no build risk and eligible coverage.
     assert pulsar2.confirmed_working_on_ax650(model) == {"Log", "Neg"}
     assert pulsar2.ax650_build_risks(model) == []
+
+
+def test_masked_encoder_simplifies_to_ax650_ops():
+    """A BERT/RoBERTa-style encoder layer as the legacy exporter emits SDPA
+    attention (``axera_masked_encoder_sdpa``): plain ``simplify()`` fuses its
+    masked attention into com.microsoft ``Attention``, which is not on the
+    AX650 list; ``pulsar2_backend.simplify()`` (what ``worker.py`` and the
+    other Axera flows use) keeps it unfused and also removes the SDPA
+    ``IsNaN`` guard, leaving no AX650 build risk (RoBERTa's ``CumSum`` stays:
+    confirmed working on the card).
+    Outputs stay equal, all-padding input included."""
+    import numpy as np
+
+    import onnxsim
+
+    ort = pytest.importorskip("onnxruntime")
+    model = models.build("axera_masked_encoder_sdpa")
+    assert {"IsNaN", "CumSum"} <= {n.op_type for n in model.graph.node}
+
+    plain, ok = onnxsim.simplify(model)
+    assert ok
+    assert "Attention" in {n.op_type for n in plain.graph.node}
+    assert "Attention" in pulsar2.new_blocking_op_types(model, plain)
+
+    simp, ok = pulsar2.simplify(model)
+    assert ok
+    ops = {n.op_type for n in simp.graph.node}
+    assert not ops & {"Attention", "IsNaN"}, ops
+    assert "CumSum" in ops
+    assert pulsar2.ax650_build_risks(simp) == []
+
+    def run(m, ids, mask):
+        sess = ort.InferenceSession(
+            m.SerializeToString(), providers=["CPUExecutionProvider"]
+        )
+        return sess.run(None, {"input_ids": ids, "attention_mask": mask})[0]
+
+    ids = np.array([[5, 6, 7, 8, 9, 1, 1, 1]], dtype=np.int64)
+    for mask in ((ids != 1).astype(np.int64), np.zeros_like(ids)):
+        np.testing.assert_allclose(
+            run(simp, ids, mask), run(model, ids, mask), rtol=1e-5, atol=1e-6
+        )
+
+
+def test_simplify_kwargs_merges_extra_optimizers():
+    kw = pulsar2.simplify_kwargs(extra_optimizers=["neg_to_mul"])
+    assert kw["attention_fusion_backend"] == "none"
+    assert kw["extra_optimizers"] == ["neg_to_mul", "eliminate_sdpa_nan_guard"]
+    kw = pulsar2.simplify_kwargs(skipped_optimizers=["eliminate_sdpa_nan_guard"])
+    assert kw["extra_optimizers"] == []
+    assert (
+        pulsar2.simplify_kwargs(attention_fusion_backend="onnx")[
+            "attention_fusion_backend"
+        ]
+        == "onnx"
+    )

@@ -34,6 +34,7 @@
 #include "passes/eliminate_optional_has_element.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
 #include "passes/eliminate_reshape_family_on_constant.h"
+#include "passes/eliminate_sdpa_nan_guard.h"
 #include "passes/eliminate_sequence_at_construct.h"
 #include "passes/eliminate_sequence_length_construct.h"
 #include "passes/eliminate_shape_op.h"
@@ -208,6 +209,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateNopSoftmax>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
     RegisterOrReplace<p::EliminateReshapeFamilyOnConstant>(registry);
+    RegisterOrReplace<p::EliminateSdpaNanGuard>(registry);
     RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
     RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
     RegisterOrReplace<p::ExplicitAutoPad>(registry);

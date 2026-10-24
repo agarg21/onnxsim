@@ -155,3 +155,47 @@ def ax650_build_risks(model: onnx.ModelProto) -> List[str]:
             f"minimum of {AX650_MIN_OPSET} for AX650"
         )
     return risks
+
+
+# `onnxsim.simplify()` arguments for any graph headed to `pulsar2 build`.
+#
+# - `attention_fusion_backend="none"`: neither `Attention` form (com.microsoft
+#   or ai.onnx) is on the AX650 op list, and since #2217 plain `simplify()`
+#   fuses masked encoder attention (BERT-style classifiers) into one -- a new
+#   blocker the unfused graph, all of whose ops are on the list, did not have.
+# - `eliminate_sdpa_nan_guard` (onnxsim/passes/eliminate_sdpa_nan_guard.h):
+#   removes the `Where(IsNaN(P), 0, P)` guard PyTorch's SDPA export puts after
+#   the attention Softmax -- Pulsar2's frontend rejects `IsNaN` outright. Exact
+#   for finite attention scores, including an all-padding row with the
+#   legacy exporter's -inf mask.
+#
+# RoBERTa's `CumSum` position ids need nothing: off the published list, but
+# confirmed exact on the card (`pulsar2_ops.AX650_CONFIRMED_WORKING_OPS`).
+# See docs/axera-encoder-classifiers.md.
+SIMPLIFY_KWARGS = {
+    "attention_fusion_backend": "none",
+    "extra_optimizers": ("eliminate_sdpa_nan_guard",),
+}
+
+
+def simplify_kwargs(**kwargs) -> dict:
+    """`kwargs` for `onnxsim.simplify()` with `SIMPLIFY_KWARGS` applied.
+
+    `extra_optimizers` are concatenated (caller's first); any other key the
+    caller passes wins over the default.
+    """
+    out = dict(SIMPLIFY_KWARGS)
+    out["extra_optimizers"] = list(kwargs.pop("extra_optimizers", None) or []) + [
+        o
+        for o in SIMPLIFY_KWARGS["extra_optimizers"]
+        if o not in (kwargs.get("skipped_optimizers") or ())
+    ]
+    out.update(kwargs)
+    return out
+
+
+def simplify(model, **kwargs):
+    """`onnxsim.simplify(model, **simplify_kwargs(**kwargs))`."""
+    from onnxsim import simplify as _simplify
+
+    return _simplify(model, **simplify_kwargs(**kwargs))

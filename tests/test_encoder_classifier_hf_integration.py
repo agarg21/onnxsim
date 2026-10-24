@@ -133,3 +133,38 @@ def test_every_encoder_layer_fuses_and_matches_transformers(
     np.testing.assert_allclose(
         _run(simplified, ids, mask), expected, rtol=1e-4, atol=1e-5
     )
+
+
+@pytest.mark.parametrize(
+    "dynamo", [True, False], ids=["dynamo_dynamic", "legacy_static"]
+)
+@pytest.mark.parametrize("model_id", MODELS, ids=lambda m: m.split("-")[-1])
+def test_sdpa_nan_guard_removed_without_fusion(tmp_path, model_id, dynamo):
+    # The NPU-legalization path (scripts/axera/pulsar2_backend.SIMPLIFY_KWARGS):
+    # no attention fusion, and eliminate_sdpa_nan_guard removes every SDPA
+    # `Where(IsNaN(P), 0, P)` -- the dynamo export's finfo.min mask directly,
+    # the legacy export's -inf mask via finfo.min plus a row-validity multiply.
+    # A fully padded row must still match the export (zeros, for -inf).
+    if dynamo:
+        pytest.importorskip("onnxscript")
+    model = _load(model_id, "sdpa")
+    exported = _export(model, tmp_path / "model.onnx", dynamo)
+    assert any(n.op_type == "IsNaN" for n in exported.graph.node)
+
+    simplified, ok = onnxsim.simplify(
+        exported,
+        attention_fusion_backend="none",
+        extra_optimizers=["eliminate_sdpa_nan_guard"],
+    )
+    assert ok
+    ops = {n.op_type for n in simplified.graph.node}
+    assert not ops & {"IsNaN", "Attention"}
+
+    for padded_from in (4, 0):
+        ids, mask = _inputs(model.config.vocab_size, padded_from=padded_from)
+        np.testing.assert_allclose(
+            _run(simplified, ids, mask),
+            _run(exported, ids, mask),
+            rtol=1e-4,
+            atol=1e-5,
+        )

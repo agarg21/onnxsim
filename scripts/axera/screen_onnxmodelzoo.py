@@ -74,9 +74,7 @@ def screen_one(name: str) -> dict:
         res["build_risks"] = pulsar2.ax650_build_risks(model)
 
         try:
-            from onnxsim import simplify
-
-            simp, _ = simplify(model)
+            simp, _ = pulsar2.simplify(model)
             res["simplified_coverage"] = sim.coverage(simp)
             res["simplified_build_risks"] = pulsar2.ax650_build_risks(simp)
         except Exception as exc:
