@@ -10,6 +10,11 @@ attention-mask Add), Div, ReduceMean, Sqrt, Sigmoid, Softmax and dynamic
 ``layer_configs: [{op_types: [<op>], data_type: U16}]``. A constant-weight
 MatMul is a FullyConnected (``linear_emit.emit_linear_u16``).
 
+A fused program (several ops in one native build: an RMSNorm, a SiLU block,
+a RoPE apply) goes through ``retarget_graph(template, model, template_q,
+target_q)`` with ``calibrate_graph(directory)``: the same rules per graph
+node, node i's formulas only in the i-th CORE job of the main engine.
+
 How a record is found
 ---------------------
 
@@ -95,8 +100,10 @@ def quant_of(directory: str) -> dict[str, tuple[float, int]]:
     out = {}
     for tc in q["tensor_configs"].values():
         for t, c in tc.items():
-            v = q["values"][str(c["hash"])]
-            if len(v["scale"]) == 1:
+            v = q["values"].get(
+                str(c["hash"])
+            )  # absent: an inner tensor's consumer side
+            if v is not None and len(v["scale"]) == 1:
                 out[t] = (float(v["scale"][0]), int(v["zero_point"][0]))
     return out
 
@@ -231,24 +238,21 @@ def _segs(model) -> list[list[bytes]]:
     return [gs.records(r) for r in suc.decode_segments(mc)]
 
 
-def retarget(
-    template,
-    op: str,
-    template_q: Mapping[str, tuple[float, int]],
-    target_q: Mapping[str, tuple[float, int]],
-    inputs: Sequence[str],
-    out: str = "y",
-    attrs: Mapping | None = None,
-) -> onnx.ModelProto:
-    """The template program at calibration ``target_q``. Both calibrations
-    are keyed by the template's tensor names (``inputs`` and ``out``); the
-    result keeps the template's IO names."""
+def _base(name: str) -> str:
+    """A candidate's formula name without its node prefix (``n<i>|``)."""
+    return name.split("|", 1)[-1]
+
+
+def _rewrite(template, ct, cn, allowed, n_core=None) -> onnx.ModelProto:
+    """Rewrite every A1 record and ``npu_params`` word of ``template`` that
+    matches one candidate of ``ct`` (allowed by ``allowed(tag, name, reg)``,
+    ``tag`` one of QUANT, DEQUANT, PARAM, CORE<i> (the i-th CORE job of the
+    main engine) or OTHER (other segments)) with its ``cn`` value, then
+    apply Pulsar2's write elision and re-pad the segments."""
     model = gs.load_model(template)
-    ct = candidates(op, template_q, inputs, out, attrs)
-    cn = candidates(op, target_q, inputs, out, attrs)
     by_val: dict[int, list[str]] = {}
     for k, v in sorted(ct.items()):
-        if k.startswith("zp:") and v < 256:
+        if _base(k).startswith("zp:") and v < 256:
             if cn[k] != v:
                 raise ValueError(
                     f"template {k} = {v}: below 256 it cannot be located in the records, "
@@ -257,19 +261,22 @@ def retarget(
             continue
         by_val.setdefault(v, []).append(k)
     segs = _segs(model)
-    role_at = {}
+    tag_at, core = {}, 0
     for role, a, b, _ in le._jobs(segs[gs.MAIN]):
-        role_at.update({i: role for i in range(a, b)})
+        tag = role
+        if role == "CORE":
+            tag, core = f"CORE{core}", core + 1
+        tag_at.update({i: tag for i in range(a, b)})
+    if n_core is not None and core != n_core:
+        raise ValueError(f"the template has {core} CORE jobs for {n_core} graph nodes")
     touched = [set() for _ in segs]
     for si, seg in enumerate(segs):
         for i, r in enumerate(seg):
             if r[0] != gs.A1:
                 continue
             reg, val = gs._reg(r), gs._val(r)
-            role = role_at.get(i, "CORE") if si == gs.MAIN else "CORE"
-            names = [
-                n for n in by_val.get(val, []) if _allowed(role, n, inputs, out, reg)
-            ]
+            tag = tag_at.get(i, "OTHER") if si == gs.MAIN else "OTHER"
+            names = [n for n in by_val.get(val, []) if allowed(tag, n, reg)]
             if len({cn[n] for n in names}) > 1:
                 raise ValueError(
                     f"segment {si} record {i} ({reg:#06x} = {val:#x}) matches {names}: "
@@ -309,12 +316,131 @@ def retarget(
             names = [
                 n
                 for n in by_val.get(val, [])
-                if not n.startswith(("zp:", "inv:", "s:"))
+                if not _base(n).startswith(("zp:", "inv:", "s:"))
             ]
             if len(names) == 1:
                 struct.pack_into("<I", p, off, cn[names[0]])
         params.raw_data = bytes(p)
     return result
+
+
+def retarget(
+    template,
+    op: str,
+    template_q: Mapping[str, tuple[float, int]],
+    target_q: Mapping[str, tuple[float, int]],
+    inputs: Sequence[str],
+    out: str = "y",
+    attrs: Mapping | None = None,
+) -> onnx.ModelProto:
+    """The template program at calibration ``target_q``. Both calibrations
+    are keyed by the template's tensor names (``inputs`` and ``out``); the
+    result keeps the template's IO names."""
+    ct = candidates(op, template_q, inputs, out, attrs)
+    cn = candidates(op, target_q, inputs, out, attrs)
+
+    def allowed(tag, name, reg):
+        return _allowed(tag, name, inputs, out, reg)
+
+    return _rewrite(template, ct, cn, allowed)
+
+
+# ---- fused (multi-op) programs ---------------------------------------------------------
+UNARY = ("Sqrt", "Sigmoid", "Softmax", "ReduceMean")
+
+
+def graph_nodes(model) -> list[tuple[str, tuple, str, dict]]:
+    """``(op, inputs, output, attrs)`` per node of a fused program's float
+    graph (``model.onnx``); ReduceMean's ``count`` is the reduced width."""
+    m = onnx.shape_inference.infer_shapes(
+        model if isinstance(model, onnx.ModelProto) else onnx.load(model)
+    )
+    dims = {
+        v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+        for v in [*m.graph.input, *m.graph.value_info, *m.graph.output]
+    }
+    out = []
+    for n in m.graph.node:
+        attrs = {}
+        if n.op_type == "ReduceMean":
+            sh = dims[n.input[0]]
+            axes = next((list(a.ints) for a in n.attribute if a.name == "axes"), [-1])
+            attrs["count"] = int(np.prod([sh[a] for a in axes]))
+        out.append((n.op_type, tuple(n.input), n.output[0], attrs))
+    return out
+
+
+def _graph_candidates(nodes, q) -> dict[str, int]:
+    c = {}
+    for i, (op, ins, out, attrs) in enumerate(nodes):
+        sub = {t: q[t] for t in {*ins, out}}
+        used = ins[:1] if op in UNARY else ins
+        for k, v in candidates(op, sub, used, out, attrs).items():
+            c[f"n{i}|{k}"] = v
+    return c
+
+
+def retarget_graph(
+    template,
+    model,
+    template_q: Mapping[str, tuple[float, int]],
+    target_q: Mapping[str, tuple[float, int]],
+    out: str | None = None,
+) -> onnx.ModelProto:
+    """``retarget`` for a fused program (several ops in one native build).
+    ``model`` is its float graph; the calibrations cover every tensor, inner
+    ones included (``quant_of`` / ``calibrate_graph``). Node i's formulas may
+    only sit in the i-th CORE job of the main engine (CORE jobs follow the
+    node order); QUANT jobs hold a graph input's ``1 / s`` and zero point,
+    the DEQUANT job the output's ``s`` and zero point; PARAM jobs and the
+    other segments any node's."""
+    m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
+    nodes = graph_nodes(m)
+    consts = {i.name for i in m.graph.initializer}
+    graph_ins = [i.name for i in m.graph.input if i.name not in consts]
+    out = out or m.graph.output[0].name
+    ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
+
+    def allowed(tag, name, reg):
+        node, base = name.split("|", 1)
+        if "@" in base and int(base.split("@")[1], 16) != reg:
+            return False
+        if tag == "QUANT":
+            return base in {f"inv:{t}" for t in graph_ins} | {
+                f"zp:{t}" for t in graph_ins
+            }
+        if tag == "DEQUANT":
+            return base in (f"s:{out}", f"zp:{out}")
+        if tag.startswith("CORE"):
+            return node == f"n{tag[4:]}"
+        return True
+
+    return _rewrite(template, ct, cn, allowed, n_core=len(nodes))
+
+
+def calibrate_graph(directory: str) -> dict[str, tuple[float, int]]:
+    """``calibrate`` for a fused program: U16 MinMax of every tensor (inputs,
+    constants, inner tensors, output) over the float forward of the whole
+    graph. Pulsar2's inner scales can be a float32 ulp off this (seen on a
+    fused RMSNorm); the zero points agree."""
+    m = onnx.load(os.path.join(directory, "model.onnx"))
+    consts = {i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer}
+    ins = [i.name for i in m.graph.input if i.name not in consts]
+    data = {n: _samples(os.path.join(directory, "dataset", f"{n}.tar")) for n in ins}
+    ref = ReferenceEvaluator(m)
+    lo, hi = {}, {}
+    for j in range(len(data[ins[0]])):
+        res = ref.run(None, {n: data[n][j].astype(F) for n in ins}, intermediate=True)
+        for k, v in res.items():
+            a = np.asarray(v)
+            if k in consts or a.dtype.kind != "f" or a.size == 0:
+                continue
+            lo[k] = min(lo.get(k, np.inf), float(a.min()))
+            hi[k] = max(hi.get(k, -np.inf), float(a.max()))
+    q = {k: unsigned_minmax(lo[k], hi[k]) for k in lo}
+    for k, a in consts.items():
+        q[k] = unsigned_minmax(a.min(), a.max())
+    return q
 
 
 def compare(got, want) -> list[str]:

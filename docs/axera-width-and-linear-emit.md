@@ -283,3 +283,25 @@ single-op programs with no Pulsar2 build per calibration. That covers 32 retarge
 permutation) and two uncalibrated Concat programs. On 64 held-out decode steps, the logits are
 within 0.96% relative RMS of float and the top-1 token agrees on 63 of 64. The card's health
 check read 0.0 throughout.
+
+### Fused programs (`retarget_graph`)
+
+`retarget_graph(template, model, template_q, target_q)` retargets a fused U16 program, such as a
+whole RMSNorm (Mul, ReduceMean, Add eps, Sqrt, Div, Mul gain), a SiLU block (Sigmoid, Mul, Mul) or a
+RoPE apply (Mul, Mul, Add). It applies the single-op rules per graph node. CORE jobs follow the node
+order, so node i's formulas may only sit in the i-th CORE job. `calibrate_graph` takes the MinMax of
+every tensor, inner ones included, over the float forward of the whole graph. Every zero point matches
+Pulsar2; a fused RMSNorm's inner scales can be one float32 ulp off.
+
+Offline check: four calibration variants each of the RMSNorm at 576, SiLU at 1536 and RoPE at 576 and
+192. Every template-to-target pair equals the native build or is refused for a stated reason (the
+RMSNorm variant whose gain has zero point 0).
+
+A fused RMSNorm still rounds its inner x^2 to 16 bits, as the single-op chain does (measured on the
+card). On SmolLM2-135M, x^2's range at layers 3-7 is about 2.6e6 against a typical mean of about 10-16,
+which puts the RMS 10% off. The decode pipeline therefore uses a two-pass norm: a coarse RMS `r0` from
+the chain, then `u = x / r0` (|u| <= ~24) through the fused RMSNorm. With that and fused SiLU/RoPE, the
+whole SmolLM2-135M decode ran on the card (AX8850, 2026-10-24) with every program Pulsar-free.
+Teacher-forced on 48 held-out steps of two passages, top-1 agreed with float on 45/48 and 45/48, with
+median logit error 2.0% and 3.5%. Pulsar2's own `llm_build` (s8 weights) on the same steps gave 42/48
+and 42/48, 3.3% and 6.2%. The decode ran at 4.2-4.6 s/token with 915 programs resident.
