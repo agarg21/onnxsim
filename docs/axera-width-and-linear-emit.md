@@ -230,7 +230,7 @@ from the U8 layer:
 | --- | --- | --- |
 | table | per 32-output group, per input segment: 16 rows of `72·ceil(pairs/18)` bytes, then a 256-byte block (32 biases, 32 multipliers) | fitted |
 | code address | pair `j` at `72·(j//18) + j%18` in its row, high nibble plane at +18, outputs 16..31 at +36, unused slots code 128 | fitted |
-| segments | `k = 576`: one of 288 pairs; `k = 1536`: `[224, 272, 272]` | fitted, no other `k` built |
+| segments | `ceil(pairs / 288)` segments, the first `pairs - 272·(n-1)`, the rest 272: `k = 576` `[288]`, `768` `[112, 272]`, `1536` `[224, 272, 272]`, `3072` `[176, 272×5]` | fitted at those four `k` (template / held-out pairs, byte-equal emits) |
 | core `0x03d0` | low half = `zp_x` (upper half: mode bits), in segments other than the main engine | fitted on three real-calibration builds |
 | wide output | 576x49152: CORE / DEQUANT pairs after QUANT; only the first DEQUANT writes lanes and `zp_y`; 100-byte IO tail | template self-check |
 
