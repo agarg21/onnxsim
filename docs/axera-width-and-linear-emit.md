@@ -249,6 +249,31 @@ final norm + lm_head (16-bit RoPE, attention and SiLU programs from Pulsar2), th
 are within 0.98% relative RMS of float and the top-1 token agrees on 63 of 64 steps (all
 U8: 14.8%, 48 of 64). The card's health check read 0.0 throughout.
 
+### GPTQ weights on the card's grid
+
+```python
+w_gptq = le.gptq_weight(w, x, device="cuda")  # x: the layer's recorded inputs
+model = le.emit_linear_u16(template_u16, w_gptq, scales, zero_points)
+```
+
+`gptq_weight` rounds with GPTQ (`onnxsim.gptq`) on the card's own s8 grid instead of
+round-to-nearest: per output channel `s = max|w| / 127.5`, the largest element's code fixed
+(it sets the scale `weight_codes` recomputes, so it also keeps its float value), every other
+code within +-127 (a -128 elsewhere would become the largest and move the scale). It needs
+no Pulsar2 build. `device` runs the float64 column loop in torch; the codes equal numpy's.
+On a GPU, Qwen3-0.6B's 112 layer linears and its 1024x151936 lm_head take 102 s, against
+minutes on about 22 CPU cores.
+
+On the card (Qwen3-0.6B, Pulsar-free decode, 48 teacher-forced steps per passage, 2026-10-24):
+
+| passage | round-to-nearest | GPTQ | Pulsar2 `llm_build` |
+| --- | --- | --- | --- |
+| adaquant | 44/48 top-1, median logit error 4.4% | 45/48, 3.4% | 45/48, 7.5% |
+| activation-memory-planning | 46/48, 4.0% | 44/48, 2.9% | 47/48, 7.3% |
+
+The top-1 flips sit at near-ties: in the host estimate, the float model's top two logits are
+0.006-0.2 apart at each of them.
+
 ## 16-bit single-op programs at a new calibration (`u16_retarget.py`)
 
 ```python

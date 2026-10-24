@@ -74,6 +74,8 @@ def _gptq_quantize_columns(
     proc_block_size: int,
     qmin: float = -7.0,
     qmax: float = 7.0,
+    code_bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
+    device: Optional[str] = None,
 ) -> np.ndarray:
     """Returns GPTQ-optimized integer codes for ``w_nk`` ([N, K], output
     channel first), reusing ``scale_blocks``' existing per-(output channel,
@@ -88,9 +90,28 @@ def _gptq_quantize_columns(
     ``qmin``/``qmax`` bound the integer codes (default: the symmetric INT4
     grid ``[-7, 7]``; :mod:`onnxsim.quark_weight_rounding` passes
     ``[-127, 127]`` for INT8 QDQ weights).
+
+    ``code_bounds`` (``(lo, hi)``, each [N, K]) bounds every element's code
+    separately instead: the AX650's s8 weights
+    (``scripts/axera/linear_emit.gptq_weight``) recompute each channel's
+    scale from its largest element, so that element's code is fixed
+    (``lo == hi``) and every other element stays within +-127.
+
+    ``device`` (``"cuda"``, ``"cpu"``) runs the column loop in torch, in
+    float64 like the numpy loop (the results agree up to summation order);
+    torch is imported only then. A large layer (an LLM's vocabulary
+    projection) is minutes of multi-core numpy and seconds on a GPU.
     """
     n, k = w_nk.shape
     hinv = _inverse_hessian_cholesky(h, percdamp)
+    if code_bounds is None:
+        lo, hi = np.full((n, k), qmin), np.full((n, k), qmax)
+    else:
+        lo, hi = (np.asarray(b, dtype=np.float64) for b in code_bounds)
+    if device is not None:
+        return _gptq_columns_torch(
+            w_nk, scale_blocks, quant_block_size, hinv, proc_block_size, lo, hi, device
+        )
 
     codes_nk = np.zeros((n, k), dtype=np.float64)
     w_work = w_nk.copy()
@@ -107,7 +128,7 @@ def _gptq_quantize_columns(
             group = k_abs // quant_block_size
             s = scale_blocks[:, group]  # [N]
             w_col = w1[:, i]
-            code_col = np.clip(np.round(w_col / s), qmin, qmax)
+            code_col = np.clip(np.round(w_col / s), lo[:, k_abs], hi[:, k_abs])
             codes_nk[:, k_abs] = code_col
             d = hinv1[i, i]
             err = (w_col - code_col * s) / d
@@ -119,6 +140,42 @@ def _gptq_quantize_columns(
             w_work[:, block_end:] -= err1 @ hinv[block_start:block_end, block_end:]
 
     return codes_nk
+
+
+def _gptq_columns_torch(
+    w_nk, scale_blocks, quant_block_size, hinv, proc_block_size, lo, hi, device
+) -> np.ndarray:
+    """``_gptq_quantize_columns``' loop in torch on ``device``, float64."""
+    import torch
+
+    def t(a):
+        return torch.as_tensor(np.asarray(a, dtype=np.float64), device=device)
+
+    n, k = w_nk.shape
+    hinv_t, w_work, sb = t(hinv), t(w_nk).clone(), t(scale_blocks)
+    lo_t, hi_t = t(lo), t(hi)
+    codes = torch.zeros((n, k), dtype=torch.float64, device=device)
+    for block_start in range(0, k, proc_block_size):
+        block_end = min(block_start + proc_block_size, k)
+        bs = block_end - block_start
+        w1 = w_work[:, block_start:block_end].clone()
+        err1 = torch.zeros_like(w1)
+        hinv1 = hinv_t[block_start:block_end, block_start:block_end]
+        for i in range(bs):
+            k_abs = block_start + i
+            s = sb[:, k_abs // quant_block_size]
+            w_col = w1[:, i]
+            code_col = torch.clamp(
+                torch.round(w_col / s), min=lo_t[:, k_abs], max=hi_t[:, k_abs]
+            )
+            codes[:, k_abs] = code_col
+            err = (w_col - code_col * s) / hinv1[i, i]
+            err1[:, i] = err
+            if i + 1 < bs:
+                w1[:, i + 1 :] -= torch.outer(err, hinv1[i, i + 1 :])
+        if block_end < k:
+            w_work[:, block_end:] -= err1 @ hinv_t[block_start:block_end, block_end:]
+    return codes.cpu().numpy()
 
 
 def apply_gptq(
