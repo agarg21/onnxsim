@@ -7403,12 +7403,31 @@ two and refined the third:
   training-graph ops need a listed decomposition (or a Neg/Log-style
   explicit mapping) rather than hoping the compiler takes them.
 
+## BERT-style encoder classifiers (rerankers, NLI, sequence classifiers)
+
+Cross-encoders, NLI / zero-shot heads and sequence classifiers build and run
+on the AX650N once two onnxsim behaviours are switched for Pulsar2:
+
+- masked attention is not fused into `Attention`, which the AX650 does not
+  support;
+- the SDPA export's `Where(IsNaN(P), 0, P)` guard is removed exactly by the
+  new `eliminate_sdpa_nan_guard` pass. Pulsar2's frontend rejects `IsNaN`.
+
+Every Axera flow now simplifies through `pulsar2_backend.simplify()`, which
+applies both. RoBERTa's `CumSum` position ids work unchanged: the op is off
+the published list but exact on the card. On the card, the
+`ms-marco-MiniLM-L-6-v2` reranker at seq 128 runs in 2.9 ms (int8) with
+exact rerank order, and DistilRoBERTa NLI keeps every label at int8.
+DistilBERT SST-2 needs U16. Tables, the exactness argument and
+reproduction steps (`encoder_classifier.py`) are in
+[`docs/axera-encoder-classifiers.md`](../../docs/axera-encoder-classifiers.md).
+
 ## Files
 
 | file | purpose |
 | --- | --- |
 | `pulsar2_ops.py` | the heuristics and confirmed data: `AX650_SUPPORTED_OPS`/`AX650_MIN_OPSET` (the real, docs-scraped AX650 op list), `CPU_ONLY_OPS` (generic cross-vendor guess), the confirmed `AXERA_NPU_OP_TYPE = "neu mode"` marker, `referenced_const_data_keys()`/`missing_npu_data()`/`has_out_of_band_npu_data()` (the corruption detector), and non-standard-`domain` detection as a fallback for vendor blobs that don't follow Axera's exact convention. |
-| `pulsar2_backend.py` | thin wrapper around `pulsar2_ops.py`: `coverage()`, `new_blocking_op_types()`, `stripped_npu_data()`, `unsafe_for_simplify()`, `ax650_build_risks()`. Shaped like the sibling `*_backend.py` modules for interface symmetry (`PULSAR2_AVAILABLE` is always `True` -- there's no external dependency to be missing). |
+| `pulsar2_backend.py` | thin wrapper around `pulsar2_ops.py`: `coverage()`, `new_blocking_op_types()`, `stripped_npu_data()`, `unsafe_for_simplify()`, `ax650_build_risks()`, and `simplify()`/`simplify_kwargs()` (the `onnxsim.simplify()` arguments every Pulsar2 flow uses: no attention fusion, `eliminate_sdpa_nan_guard`). Shaped like the sibling `*_backend.py` modules for interface symmetry (`PULSAR2_AVAILABLE` is always `True` -- there's no external dependency to be missing). |
 | `inspect_axmodel.py` | standalone CLI for a **real** `.axmodel` file: loads it with `onnx.load()`, then reports non-standard-domain nodes, op types outside the model's declared opset, and suspiciously large raw attributes -- what originally found the `neu mode` node in the real YOLOv8 file. |
 | `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf` (real CNN `neu mode` node shape) and `axera_llm_layer_leaf` (real per-layer LLM shape: two `neu mode` nodes sharing one initializer) -- no real device needed to exercise the corruption check in CI. |
 | `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects both `onnxruntime`'s availability and `onnxsim` itself actually being importable (a checkout with `onnxsim`'s compiled extension not yet built fails `import onnxsim`, not just the lazy `onnxruntime` import inside it -- both are caught the same way so this degrades gracefully instead of taking `pulsar2_simulator.py`'s `import` down with it). |
@@ -7422,6 +7441,7 @@ two and refined the third:
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
 | `pulsar2_docker.py` | real `pulsar2 build` (Docker) + `axcl_run_model` (device) wrapper: `build()` (with `profile=` for `trace.json`), `llm_build()` (the separate, ONNX-free `pulsar2 llm_build` LLM path -- see above), `build_from_hf_checkpoint()` (the hf-config+safetensors -> `onnxsim.reconstruct_hf_graph()` -> `build()` path -- see "An alternative LLM path" above), `run_on_device()`, `run_on_device_with_input()`, `force_rmtree()`. Manual/local-only -- needs a loaded Docker image. |
 | `convert_onnxmodelzoo.py` | batch driver over `pulsar2_docker.py`: fetch -> onnxsim -> real `pulsar2 build` (orig + simplified, `--profile` optional) -> optional on-device bit-exact diff -> CSV. Entry point for `axera-integration.yml`'s `pulsar2-docker-convert` job -- like `amd-integration.yml`'s MIGraphX check, that job is `workflow_dispatch`-only and targets a `[self-hosted, axcl]` runner this repository doesn't provision, so it's dormant until one exists. |
+| `encoder_classifier.py` | BERT-style encoder classifiers end to end: legacy export at a static `[1, seq]`, `pulsar2_backend.simplify()`, `pulsar2 build` at U8/U16 with text-pair calibration, then logit error, label agreement, rerank order and latency on the card -- see `docs/axera-encoder-classifiers.md`. |
 | `demo_hf_llm.py` | interactive one-shot demo of `build_from_hf_checkpoint()`: compile, print the phase-timing breakdown (and `--profile`'s trace.json/Netron paths), feed one prompt, print top-5 predicted next tokens. |
 | `llm_pulsar_free/` | whole-LLM decode (llama / qwen3) where every program is retargeted or emitted without Pulsar2 (`u16_retarget`, `linear_emit.emit_linear_u16`) and run as one plan per token with the K / V caches on the card; llama-160m and Qwen3-0.6B results against `llm_build` in `docs/axera-llm-pulsar-free-decode.md`. |
 | `demo_hf_llm_chat.py` | interactive chat REPL on top of the same compiled `.axmodel`, generating one token at a time and reporting real tokens/sec -- see its own docstring for the confirmed ~700ms-per-step `axcl_run_model` process/model-reload overhead this measures alongside the NPU's actual ~0.6-0.8ms compute latency. |

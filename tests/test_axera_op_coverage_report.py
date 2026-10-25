@@ -194,5 +194,6 @@ def test_unlisted_frontend_failures_classify_as_broken():
         assert op_coverage.classify(op) == op_coverage.BROKEN, op
     # ONNX can add default-domain operators between releases (for example,
     # SwiGLU in 1.23), so keep the historical floor without pinning an exact
-    # count to one ONNX schema snapshot.
-    assert len(op_coverage.coverage_table()["unlisted"]) >= 80
+    # count to one ONNX schema snapshot. (78: IsNaN and CumSum left the
+    # unlisted set once classified broken / working on hardware.)
+    assert len(op_coverage.coverage_table()["unlisted"]) >= 78

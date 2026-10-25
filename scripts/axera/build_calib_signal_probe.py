@@ -167,14 +167,17 @@ def build_instrumented_step(
     legalize.legalize(step_model, _POST_BACKWARD_RULES)
     onnx.checker.check_model(step_model)
 
+    import pulsar2_backend
     from onnxsim import simplify as _simplify
 
     step_model, ok = _simplify(
         step_model,
-        skipped_optimizers=[
-            "fuse_matmul_add_bias_into_gemm",
-            "fuse_transpose_into_gemm",
-        ],
+        **pulsar2_backend.simplify_kwargs(
+            skipped_optimizers=[
+                "fuse_matmul_add_bias_into_gemm",
+                "fuse_transpose_into_gemm",
+            ],
+        ),
     )
     if not ok:
         raise RuntimeError("post-legalize simplify() failed its own correctness check")

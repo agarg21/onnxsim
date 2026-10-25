@@ -113,9 +113,9 @@ def convert_one(
             res["status"] = "skipped_not_single_image_input"
             return res
 
-        from onnxsim import simplify
+        import pulsar2_backend
 
-        simp, _ = simplify(model)
+        simp, _ = pulsar2_backend.simplify(model)
 
         model_dir = os.path.join(work_dir, "model")
         dataset_dir = os.path.join(work_dir, "dataset")

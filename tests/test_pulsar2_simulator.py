@@ -38,8 +38,16 @@ def test_partition_reports_full_coverage_for_clean_models():
     inference) -- a real finding, not a bug in this test's expectation. A
     deployed model would normally have onnxsim constant-fold this away
     first, which is exactly what this suite's regression tests check for.
+
+    ``axera_masked_encoder_sdpa`` is a raw SDPA export's shape: its ``IsNaN``
+    guard is a confirmed build failure (onnxsim's ``eliminate_sdpa_nan_guard``
+    removes it), and RoBERTa's ``CumSum`` is off the published list (though
+    confirmed working, ``pulsar2_ops.AX650_CONFIRMED_WORKING_OPS``).
     """
-    expected_cpu_op_types = {"foldable_shape_reshape": {"Shape": 1}}
+    expected_cpu_op_types = {
+        "foldable_shape_reshape": {"Shape": 1},
+        "axera_masked_encoder_sdpa": {"IsNaN": 1, "CumSum": 1},
+    }
     for name in models.names():
         model = models.build(name)
         expected = expected_cpu_op_types.get(name, {})

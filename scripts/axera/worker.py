@@ -19,7 +19,9 @@ one model:
    ``pulsar2_ops.py``'s docstring for the full, exhausted list of parameter
    combinations that were tried and did not help) -- there is no safe way to
    run this step for such a model.
-1. Otherwise, ``simplify`` it with onnxsim.
+1. Otherwise, ``simplify`` it with onnxsim, with the arguments every
+   Pulsar2 flow uses (``pulsar2_backend.simplify``: no attention fusion,
+   SDPA ``IsNaN`` guard removed).
 2. Compute the static Pulsar2-NPU-blocker set for the original and the
    simplified graph (``pulsar2_ops.blocking_ops``).
 3. If simplification introduced a blocking op type that wasn't already
@@ -72,8 +74,6 @@ def check(model_name: str, onnx_path: str | None) -> dict:
         import onnx
         import pulsar2_backend as pulsar2
 
-        from onnxsim import simplify
-
         if onnx_path:
             model = onnx.load(onnx_path)
         else:
@@ -92,7 +92,7 @@ def check(model_name: str, onnx_path: str | None) -> dict:
             return res
 
         try:
-            simp, check_ok = simplify(model)
+            simp, check_ok = pulsar2.simplify(model)
         except Exception as exc:
             res["status"] = "simplify_error"
             res["error"] = f"{type(exc).__name__}: {exc}"

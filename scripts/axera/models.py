@@ -19,6 +19,14 @@ Both exercise `pulsar2_ops.has_out_of_band_npu_data`/`missing_npu_data` and
 the `pulsar2_unsafe_for_simplify` worker path in CI, without needing the
 real device -- `axera_llm_layer_leaf` specifically checks the multi-NPU-node
 case the CNN-only leaf never exercises.
+
+- `axera_masked_encoder_sdpa`: one BERT/RoBERTa-style encoder layer in the
+  node shapes PyTorch's legacy exporter gives SDPA attention -- a -inf
+  padding mask from the int `attention_mask` input, the `Where(IsNaN(P), 0,
+  P)` guard after the Softmax -- plus RoBERTa's `CumSum` position ids. Plain
+  `simplify()` fuses this attention into com.microsoft `Attention` (not on
+  the AX650 list); the worker's `pulsar2_backend.simplify()` must not, and
+  must also remove `IsNaN` (docs/axera-encoder-classifiers.md).
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ import sys
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper, numpy_helper
+from onnx import TensorProto, helper, numpy_helper, parser
 
 _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Only keep scripts/ on sys.path for the duration of this import: scripts/
@@ -189,23 +197,106 @@ def axera_llm_layer_leaf() -> onnx.ModelProto:
     )
 
 
+_AXERA_ENCODER_NAME = "axera_masked_encoder_sdpa"
+
+
+def axera_masked_encoder_sdpa() -> onnx.ModelProto:
+    """One masked encoder layer as the legacy exporter emits SDPA attention
+    (see this module's docstring)."""
+    s, c, h = 8, 16, 2
+    d = c // h
+    rng = np.random.default_rng(0)
+    weights = {
+        "emb": (50, c),
+        "pos_emb": (s + 2, c),
+        **{f"w{t}": (c, c) for t in "qkvo"},
+        **{f"b{t}": (c,) for t in "qkvo"},
+        "ln_g": (c,),
+        "ln_b": (c,),
+    }
+    # Node order as the legacy exporter emits it (K's transpose after V's).
+    body = ""
+    for t in "qkv":
+        body += f"""
+        {t}m = MatMul(x, w{t})
+        {t}l = Add(b{t}, {t}m)
+        {t}r = Reshape({t}l, heads)
+        """
+        if t != "k":
+            body += f"{t}h = Transpose <perm=[0,2,1,3]> ({t}r)\n"
+    body += "kh = Transpose <perm=[0,2,3,1]> (kr)\n"
+    model = parser.parse_model(
+        f"""
+        <ir_version: 8, opset_import: ["" : 17]>
+        {_AXERA_ENCODER_NAME} (int64[1, {s}] input_ids, int64[1, {s}] attention_mask)
+            => (float[1, {s}, {c}] out)
+        <int64[4] heads = {{1, {s}, {h}, {d}}}, int64[3] merged = {{1, {s}, {c}}},
+         float scale = {{{(1.0 / d) ** 0.25!r}}},
+         int64[2] ax12 = {{1, 2}}, int64 pad = {{1}}, int64 cs_axis = {{1}},
+         float[1] zero = {{0.0}}, float[1] minf = {{-inf}}, float nz = {{0.0}}>
+        {{
+            word = Gather(emb, input_ids)
+            is_pad = Equal(input_ids, pad)
+            not_pad = Not(is_pad)
+            m32 = Cast <to = 6> (not_pad)
+            csum = CumSum(m32, cs_axis)
+            cm = Mul(csum, m32)
+            c64 = Cast <to = 7> (cm)
+            pos_ids = Add(c64, pad)
+            pos = Gather(pos_emb, pos_ids)
+            e = Add(word, pos)
+            x = LayerNormalization <axis=-1, epsilon=1e-12> (e, ln_g, ln_b)
+            {body}
+            qs = Mul(qh, scale)
+            ks = Mul(kh, scale)
+            qk = MatMul(qs, ks)
+            m4 = Unsqueeze(attention_mask, ax12)
+            keep = Cast <to = 9> (m4)
+            mask = Where(keep, zero, minf)
+            logits = Add(qk, mask)
+            p = Softmax <axis=-1> (logits)
+            nan = IsNaN(p)
+            guarded = Where(nan, nz, p)
+            ctx4 = MatMul(guarded, vh)
+            ctxt = Transpose <perm=[0,2,1,3]> (ctx4)
+            ctx = Reshape(ctxt, merged)
+            om = MatMul(ctx, wo)
+            o = Add(bo, om)
+            out = Add(o, x)
+        }}
+        """
+    )
+    for name, shape in weights.items():
+        model.graph.initializer.append(
+            numpy_helper.from_array(
+                (rng.standard_normal(shape) * 0.2).astype(np.float32), name
+            )
+        )
+    onnx.checker.check_model(model)
+    return model
+
+
+_AXERA_BUILDERS = {
+    _AXERA_LEAF_NAME: axera_npu_compiled_leaf,
+    _AXERA_LLM_LAYER_NAME: axera_llm_layer_leaf,
+    _AXERA_ENCODER_NAME: axera_masked_encoder_sdpa,
+}
+
+
 def names() -> list:
-    return [*_shared_names(), _AXERA_LEAF_NAME, _AXERA_LLM_LAYER_NAME]
+    return [*_shared_names(), *_AXERA_BUILDERS]
 
 
 def build(name: str) -> onnx.ModelProto:
-    if name == _AXERA_LEAF_NAME:
-        return axera_npu_compiled_leaf()
-    if name == _AXERA_LLM_LAYER_NAME:
-        return axera_llm_layer_leaf()
+    if name in _AXERA_BUILDERS:
+        return _AXERA_BUILDERS[name]()
     return _shared_build(name)
 
 
 def all_models() -> dict:
     return {
         **_shared_all_models(),
-        _AXERA_LEAF_NAME: axera_npu_compiled_leaf(),
-        _AXERA_LLM_LAYER_NAME: axera_llm_layer_leaf(),
+        **{n: b() for n, b in _AXERA_BUILDERS.items()},
     }
 
 

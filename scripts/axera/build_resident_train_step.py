@@ -546,15 +546,18 @@ def _fold_constants(model: onnx.ModelProto) -> onnx.ModelProto:
     optimizer behavior, which is exactly the kind of silent, model-specific
     failure this flag closes off generally rather than routing around once.
     """
+    import pulsar2_backend
     from onnxsim import simplify as _simplify
 
     model, ok = _simplify(
         model,
-        initializers_as_constants=False,
-        skipped_optimizers=[
-            "fuse_matmul_add_bias_into_gemm",
-            "fuse_transpose_into_gemm",
-        ],
+        **pulsar2_backend.simplify_kwargs(
+            initializers_as_constants=False,
+            skipped_optimizers=[
+                "fuse_matmul_add_bias_into_gemm",
+                "fuse_transpose_into_gemm",
+            ],
+        ),
     )
     if not ok:
         raise RuntimeError(
@@ -816,14 +819,17 @@ def build_resident_step(
     legalize.legalize(step_model, _POST_BACKWARD_RULES)
     onnx.checker.check_model(step_model)
 
+    import pulsar2_backend
     from onnxsim import simplify as _simplify
 
     step_model, ok = _simplify(
         step_model,
-        skipped_optimizers=[
-            "fuse_matmul_add_bias_into_gemm",
-            "fuse_transpose_into_gemm",
-        ],
+        **pulsar2_backend.simplify_kwargs(
+            skipped_optimizers=[
+                "fuse_matmul_add_bias_into_gemm",
+                "fuse_transpose_into_gemm",
+            ],
+        ),
     )
     if not ok:
         raise RuntimeError("post-legalize simplify() failed its own correctness check")
