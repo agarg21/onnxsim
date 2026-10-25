@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `002b2cea7` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `b5a4840a6` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1026,3 +1026,39 @@ Still hand-written:
   A BEVFormer query sees 1-2 of the 6 cameras, and a static generated kernel samples all 6 with weight 0. Also, the vector
   floor / float -> int helpers (`HVX_REVEC_CMP=1`) gave wrong results on the phone: there HVX float math is qf32, which
   hexagon-sim doesn't model.
+
+**Intermediates in VTCM, placed by the graph.** A kernel can't keep data in VTCM for a later kernel, because it doesn't know
+what runs in between. The graph emitter does know:
+- each buffer's live range over the call order;
+- which calls use the HMX tile pool;
+- how each kernel reads and writes each buffer (from its source).
+
+It now places intermediates in a VTCM arena past the tile pool (`DSP_GRAPH_VTCM_KB`), which no kernel touches. Placement is
+first fit over live ranges, with the most calls per byte first. Only buffers that some single call writes whole qualify, and
+only if every kernel touches them as whole HVX vectors or through the HMX pack/store helpers. VTCM has no L1, so a buffer
+read with 16-byte `float4` loads ran 40% slower there and stays in DDR. Hand kernels' buffers stay in DDR too.
+
+The skel acquires the tile pool plus the arena on every run. A cDSP that grants less runs those buffers from one DDR block:
+the results are the same, only slower. `dsp_graph_onnx.py` sizes the arena to what the tile pool leaves of
+`DSP_VTCM_TOTAL_KB` (default 8192, the V69's). A 3 MB tile pool (`HMX_VTCM_KB=3072`) with a 5 MB arena measured best; the
+split attention needs 2.1 MB of the pool.
+
+The same round fixed two issues found along the way:
+- A threaded kernel whose buffer numbering skips one declares its core id before its last buffer. The emitter used to pass
+  the core id last, which faulted on the phone.
+- A reduction over 960 fp16 values with a per-column bias took the rows as its vector lanes, which made every load a
+  2-byte gather.
+
+| model | before | VTCM arena (`HMX_VTCM_KB=3072`) | vs onnxruntime on the plain export |
+|---|---:|---:|---|
+| decoder | 84.0 ms | 61.7 ms | max rel 1.1e-3 |
+| encoder, 1 layer | 40.8 ms | 34.0 ms | PASS (rtol 2e-3) |
+| encoder, 3 layers | 111.5 ms | 101.3 ms | PASS (rtol 2e-3) |
+
+`HMX_ATTN=3` runs the decoder attention as generated kernels, one head at a time, so a head's S^T and P^T fit the arena:
+- S^T = K Q^T on the HMX;
+- the softmax over S^T's rows, as vector reductions with an fp16 exp computed once;
+- O^T = V^T P^T on the HMX.
+
+It passes but takes 199 ms against 62 ms for the hand attention. About 13 ms per layer is the heads themselves; another
+~15 ms per layer goes to the q / k / v transposes and assembling the heads, which codegen still renders as scalar copies.
