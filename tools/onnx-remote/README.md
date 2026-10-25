@@ -1051,9 +1051,9 @@ The same round fixed two issues found along the way:
 
 | model | before | VTCM arena (`HMX_VTCM_KB=3072`) | vs onnxruntime on the plain export |
 |---|---:|---:|---|
-| decoder | 84.0 ms | 61.7 ms | max rel 1.1e-3 |
-| encoder, 1 layer | 40.8 ms | 34.0 ms | PASS (rtol 2e-3) |
-| encoder, 3 layers | 111.5 ms | 101.3 ms | PASS (rtol 2e-3) |
+| decoder | 84.0 ms | 61.7 ms | max rel 1.15e-3 |
+| encoder, 1 layer | 40.8 ms | 34.0 ms | max rel 3.2e-4 |
+| encoder, 3 layers | 111.5 ms | 101.3 ms | max rel 1.2e-3 |
 
 `HMX_ATTN=3` runs the decoder attention as generated kernels, one head at a time, so a head's S^T and P^T fit the arena:
 - S^T = K Q^T on the HMX;
