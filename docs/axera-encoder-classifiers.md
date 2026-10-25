@@ -158,6 +158,11 @@ Notes:
 - Build time is under a minute per model. Each model compiles to one NPU
   subgraph.
 
+Exports from newer torch no longer have the guard. torch 2.11 (used for
+every result here) emits it, while CI's torch 2.14.1 exports SDPA without
+`IsNaN`. On those exports the pass simply finds nothing to do, and
+`attention_fusion_backend="none"` is still required.
+
 ## Not covered
 
 - Dynamo exports were not built with Pulsar2. Their `finfo.min` mask takes

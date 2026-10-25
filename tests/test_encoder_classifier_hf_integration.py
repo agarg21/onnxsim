@@ -149,7 +149,8 @@ def test_sdpa_nan_guard_removed_without_fusion(tmp_path, model_id, dynamo):
         pytest.importorskip("onnxscript")
     model = _load(model_id, "sdpa")
     exported = _export(model, tmp_path / "model.onnx", dynamo)
-    assert any(n.op_type == "IsNaN" for n in exported.graph.node)
+    # torch 2.11 exports the guard; torch 2.14 no longer does. Either way the
+    # result must be guard- and Attention-free and match the export.
 
     simplified, ok = onnxsim.simplify(
         exported,
