@@ -246,6 +246,76 @@ python scripts/axera/mixed_precision.py W/TAG.sim.onnx W/TAG_U8/out W/TAG_U16/ou
 python scripts/axera/encoder_classifier.py MODEL --precision --mix best=mix.json --work W
 ```
 
+## Mixed precision, end to end: `--precision auto`
+
+One command does all of the above and checks the result on the card:
+
+```bash
+# any ONNX model with static shapes + calibration/dev inputs (.npz, axis 0 = sample)
+python scripts/axera/mixed_precision.py auto model.onnx \
+    --calib calib.npz --dev dev.npz --work W [--slack-db 1] [--max-err X] [--max-latency-ms Y]
+# the classifiers: export, simplify, and dev pairs are handled for you
+python scripts/axera/encoder_classifier.py MODEL [--nli] --precision auto
+```
+
+`mixed_precision.auto()` runs these steps:
+
+1. **Build U8 and U16, and measure both on the card.** It builds U8 and
+   whole-model U16 and runs both on the dev inputs on the card. Accuracy is the
+   SNR of the first output against onnxruntime fp32, plus NPU latency.
+2. **Set the budget.** By default the budget is 1 dB below the card's U16
+   SNR. `--max-err` sets a relative-error floor instead. `--max-latency-ms`
+   adds a latency budget. If U8 already meets the budget, the run stops here.
+3. **Search.** It runs `search()` over op-type groups and over layer groups
+   (`--by auto`). It keeps whichever grouping's first candidate widens fewer
+   tensors. In practice, op types win on transformers (the residual stream)
+   and layers (blocks) win on CNNs. Every prefix of the search order is a
+   candidate.
+4. **Build and check candidates on the card.** The first candidate to build
+   is the first prefix whose replayed SNR comes within `--margin-db`
+   (default 3 dB) of the budget. The budget is moved into replay terms using
+   the U16 build's card-vs-replay offset; the margin exists because replay
+   underestimates mixes (DistilBERT LN+Add: 17.0 dB replayed, 18.4 dB on the
+   card). Each candidate is built and run on the card. A candidate that misses
+   the card budget is noted, and the next prefix is tried, up to
+   `--max-candidates`. A candidate over the latency budget stops the search,
+   because longer prefixes are only slower.
+5. **Fall back.** If no candidate passes, it uses whole-model U16 if U16
+   meets the latency budget. Otherwise nothing is chosen, and the exit
+   status is 1.
+
+Builds are cached under `W` by a hash of model, calibration data, config and
+image. A rerun only replays and visits the card. Each card visit is its own
+`AXSession`, with a health check before and after. The run writes
+`W/auto_report.{json,md}`: every candidate with its predicted and card SNR,
+relative error, latency, 16-bit tensor count, build time (or "cached"),
+and the choice.
+
+Results on the card with the default budget. Error is measured on the
+evaluation pairs, not the dev set the choice was made on:
+
+| Model | auto chose | hand-picked (above) | 16-bit tensors | Latency | Rel. err (eval) | Agreement | Candidates built | Wall time |
+|---|---|---|---|---|---|---|---|---|
+| DistilBERT SST-2 | LayerNorm + Add (op types) | LN + Add | 43 | 6.84 ms | 22 % | 12/12 | 1 (accepted) | ~290 s uncached (measured as 245 s for U8/U16 + search, plus the 48 s mix build); 151 s cached |
+| MiniLM-L6 reranker | LayerNorm (op types) | LN only | 13 | 2.94 ms | 3.9 % | τ 0.95, top-1 4/4 | 1 (accepted) | 170 s |
+| DistilRoBERTa NLI | LayerNorm + Add (op types) | LN + Add | 45 | 6.99 ms | 5.2 % | 12/12 | 1 (accepted) | 336 s |
+| MobileNetV2, ImageNet (not an encoder) | blocks 17, 16, 15, 1, 2, 14 (layers) | -- | 31 of 98 | 1.11 ms (U8 0.77, U16 1.37) | 9.0 % (dev) | top-1 65.7 % (U8 65.7, U16 66.0, fp32 67.7) on 300 images; 95.3 % agreement with fp32 (U8 89.7 %, U16 95.3 %) | 4 (3 missed, next prefix each time) | 394 s |
+
+Notes on the table:
+
+- On all three classifiers, auto reproduces the hand-picked mix.
+- Wall time is everything: export, simplify, the U8/U16 builds, the search,
+  and the card visits. Uncached Pulsar2 builds take 25–60 s each.
+- On MobileNetV2, op-type grouping would widen almost every tensor: Conv,
+  then Conv + Add, reaches the budget at 95 of 98 tensors and U16 latency.
+  The layer grouping is the useful one.
+- On MobileNetV2, the fallback loop ran for real. The first three prefixes
+  missed the card budget by 2.2 / 1.4 / 0.5 dB, and replay was within
+  0.25 dB of the card on each.
+- With `--slack-db 3`, DistilBERT reaches the same LN + Add mix. With the
+  default, it does too, because on the dev set its card SNR (18.4 dB) beats
+  U16's (17.8 dB).
+
 ## Not covered
 
 - Dynamo exports were not built with Pulsar2. Their `finfo.min` mask takes
@@ -254,6 +324,10 @@ python scripts/axera/encoder_classifier.py MODEL --precision --mix best=mix.json
   #2217 found all their ops on the AX650 list.
 - Larger checkpoints (BERT-base 12L, `bge-reranker`) were not run.
 - seq 512 was not run.
+- `--precision auto` is not wired into `worker.py` / `pulsar2_backend`
+  (static checks with no compiler) or `convert_onnxmodelzoo.py` (its
+  image-preprocessing build config is a different shape). Call
+  `mixed_precision.py auto` on the ONNX instead.
 - Mixed precision was chosen and checked on 12–20 evaluation pairs per
   model (64 dev pairs for the choice). A larger task set (SST-2 / MNLI
   validation) would tighten the error figures.
