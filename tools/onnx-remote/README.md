@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `a1c7fda44` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `5f6c99d93` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1092,3 +1092,27 @@ or 900 rows, though, so it isn't used in these models yet.
 | encoder, 3 layers | 105.8 ms | 95.4 ms | max rel 1.2e-3 |
 
 The "before" column is the same day's run of the previous fork commit.
+
+**Transposes, call order and VTCM placement.** Another round, again measured with one-op micro models on the phone:
+- *Odd-sized transposes.* A transposing copy whose swapped axis isn't a multiple of 32 (the camera maps, 6 x 256 x 375 ->
+  6 x 375 x 256) now runs in three parts: the multiple-of-32 part and the last 32 (overlapping), each through the 32 x 32
+  transpose network, then a concatenation. 6.2 -> 0.61 ms. The concatenation needed one more renderer fix: a select whose
+  condition is the same scalar in every lane is now one vector select, not 128 lane selects (2.1 -> 0.2 ms).
+- *VTCM ranking.* Candidates are ranked by uses per byte-call of VTCM held, so small buffers read twice 200 calls apart no
+  longer block the arena.
+- *Call order.* The capture runs every kernel as early as possible, so a producer near the start could feed a consumer 70 calls
+  later. A pass now sinks each call to just before its first dependent, comparing byte ranges within buffers.
+- *Buffer reuse.* tinygrad's own memory planner aliased unrelated tensors, which created false dependencies between calls. It is
+  now off (`NO_MEMORY_PLANNER=1`), and the emitter plans DDR reuse by liveness after the reordering (`DSP_GRAPH_REUSE=1`). The
+  3-layer encoder's scratch went from 108 to 37 MB.
+- *Hand kernels in VTCM.* A hand kernel can declare which of its buffers it reads only as whole HVX vectors
+  (`/* vtcm-params: 1 */`). MSDA declares its value maps, and those are placed first. Per MSDA call: decoder 1.6 -> 0.83 ms,
+  two-frame temporal 6.5 -> 3.2 ms, cameras 6.0 -> 4.3 ms.
+
+| model | before | now (`HMX_VTCM_KB=3072`) | vs onnxruntime on the plain export |
+|---|---:|---:|---|
+| decoder | 59.3 ms | 44.7 ms | max rel 1.15e-3 |
+| encoder, 1 layer | 32.5 ms | 20.7 ms | max rel 3.2e-4 |
+| encoder, 3 layers | 95.4 ms | 60.6 ms | max rel 1.2e-3 |
+
+At the start of this series (fused hand attention, before the VTCM arena) the same three took 84 / 41 / 111 ms.
