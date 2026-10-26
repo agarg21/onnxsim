@@ -163,6 +163,89 @@ every result here) emits it, while CI's torch 2.14.1 exports SDPA without
 `IsNaN`. On those exports the pass simply finds nothing to do, and
 `attention_fusion_backend="none"` is still required.
 
+## Mixed precision: the residual stream at 16 bits
+
+Whole-model U16 fixes every model above but costs 15–20 % latency. Running
+only the **residual stream** at 16 bits gets almost all of that accuracy at
+2–4 % latency. The residual stream is every `LayerNorm` and residual `Add`,
+i.e. the tensors entering them. Rows are U8 / the best mix /
+whole-model U16. The mixes were chosen by `scripts/axera/mixed_precision.py`
+on a 64-pair dev set disjoint from the evaluation pairs, and all were built
+and run on the card. Health was 0.0 LSB before and after every batch.
+
+| Model | Build | 16-bit tensors | Latency | Logit rel. err | Agreement with fp32 |
+|---|---|---|---|---|---|
+| DistilBERT SST-2 | U8 | 0 | 6.63 ms | 101 % | argmax 5/12 |
+| | **LN + Add (25 ops)** | 43 | **6.76 ms** | **22 %** | **12/12** |
+| | U16 | 164 | 7.73 ms | 15 % | 12/12 |
+| MiniLM-L6 reranker | U8 | 0 | 2.93 ms | 9.1 % | τ 1.00, top-1 4/4 |
+| | **LN only (13 ops)** | 13 | **2.92 ms** | **3.9 %** | τ 0.95, top-1 4/4, sign 100 % |
+| | LN + Add (26 ops) | 45 | 2.98 ms | 1.8 % | τ 0.95, top-1 4/4, sign 100 % |
+| | U16 | 168 | 3.43 ms | 1.6 % | τ 0.95, top-1 4/4 |
+| DistilRoBERTa NLI | U8 | 0 | 6.73 ms | 17 % | argmax 12/12 |
+| | **LN + Add (26 ops)** | 45 | **6.99 ms** | **5.2 %** | **12/12** |
+| | U16 | 169 | 8.01 ms | 5.1 % | 12/12 |
+
+The 16-bit tensor counts are unique activation tensors at 16 bits in
+`quant_axmodel.json`. The MiniLM τ of 0.95 is one near-tied passage pair, the
+same pair that U16 swaps.
+
+### How the mix is chosen, and what did not work
+
+`mixed_precision.py` never rebuilds per candidate. It needs one U8 and one
+U16 build of the model:
+
+1. **Replay.** `replay.py` reproduces the card from a build's own scale table.
+   Replaying the U8 and U16 builds gives logit errors of 100.9 % / 25 %
+   (DistilBERT), 9.0 % / 2.0 % (MiniLM) and 16.3 % / 5.2 % (DistilRoBERTa).
+   On the card they are 101 % / 15 %, 9.1 % / 1.6 % and 17 % / 5.1 %.
+2. **Splice.** A mix is emulated by taking the U16 build's scales for the
+   tensors the mix widens and the U8 build's scales for everything else.
+3. **What a mix widens.** This took a wrong build to learn: `layer_configs`
+   promotes an op's **inputs**, not its output. A promoted `Add` reads 16-bit
+   operands and still writes 8 bits. An operand that some 8-bit op also reads
+   stays 8-bit, and Pulsar2 inserts an `AxRequantizeLinear` into the
+   promoted op, which gains nothing. So a tensor is 16-bit only when every
+   op reading it is promoted (`Build.widened()`).
+   - Before this rule, the first DistilBERT mix promoted the op producing
+     the outlier tensor. It went 101 % → 94 % on the card while the splice
+     predicted 38 %.
+   - With the rule, the splice predicts three real mixed builds to within a
+     few points: 0.93 / 0.91 / 0.39, against 0.94 / 0.91 / 0.41 on the card.
+4. **Search.** Start from all-U8, and at each step add the op-type group
+   whose addition scores best (output SNR on the dev set). Stop within 1 dB
+   of all ops promoted. On DistilBERT and DistilRoBERTa this picks
+   `LayerNorm` then `Add`. On MiniLM `LayerNorm` alone is enough.
+5. **Emit.** The chosen ops' post-fusion names become
+   `[{"layer_names": [...], "data_type": "U16"}]`, which go to
+   `encoder_classifier.py --mix NAME=FILE`.
+
+What did not work: ranking single tensors (or single ops) by their gain
+alone, then promoting them greedily.
+
+- **DistilBERT.** One tensor stands out: the layer-4 FFN residual `Add`
+  output, +7.6 dB alone, which is DistilBERT's known outlier layer.
+  Promoting it and the next five fixes the label on 11 of 12 pairs, but the
+  logit error stays at 44–45 % on the card.
+- **MiniLM.** The error is spread out, and 2–4 greedy tensors do nothing on
+  the card (9.7–9.9 %).
+- **DistilRoBERTa.** Greedy reaches 9.2 % with 4 tensors and 6.3 % with 10
+  (7.15 / 7.42 ms). Both are worse and slower than LN + Add.
+
+The residual stream only pays as a whole: widening one residual tensor
+helps little while its neighbours are still 8-bit. That is why `search()`
+adds whole groups rather than ranked tensors.
+
+Reproduce:
+
+```bash
+# U8 + U16 builds (and the dev set)
+python scripts/axera/encoder_classifier.py MODEL --precision U8 U16 --work W --dev-npz W
+python scripts/axera/mixed_precision.py W/TAG.sim.onnx W/TAG_U8/out W/TAG_U16/out \
+    --feeds W/TAG.dev.npz --json mix.json
+python scripts/axera/encoder_classifier.py MODEL --precision --mix best=mix.json --work W
+```
+
 ## Not covered
 
 - Dynamo exports were not built with Pulsar2. Their `finfo.min` mask takes
@@ -171,5 +254,7 @@ every result here) emits it, while CI's torch 2.14.1 exports SDPA without
   #2217 found all their ops on the AX650 list.
 - Larger checkpoints (BERT-base 12L, `bge-reranker`) were not run.
 - seq 512 was not run.
-- No mixed precision short of whole-model U16 was tried for DistilBERT.
+- Mixed precision was chosen and checked on 12–20 evaluation pairs per
+  model (64 dev pairs for the choice). A larger task set (SST-2 / MNLI
+  validation) would tighten the error figures.
 - Batch > 1 was not run.
