@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `b5a4840a6` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `642580645` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1061,4 +1061,12 @@ The same round fixed two issues found along the way:
 - O^T = V^T P^T on the HMX.
 
 It passes but takes 199 ms against 62 ms for the hand attention. About 13 ms per layer is the heads themselves; another
-~15 ms per layer goes to the q / k / v transposes and assembling the heads, which codegen still renders as scalar copies.
+~15 ms per layer goes to the q / k / v transposes and assembling the heads, which codegen rendered as scalar copies.
+
+A transposing copy now upcasts both of its axes by 32 (`HVX_TRANSPOSE`). Loads and stores are whole rows, and the transpose
+happens in registers. On hexagon-sim a per-head 900 x 32 float -> 32 x 960 fp16 copy went from 11.0 M to 1.9 M cycles; its
+values are within one fp16 ulp, because the vector float -> half conversion rounds a few values differently. The kernel
+spills a 97 KB frame, which overran the 96 KB pool-thread stacks and faulted the PD, so the stacks are now 192 KB. With this,
+`HMX_ATTN=3` takes the decoder from 199 to 174 ms. The default path has no such copy and is unchanged.
+
+The same phone ran ~4% slower on the second day for identical programs, so compare runs from one session only.
