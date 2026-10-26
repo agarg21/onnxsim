@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `5f6c99d93` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `823bd8f93` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1116,3 +1116,30 @@ The "before" column is the same day's run of the previous fork commit.
 | encoder, 3 layers | 95.4 ms | 60.6 ms | max rel 1.2e-3 |
 
 At the start of this series (fused hand attention, before the VTCM arena) the same three took 84 / 41 / 111 ms.
+
+**Generated attention.** The decoder's self-attention can also run as generated kernels (`HMX_ATTN=3`, opt-in), head by head
+and transposed: S^T = K Q^T on the HMX, softmax over S^T's rows, O^T = V^T P^T on the HMX. This round took it from 128 to
+52 ms. Most of the gain came from these changes:
+- *Operands from the projections.* The ONNX graph's realized (8, 900, 32) and (8, 32, 900) copies are read through back to
+  the (900, 256) projection outputs. Each operand is then one fp32 row copy or 32 x 32 block transpose, cast to fp16 last. Each
+  had been a second transposing copy over rows of 900 values (2.9 ms each, 13 ms per layer).
+- *Softmax.* The max shift runs in fp16 and the exp is computed in place over S^T, so each head needs one 1.8 MB VTCM region. A
+  row of ones in V^T gives each query's sum of exp from the P V product itself, so there is no normalization pass. The fp16 exp2
+  helper now keeps its polynomial in qf16, as the hand softmax does: 0.39 -> 0.18 ms per head.
+- *Output.* Each head's O^T and its sums are stored into rows of one buffer, then one block transpose divides and writes
+  (900, 256).
+- *HMX output pairing.* When every B tile is cached by the inner tile loop, two adjacent output tiles are now computed together
+  and written as full 128-byte rows. S^T went from 0.385 to 0.18 ms per head, and the decoder's other generated Gemms from 15
+  to 11 ms. Those Gemms are what sped up the default build too.
+- *VTCM.* A buffer left out may now take the place of overlapping ones that carry less traffic (uses x bytes). The graph also
+  hoists calls that don't depend on an HMX-to-HMX chain out of it: call sinking had put the V projection between a layer's
+  first S^T and its P V.
+
+| model | before | now, hand attention (default) | `HMX_ATTN=3` | vs onnxruntime on the plain export |
+|---|---:|---:|---:|---|
+| decoder | 44.7 ms | 40.5 ms | 51.9 ms | max rel 1.15e-3 |
+| encoder, 1 layer | 20.7 ms | 18.6 ms | | max rel 3.2e-4 |
+| encoder, 3 layers | 60.6 ms | 53.8 ms | | max rel 1.2e-3 |
+
+The hand attention keeps S in the HMX tile layout from its S call through the softmax to P V, so it never converts S to
+row-major or packs P (its S and P V calls take under 0.02 ms each per head). That is most of the remaining 0.3 ms per head.
