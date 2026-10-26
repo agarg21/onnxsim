@@ -10,7 +10,10 @@ is emitted from or fed with.
 * ``LLM_PF_OUT``: the output directory of the pipeline (default
   ``llm_pulsar_free_out/<MODEL>`` under the current directory);
 * ``GPTQ=1``: linear programs are emitted from ``<out>/gptq/*.npz``
-  (``pf_gptq.py``) instead of round-to-nearest.
+  (``pf_gptq.py``) instead of round-to-nearest;
+* ``LLM_PF_FUSE``: the program layout, ``0`` one program per step
+  (``pf_layout.LAYER``) or ``1`` merged (``pf_layout.LAYER_FUSED``); default
+  the model's ``fuse``.
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -65,6 +68,7 @@ MODELS = {
         zero_pos0=False,
         share_linears=True,
         split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
+        fuse=1,
     ),
 }
 #: share a linear between the sets when the first set's ranges are within this factor
@@ -97,6 +101,7 @@ class Config:
         gptq: bool = False,
         tokenizer_dir: str | None = None,
         seq: int = lay.S,
+        fuse: int = 0,
     ):
         self.model, self.name, self.out = model, name, out
         self.L, self.H, self.hd = model.L, model.H, model.hd
@@ -116,7 +121,10 @@ class Config:
         self.ln_f = model.weight("model.norm.weight").astype(F32).reshape(1, self.H)
         self.QKV = lay.qkv_parts(self.nh, self.hd, self.kvd, self.qk_norm)
         self.GU = lay.gu_parts(self.I)
-        self.layer_programs = lay.layer_programs(self.qk_norm)
+        self.fuse = int(fuse)
+        self.layer_programs = lay.layer_programs(self.qk_norm, self.fuse)
+        self.post_programs = lay.post_programs(self.fuse)
+        self.k_program = lay.k_program(self.qk_norm, self.fuse)
         self._lg: dict = {}
         self._post = ReferenceEvaluator(
             ld.make_graph(
@@ -297,6 +305,8 @@ def load(name: str | None = None, out: str | None = None) -> Config:
         out or os.environ.get("LLM_PF_OUT") or os.path.join("llm_pulsar_free_out", name)
     )
     os.makedirs(out, exist_ok=True)
+    if os.environ.get("LLM_PF_FUSE"):
+        spec["fuse"] = int(os.environ["LLM_PF_FUSE"])
     return Config(
         ref.Model.load(snap),
         name=name,

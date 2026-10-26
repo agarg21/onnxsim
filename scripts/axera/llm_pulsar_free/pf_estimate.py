@@ -93,8 +93,51 @@ class Chain:
                 else:
                     self.f[(wh, k)] = _exact_add if ex else AddEval(e["calibration"])
 
+    def layer_fused(self, li, x, K, V, p):
+        """A layer of the merged layout. ``x``: the embedding row (layer 0) or
+        the previous layer's ``(x1, down)``, whose Add the layer's ``n1`` holds;
+        returns this layer's ``(x1, down)``."""
+        cfg = self.cfg
+        nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
+
+        def f(k):
+            return self.f[(f"L{li}", k)]
+
+        t = cfg.rope_tiles(p, li)
+        g1, g2 = cfg.gains(li)
+        if isinstance(x, tuple):
+            x, a = f("n1")(a=x[0], b=x[1], g=g1)
+        else:
+            a = f("n1")(x=x, g=g1)
+        y5 = f("qkv5")(a)
+        o = lay.offsets(cfg.QKV)
+
+        def sl(k, n):
+            return y5[:, o[k] : o[k] + n]
+
+        qr, kr = f("qk")(
+            q=sl("q_proj", nh * hd),
+            qr=sl("q_rot", nh * hd),
+            k=sl("k_proj", kvd),
+            kr=sl("k_rot", kvd),
+            cq=t["cos_q"],
+            sq=t["sin_q"],
+            ck=t["cos_k"],
+            sk=t["sin_k"],
+        )
+        K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
+        att = f("attn")(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
+        x1, m = f("n2")(a=x, b=f("o_proj")(att), g=g2)
+        gu = f("gu")(m)
+        og = lay.offsets(cfg.GU)
+        gate = gu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
+        up = gu[:, og["up_proj"] : og["up_proj"] + cfg.I]
+        return x1, f("down_proj")(f("silu_f")(gate=gate, up=up))
+
     def layer(self, li, x, K, V, p):
         cfg = self.cfg
+        if cfg.fuse:
+            return self.layer_fused(li, x, K, V, p)
         nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
 
         def f(k):
@@ -133,6 +176,9 @@ class Chain:
         return f("res2")(x1, f("down_proj")(act))
 
     def post(self, x):
+        if self.cfg.fuse:
+            _, xn = self.f[("post", "nf")](a=x[0], b=x[1], g=self.cfg.ln_f)
+            return self.f[("post", "lm_head")](xn).reshape(-1)
         u = self.f[("post", "nf_c")](x=x)
         xn = self.f[("post", "nf_rms")](x=u, g=self.cfg.ln_f)
         return self.f[("post", "lm_head")](xn).reshape(-1)

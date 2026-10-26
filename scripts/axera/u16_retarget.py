@@ -66,7 +66,6 @@ all but one of those builds (a ReduceMean output scale two ulps off).
 from __future__ import annotations
 
 import io
-import itertools
 import json
 import os
 import struct
@@ -459,8 +458,45 @@ def _core_jobs(template) -> int:
 #: offset) all sit at or above this; below it are source / destination address
 #: writes, which a candidate value can coincide with
 MIN_CALIB_REG = 0x0F00
-#: brute-force bound of the CORE job -> node assignment (8! permutations)
-MAX_ASSIGN = 8
+
+
+def _max_assignment(score: np.ndarray) -> list[int]:
+    """Column of each row in the one-to-one assignment of a square ``score``
+    matrix with the largest total (Hungarian method, O(n^3))."""
+    n = len(score)
+    cost = score.max() - np.asarray(score, np.float64)
+    u, v = np.zeros(n + 1), np.zeros(n + 1)
+    p, way = np.zeros(n + 1, int), np.zeros(n + 1, int)  # p[col] = row (1-based)
+    for i in range(1, n + 1):
+        p[0], j0 = i, 0
+        minv, used = np.full(n + 1, np.inf), np.zeros(n + 1, bool)
+        while True:
+            used[j0] = True
+            i0, delta, j1 = p[j0], np.inf, 0
+            for j in range(1, n + 1):
+                if not used[j]:
+                    cur = cost[i0 - 1, j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j], way[j] = cur, j0
+                    if minv[j] < delta:
+                        delta, j1 = minv[j], j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+    col = [0] * n
+    for j in range(1, n + 1):
+        col[p[j] - 1] = j - 1
+    return col
 
 
 def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
@@ -468,10 +504,8 @@ def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
     the jobs topologically, not in ONNX node order (a fused q / k norm + RoPE
     runs ``x * x`` first), so each job is given the node whose template
     formulas explain most of its calibration records (best one-to-one
-    assignment; ONNX order among equals)."""
+    assignment, ``_max_assignment``; ONNX order among equals)."""
     cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
-    if len(comp) > MAX_ASSIGN:
-        return {j: f"n{i}" for j, i in enumerate(comp)}
     by_node: dict[str, set[int]] = {}
     for k, v in ct.items():
         node, base = k.split("|", 1)
@@ -486,36 +520,42 @@ def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
         ]
         for c, i in enumerate(comp):
             score[j, c] = sum(v in by_node.get(f"n{i}", ()) for v in vals)
-    best = max(
-        itertools.permutations(range(len(comp))),
-        key=lambda pm: sum(score[j, pm[j]] for j in range(len(cores))),
-    )
+    # ties: the job and node closest in order (a fraction of one matching record)
+    n = len(comp)
+    order = np.abs(np.arange(n)[:, None] - np.arange(n)[None, :]) / (4.0 * n * n)
+    best = _max_assignment(score - order)
     return {j: f"n{comp[best[j]]}" for j in range(len(cores))}
 
 
 def _check_add_shift_writes(main, nodes, assign, cn) -> None:
-    """Refuse a template that elided an Add-shift write the target needs. Two
-    Adds at one shift share one ``0x1ea0`` write; a target whose Adds shift
-    differently needs both, and the elided one cannot be restored (the second
-    Add would run at the first one's shift)."""
-    cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
-    adds = sorted(j for j, n in assign.items() if nodes[int(n[1:])][0] == "Add")
-    need, cur = 0, None
-    for j in adds:
-        v = cn[f"{assign[j]}|add_shift@{ADD_SHIFT:#06x}"]
-        need, cur = need + (v != cur), v
-    have = sum(
-        1
-        for j in adds
-        for r in range(*cores[j])
-        if main[r][0] == gs.A1 and gs._reg(main[r]) == ADD_SHIFT
-    )
-    if need > have:
-        raise ValueError(
-            f"the template writes {ADD_SHIFT:#06x} {have} times, the target needs "
-            f"{need}: an elided Add-shift write; use a template whose Adds shift "
-            "differently"
-        )
+    """Refuse a template that elided an Add-shift write the target needs.
+    Pulsar2 writes ``0x1ea0`` in an Add's CORE job only when the register
+    does not already hold that Add's shift (PARAM jobs reset it to 0, other
+    jobs may write it too). Walking the main segment with the target's
+    shifts, an Add whose shift differs from the register's value needs a
+    write in its own job; when the template left it out, it cannot be
+    restored (the Add would run at the previous shift)."""
+    state, core = None, 0
+    for role, a, b, _ in le._jobs(main):
+        writes = [
+            gs._val(main[r])
+            for r in range(a, b)
+            if main[r][0] == gs.A1 and gs._reg(main[r]) == ADD_SHIFT
+        ]
+        node = None
+        if role == "CORE":
+            node, core = assign.get(core), core + 1
+        if node is not None and nodes[int(node[1:])][0] == "Add":
+            want = cn[f"{node}|add_shift@{ADD_SHIFT:#06x}"]
+            if want != state and not writes:
+                raise ValueError(
+                    f"the target's {node} Add needs {ADD_SHIFT:#06x} = {want} (the "
+                    f"register holds {state}) but the template elided that write; "
+                    "use a template whose Adds shift differently"
+                )
+            state = want
+        elif writes:
+            state = writes[-1]
 
 
 def retarget_graph(
@@ -537,8 +577,8 @@ def retarget_graph(
     Transpose quantizes its own output; a whole-layer attention with
     Reshapes), any node's formulas may sit in any CORE job and a QUANT job may
     hold any tensor's ``1 / s`` and zero point; a record matching two formulas
-    with different targets is still refused. The DEQUANT job holds the
-    output's ``s`` and zero point; PARAM jobs and the other segments any
+    with different targets is still refused. A DEQUANT job holds an
+    output's ``s`` and zero point (any graph output unless ``out`` names one); PARAM jobs and the other segments any
     node's. Records below ``MIN_CALIB_REG`` are never rewritten.
     Data-movement nodes (``PASS_THROUGH``) contribute per-tensor formulas
     only."""
@@ -546,7 +586,7 @@ def retarget_graph(
     nodes = graph_nodes(m)
     consts = {i.name for i in m.graph.initializer}
     graph_ins = [i.name for i in m.graph.input if i.name not in consts]
-    out = out or m.graph.output[0].name
+    outs = {out} if out else {o.name for o in m.graph.output}
     template_q, target_q = propagate(m, template_q), propagate(m, target_q)
     ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
     main = _segs(gs.load_model(template))[gs.MAIN]
@@ -569,7 +609,7 @@ def retarget_graph(
                 }
             return base.split(":", 1)[0] in ("inv", "zp")
         if tag == "DEQUANT":
-            return base in (f"s:{out}", f"zp:{out}")
+            return base in {f"{p}:{o}" for o in outs for p in ("s", "zp")}
         if tag.startswith("CORE") and strict:
             return node == assign[int(tag[4:])]
         return True

@@ -69,7 +69,7 @@ class Plan:
         loaded = {}
         for st in ("first", "rest"):
             for wh in [f"L{li}" for li in range(cfg.L)] + ["post"]:
-                for k in lay.POST if wh == "post" else cfg.layer_programs:
+                for k in cfg.post_programs if wh == "post" else cfg.layer_programs:
                     e = self.man[st][wh][k]
                     src = e.get(
                         "shared", st
@@ -85,6 +85,11 @@ class Plan:
                                 loaded[path] = ax.load(open(path, "rb").read())
                         self.M[(st, wh, pk)] = loaded[path]
         self.n_programs = len(loaded)
+        self.n_runs = sum(
+            len(_parts(self.man["rest"][wh][k], k))
+            for wh in [f"L{li}" for li in range(cfg.L)] + ["post"]
+            for k in (cfg.post_programs if wh == "post" else cfg.layer_programs)
+        )
         self.out_bufs = {}
         B = self.buf
         H, S, kvd = cfg.H, cfg.S, cfg.kvd
@@ -139,17 +144,28 @@ class Plan:
         else:
             self.lines.append(f"B {cmd}")
 
-    def _out(self, st, wh, key, prog):
-        # one output buffer per (layer, program) for both sets: a shared program binds identically
-        if (wh, key) not in self.out_bufs:
-            self.out_bufs[(wh, key)] = self.buf(
-                self.M[(st, wh, prog)].outputs[0].nbytes
-            )
-        self.bind(st, wh, prog, "O", 0, self.out_bufs[(wh, key)])
-        return self.out_bufs[(wh, key)]
+    def _out(self, st, wh, key, prog, idx=0):
+        # one output buffer per (layer, program, output) for both sets: a shared
+        # program binds identically
+        o = self.M[(st, wh, prog)].outputs[idx]
+        if (wh, key, o.name) not in self.out_bufs:
+            self.out_bufs[(wh, key, o.name)] = self.buf(o.nbytes)
+        self.bind(st, wh, prog, "O", idx, self.out_bufs[(wh, key, o.name)])
+        return self.out_bufs[(wh, key, o.name)]
+
+    def outputs(self, st, wh, key, skip=()):
+        """Bind every output of a program but ``skip`` (output names);
+        ``{name: buffer}``."""
+        m = self.M[(st, wh, key)]
+        return {
+            o.name: self._out(st, wh, key, key, i)
+            for i, o in enumerate(m.outputs)
+            if o.name not in skip
+        }
 
     def chain(self, st, wh, key, **ins):
-        """Bind a program's inputs (buffer or (buffer, byte offset)) and its output."""
+        """Bind a program's inputs (buffer or (buffer, byte offset)) and its
+        output (a merged program with several outputs: ``outputs``)."""
         if self.man[st][wh].get(key, {}).get("kind") == "split":
             # hi and lo linears on the same input, then their Add
             hi = self.chain(st, wh, f"{key}_hi", **ins)
@@ -184,8 +200,64 @@ class Plan:
             raise RuntimeError(f"PLAN {tag}: {r}")
         return [int(v) for v in r.split()[1:]]
 
+    def bind_set_fused(self, st):
+        """``bind_set`` of the merged layout (``pf_layout.LAYER_FUSED``)."""
+        cfg = self.cfg
+        oq, og = lay.offsets(cfg.QKV), lay.offsets(cfg.GU)
+        io = {}
+        xp = dn = None
+        for li in range(cfg.L):
+            wh = f"L{li}"
+            b1, b2 = self.gain[li]
+            if li == 0:
+                self.bind(st, wh, "n1", "I", "x", self.x0)
+                self.bind(st, wh, "n1", "I", "g", b1)
+                x, a = self.x0, self.outputs(st, wh, "n1")["y"]
+            else:
+                for n, v in dict(a=xp, b=dn, g=b1).items():
+                    self.bind(st, wh, "n1", "I", n, v)
+                o = self.outputs(st, wh, "n1")
+                x, a = o["x"], o["y"]
+            y5 = self.chain(st, wh, "qkv5", x=a)
+
+            def o5(k, y5=y5):
+                return (y5, oq[k] * 4)
+
+            cq, sq, ck, sk = self.tables(li)
+            ins = dict(q=o5("q_proj"), qr=o5("q_rot"), k=o5("k_proj"), kr=o5("k_rot"))
+            ins |= dict(cq=cq, sq=sq, ck=ck, sk=sk)
+            for n, v in ins.items():
+                self.bind(st, wh, "qk", "I", n, *(v if isinstance(v, tuple) else (v,)))
+            qr = self.outputs(st, wh, "qk", skip=("yk",))["yq"]  # yk: K row p, per step
+            att = self.chain(
+                st, wh, "attn", q=qr, k=self.K[li], v=self.V[li], mask=self.mask
+            )
+            op = self.chain(st, wh, "o_proj", x=att)
+            for n, v in dict(a=x, b=op, g=b2).items():
+                self.bind(st, wh, "n2", "I", n, v)
+            o = self.outputs(st, wh, "n2")
+            x1, m = o["x"], o["y"]
+            gu = self.chain(st, wh, "gu", x=m)
+            act = self.chain(
+                st,
+                wh,
+                "silu_f",
+                gate=(gu, og["gate_proj"] * 4),
+                up=(gu, og["up_proj"] * 4),
+            )
+            dn = self.chain(st, wh, "down_proj", x=act)
+            xp = x1
+            io[li] = dict(y5=y5)
+        for n, v in dict(a=xp, b=dn, g=self.gf).items():
+            self.bind(st, "post", "nf", "I", n, v)
+        xn = self.outputs(st, "post", "nf")["y"]
+        io["logits"] = self.chain(st, "post", "lm_head", x=xn)
+        return io
+
     def bind_set(self, st):
         cfg = self.cfg
+        if cfg.fuse:
+            return self.bind_set_fused(st)
         oq, og = lay.offsets(cfg.QKV), lay.offsets(cfg.GU)
         io, x = {}, self.x0
         for li in range(cfg.L):
@@ -249,21 +321,21 @@ class Plan:
                 self.lines.append(f"X {self.M[(st, wh, pk)].id}")
 
         ov = lay.offsets(cfg.QKV)["v_proj"]
-        before_rk = cfg.layer_programs[: cfg.layer_programs.index("rk")]
-        after_rk = cfg.layer_programs[cfg.layer_programs.index("rk") + 1 :]
+        kp, kout = cfg.k_program
+        progs = cfg.layer_programs
+        before_k, after_k = progs[: progs.index(kp)], progs[progs.index(kp) + 1 :]
         for li in range(cfg.L):
             wh = f"L{li}"
-            for k in before_rk:
+            for k in before_k:
                 X(wh, k)
-            self.bind(
-                st, wh, "rk", "O", 0, self.K[li], p * kvd * 4, now=False
-            )  # K row p
-            X(wh, "rk")
+            # the K program's output: K row p
+            self.bind(st, wh, kp, "O", kout, self.K[li], p * kvd * 4, now=False)
+            X(wh, kp)
             y5 = self.io[st][li]["y5"]
             self.lines.append(f"C {self.V[li]} {p * kvd * 4} {y5} {ov * 4} {kvd * 4}")
-            for k in after_rk:
+            for k in after_k:
                 X(wh, k)
-        for k in lay.POST:
+        for k in cfg.post_programs:
             X("post", k)
         nb = self.M[(st, "post", "lm_head")].outputs[0].nbytes
         self.lines.append(f"R {self.io[st]['logits']} 0 {nb} {self.g}/t/logits.bin")
@@ -290,6 +362,10 @@ def write_float_set(cfg: pf_model.Config, root: str) -> None:
     qd, kvd = cfg.nh * cfg.hd, cfg.kvd
     rope = "qkrope" if cfg.qk_norm else "rope"
     fused = {
+        "n1": f"anorm{cfg.H}",
+        "n2": f"anorm{cfg.H}",
+        "nf": f"anorm{cfg.H}",
+        "qk": f"qkf{qd}",
         "n1_c": f"crms{cfg.H}",
         "n2_c": f"crms{cfg.H}",
         "nf_c": f"crms{cfg.H}",
@@ -317,12 +393,14 @@ def write_float_set(cfg: pf_model.Config, root: str) -> None:
             D = os.path.join(root, st, wh)
             os.makedirs(D, exist_ok=True)
             ml = {}
-            for k in lay.POST if wh == "post" else cfg.layer_programs:
-                if st == "first" and cfg.first_pos == 0 and k in ("rq", "rk", "kc"):
+            for k in cfg.post_programs if wh == "post" else cfg.layer_programs:
+                shared = ("rq", "rk", "kc", "qk")
+                if st == "first" and cfg.first_pos == 0 and k in shared:
                     ml[k] = dict(man_rest[wh][k], shared="rest")
                 elif k in fused:
                     path = os.path.join(D, f"{k}.axmodel")
-                    onnx.save(tpl.float_graph(fused[k], d), path)
+                    name = f"nrm{cfg.H}" if (k, wh) == ("n1", "L0") else fused[k]
+                    onnx.save(tpl.float_graph(name, d), path)
                     ml[k] = dict(
                         kind="fused", model=os.path.relpath(path, root), signed=[]
                     )
@@ -402,10 +480,18 @@ def main():
     t0 = time.time()
     pl = Plan(ax, cfg, a.fake, root)
     t_setup = time.time() - t0
-    print(f"{pl.n_programs} programs loaded, setup {t_setup:.1f}s", flush=True)
+    print(
+        f"{pl.n_programs} programs loaded, {pl.n_runs} per token, setup {t_setup:.1f}s",
+        flush=True,
+    )
     rows = decode(pl, cfg, ids)
     res = dict(
-        model=cfg.name, fake=a.fake, doc=lay.EVAL_DOCS[a.doc], programs=pl.n_programs
+        model=cfg.name,
+        fake=a.fake,
+        doc=lay.EVAL_DOCS[a.doc],
+        programs=pl.n_programs,
+        runs_per_token=pl.n_runs,
+        fuse=cfg.fuse,
     )
     if sess is not None:
         res["health_after"] = A.health_check(sess)

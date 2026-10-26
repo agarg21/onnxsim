@@ -44,12 +44,47 @@ LAYER = [
 POST = ["nf_c", "nf_rms", "lm_head"]
 LINEARS = ("qkv5", "o_proj", "gu", "down_proj", "lm_head")
 
+#: the merged layout (``fuse=1``): every execute costs ~0.27 ms on the card
+#: whatever it computes, so adjacent elementwise programs run as one.
+#: ``n1``: the previous layer's residual Add (``res2``) + the two-pass norm
+#: (layer 0: the norm alone); ``qk``: q's RoPE, k's coarse norm and k's RoPE
+#: (``rq`` + ``kc`` + ``rk``; without a per-head q / k norm ``rq`` and ``rk``
+#: stay); ``n2``: ``res1`` + the second norm; post ``nf``: the last ``res2`` +
+#: the final norm.
+LAYER_FUSED = [
+    "n1",
+    "qkv5",
+    "qk",
+    "attn",
+    "o_proj",
+    "n2",
+    "gu",
+    "silu_f",
+    "down_proj",
+]
+POST_FUSED = ["nf", "lm_head"]
 
-def layer_programs(qk_norm: bool) -> list[str]:
+
+def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
+    if fuse:
+        progs = list(LAYER_FUSED)
+        if not qk_norm:
+            i = progs.index("qk")
+            progs[i : i + 1] = ["rq", "rk"]
+        return progs
     progs = list(LAYER)
     if qk_norm:
         progs.insert(progs.index("rk"), "kc")
     return progs
+
+
+def post_programs(fuse: int = 0) -> list[str]:
+    return list(POST_FUSED if fuse else POST)
+
+
+def k_program(qk_norm: bool, fuse: int = 0) -> tuple[str, str]:
+    """``(program, output)`` that writes the step's K row."""
+    return ("qk", "yk") if fuse and qk_norm else ("rk", "y")
 
 
 def mask_ref(p: int, s: int = S) -> np.ndarray:
@@ -163,7 +198,7 @@ class FakeAX:
     """``BUF`` / ``BIND`` / ``PLAN`` and ``load`` of ``axcl_session.AXSession``
     over numpy float32 buffers. ``load(path, fn)`` takes a program's IO from
     its ONNX graph (initializers are not inputs) and runs ``fn(feeds)`` (input
-    name -> array) for its ``X`` line. Plan lines: ``B mid I|O idx buf off``,
+    name -> array; a tuple for several outputs, in graph order) for its ``X`` line. Plan lines: ``B mid I|O idx buf off``,
     ``X mid``, ``C dst doff src soff nbytes``, ``W buf off nbytes file``,
     ``R buf off nbytes file``."""
 
@@ -227,9 +262,13 @@ class FakeAX:
                         f"model {m.id} input {spec.name}: buffer too short"
                     )
                 feeds[spec.name] = a.reshape(spec.shape).copy()
-            y = np.asarray(self.fns[m.id](feeds), F32).ravel()
-            b, off = m.bind[("O", 0)]
-            self.bufs[b][off // 4 : off // 4 + y.size] = y
+            ys = self.fns[m.id](feeds)
+            if not isinstance(ys, (tuple, list)):
+                ys = (ys,)
+            for i, y in enumerate(ys):
+                y = np.asarray(y, F32).ravel()
+                b, off = m.bind[("O", i)]
+                self.bufs[b][off // 4 : off // 4 + y.size] = y
         elif c == "C":
             db, doff, sb, soff, n = map(int, args.split())
             self.bufs[db][doff // 4 : (doff + n) // 4] = self.bufs[sb][
