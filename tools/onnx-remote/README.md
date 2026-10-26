@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `642580645` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `a1c7fda44` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1070,3 +1070,25 @@ spills a 97 KB frame, which overran the 96 KB pool-thread stacks and faulted the
 `HMX_ATTN=3` takes the decoder from 199 to 174 ms. The default path has no such copy and is unchanged.
 
 The same phone ran ~4% slower on the second day for identical programs, so compare runs from one session only.
+
+**Threading the kernels the pool skipped.** A small phone-side test loop found two kinds of kernel running on one thread: a
+one-op ONNX model run through onnx-remote, like the full models, and then compiled locally to read the kernel.
+- *No axis divides by the pool size.* BEVFormer's LayerNorm second stage reduces 2500 rows, and after a 4-row upcast 625 = 5^4
+  are left, which no thread count from 2 to 4 divides. The pool already strides a kernel's slices over its threads, so such a
+  kernel now takes more slices than threads when they spread evenly (25 slices over 4 threads, 89%): 0.7 -> 0.2 ms per call.
+- *Few elements, each expensive.* The threading threshold counted elements as if each were cheap. It is now weighted by the
+  kernel's arithmetic, with transcendentals and reciprocals counted 20 times. The decoder's inverse sigmoid of its reference
+  points (2700 values, an exp, two reciprocals and a log polynomial each, scalar) took 1.2 ms on one thread.
+
+Both apply to v68+ programs only. Also in this round: a pure splat of a loaded lane no longer goes through the lane gather (a
+regression from the lane-gather commit that the unit tests caught). A butterfly transpose network for the columns of a 32 x 32
+block of vectors is in place too: 1.0 M -> 67 K cycles for a 2560 x 32 row sum on hexagon-sim. BEVFormer's row sums have 2500
+or 900 rows, though, so it isn't used in these models yet.
+
+| model | before | threading (`HMX_VTCM_KB=3072`) | vs onnxruntime on the plain export |
+|---|---:|---:|---|
+| decoder | 63.5 ms | 59.3 ms | max rel 1.15e-3 |
+| encoder, 1 layer | 35.8 ms | 32.5 ms | max rel 3.2e-4 |
+| encoder, 3 layers | 105.8 ms | 95.4 ms | max rel 1.2e-3 |
+
+The "before" column is the same day's run of the previous fork commit.
