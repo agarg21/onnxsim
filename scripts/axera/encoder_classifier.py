@@ -35,9 +35,7 @@ import io
 import json
 import os
 import random
-import shutil
 import sys
-import time
 import warnings
 
 import numpy as np
@@ -295,63 +293,21 @@ def _ort(model_path, feeds):
     return [s.run(None, f)[0][0] for f in feeds]
 
 
-def build(work, tag, onnx_path, names, calib, precision, op_types, method="MinMax"):
-    import pulsar2_docker as pd
+def build(work, tag, onnx_path, calib, precision, method="MinMax"):
+    """`pulsar2 build` at `precision` ("U8", "U16", or a `layer_configs`
+    list), cached by `mixed_precision.pulsar2_build`."""
+    import mixed_precision as mp
+    import onnx
 
-    root = os.path.join(work, tag)
-    os.makedirs(os.path.join(root, "dataset"), exist_ok=True)
-    os.makedirs(os.path.join(root, "config"), exist_ok=True)
-    shutil.copy(onnx_path, os.path.join(root, "model.onnx"))
-    inputs = []
-    for n in names:
-        pd.make_numpy_calibration_tar(
-            os.path.join(root, f"dataset/{n}.tar"), [c[n] for c in calib]
-        )
-        inputs.append(
-            {
-                "tensor_name": n,
-                "calibration_dataset": f"./dataset/{n}.tar",
-                "calibration_format": "Numpy",
-                "calibration_size": len(calib),
-            }
-        )
-    quant = {
-        "input_configs": inputs,
-        "calibration_method": method,
-        "precision_analysis": False,
-    }
     if isinstance(precision, list):  # explicit layer_configs (a mixed build)
-        quant["layer_configs"] = precision
-    elif precision != "U8":
-        quant["layer_configs"] = [
-            {"op_types": sorted(op_types), "data_type": precision}
-        ]
-    cfg = {
-        "model_type": "ONNX",
-        "npu_mode": "NPU1",
-        "quant": quant,
-        "compiler": {"check": 0},
-    }
-    with open(os.path.join(root, "config/c.json"), "w") as f:
-        json.dump(cfg, f, indent=1)
-    t0 = time.time()
-    r = pd.build(
-        root,
-        "model.onnx",
-        "out",
-        config_path="config/c.json",
-        image=IMAGE,
-        timeout=3600,
-    )
-    return r, time.time() - t0
-
-
-def _count_16bit(build_dir):
-    """Activation tensors the build quantised at 16 bits."""
-    with open(os.path.join(build_dir, "quant", "quant_axmodel.json")) as fh:
-        tc = json.load(fh)["tensor_configs"]
-    return len(
-        {t for cfg in tc.values() for t, c in cfg.items() if c.get("bit_width") == 16}
+        cfg = precision
+    elif precision == "U8":
+        cfg = None
+    else:
+        cfg = mp.u16_layer_configs(onnx.load(onnx_path, load_external_data=False))
+        cfg[0]["data_type"] = precision
+    return mp.pulsar2_build(
+        os.path.join(work, tag), onnx_path, calib, cfg, method=method, image=IMAGE
     )
 
 
@@ -388,7 +344,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("models", nargs="+")
     ap.add_argument("--seq", type=int, default=128)
-    ap.add_argument("--precision", nargs="*", default=["U8"])
+    ap.add_argument(
+        "--precision",
+        nargs="*",
+        default=["U8"],
+        help='U8, U16, and/or "auto" (mixed_precision.auto: build U8 + U16, '
+        "search a mix on dev_pairs(), check it on the card against the budget)",
+    )
+    ap.add_argument("--slack-db", type=float, default=1.0, help="auto: dB below U16")
+    ap.add_argument("--max-err", type=float, help="auto: relative-error budget instead")
+    ap.add_argument("--max-latency-ms", type=float, help="auto: latency budget")
     ap.add_argument(
         "--mix",
         nargs="*",
@@ -413,8 +378,8 @@ def main(argv=None):
     ap.add_argument("--runs", type=int, default=20, help="timed runs per model")
     a = ap.parse_args(argv)
 
+    import mixed_precision as mp
     import onnx
-
     import pulsar2_backend
 
     results, evals = [], {}
@@ -451,27 +416,46 @@ def main(argv=None):
             with open(path) as fh:
                 cfg = json.load(fh)
             mixes[label] = cfg["layer_configs"] if isinstance(cfg, dict) else cfg
-        for prec in [*a.precision, *mixes]:
-            r, secs = build(
+        for prec in [p for p in [*a.precision, *mixes] if p != "auto"]:
+            r = build(
                 a.work,
                 f"{tag}_{prec}",
                 sp,
-                names,
                 calib,
                 mixes.get(prec, prec),
-                set(ops),
                 a.calib_method,
             )
             b = {
-                "success": r.success,
-                "build_s": round(secs, 1),
-                "axmodel": r.axmodel_path,
+                "success": r.build_dir is not None,
+                "build_s": round(r.seconds, 1),
+                "cached": r.cached,
+                "axmodel": r.axmodel,
             }
-            if not r.success:
-                b["error"] = (r.error or r.stdout_tail)[-1500:]
+            if r.build_dir is None:
+                b["error"] = r.error
             else:
-                b["tensors_16bit"] = _count_16bit(os.path.dirname(r.axmodel_path))
+                b["tensors_16bit"] = mp.count_16bit(r.build_dir)
             rec["builds"][prec] = b
+        if "auto" in a.precision:
+            dev = _tokenize(tok, dev_pairs(pairs), a.seq, names)
+            rep = mp.auto(
+                sp,
+                calib,
+                dev,
+                os.path.join(a.work, tag + "_auto"),
+                slack_db=a.slack_db,
+                max_err=a.max_err,
+                max_latency_ms=a.max_latency_ms,
+            )
+            rec["auto"] = rep
+            if rep["chosen"]:
+                c = next(c for c in rep["candidates"] if c["label"] == rep["chosen"])
+                rec["builds"]["auto:" + rep["chosen"]] = {
+                    "success": True,
+                    "build_s": c["build_s"],
+                    "axmodel": c["axmodel"],
+                    "tensors_16bit": c["tensors_16bit"],
+                }
         results.append(rec)
         evals[mid] = feeds, ref
         print(json.dumps(rec, indent=1, default=str), flush=True)

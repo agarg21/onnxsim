@@ -53,7 +53,9 @@ Feeds = Dict[str, np.ndarray]
 
 #: data-movement ops: they carry codes and are never worth promoting alone.
 _MOVEMENT = ("AxReshape", "AxTranspose", "AxSlice", "AxTile", "AxPad", "AxConcat")
-_LAYER = re.compile(r"(?:^|/)((?:layer|layers|block|blocks|h)[._]\d+)(?:/|$)")
+_LAYER = re.compile(
+    r"/([A-Za-z_]+[._]\d+)(?:/|$)"
+)  # ".../layer.3/...", ".../features.12/..."
 
 
 @dataclass
@@ -194,13 +196,19 @@ class Replayer:
         self.metric = metric or snr_db
         self.ref = self._run(model)
 
-    def _run(self, model):
+    def _session(self, model):
         o = self.ort.SessionOptions()
         o.graph_optimization_level = self.ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        s = self.ort.InferenceSession(
+        return self.ort.InferenceSession(
             model.SerializeToString(), o, providers=["CPUExecutionProvider"]
         )
+
+    def _run(self, model):
+        s = self._session(model)
         return [s.run(None, f)[0] for f in self.feeds]
+
+    def _run_one(self, model, feed):
+        return self._session(model).run(None, feed)[0]
 
     def outputs(self, scales: dict):
         from replay import insert_qdq
@@ -327,7 +335,463 @@ def layer_configs(selected: Sequence[Op], data_type: str = "U16") -> List[dict]:
     return [{"layer_names": names, "data_type": data_type}] if names else []
 
 
+# ---------------------------------------------------------------------------
+# End to end: build, search, build the mix, check it on the card, fall back
+# ---------------------------------------------------------------------------
+
+#: Pulsar2 image the automatic flow builds with.
+IMAGE = "pulsar2:7.0-lite"
+
+
+def _digest(*parts) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p if isinstance(p, bytes) else json.dumps(p, sort_keys=True).encode())
+    return h.hexdigest()[:16]
+
+
+def pulsar2_config(
+    input_names: Sequence[str],
+    n_calib: int,
+    layer_configs_: Optional[List[dict]] = None,
+    method: str = "MinMax",
+) -> dict:
+    """A `pulsar2 build` config for raw (Numpy) inputs: one calibration tar
+    per input at `./dataset/<name>.tar`, optional `layer_configs`."""
+    quant = {
+        "input_configs": [
+            {
+                "tensor_name": n,
+                "calibration_dataset": f"./dataset/{n}.tar",
+                "calibration_format": "Numpy",
+                "calibration_size": n_calib,
+            }
+            for n in input_names
+        ],
+        "calibration_method": method,
+        "precision_analysis": False,
+    }
+    if layer_configs_:
+        quant["layer_configs"] = layer_configs_
+    return {
+        "model_type": "ONNX",
+        "npu_mode": "NPU1",
+        "quant": quant,
+        "compiler": {"check": 0},
+    }
+
+
+def u16_layer_configs(model: onnx.ModelProto) -> List[dict]:
+    """Whole-model U16: every op type in the float graph."""
+    return [
+        {"op_types": sorted({n.op_type for n in model.graph.node}), "data_type": "U16"}
+    ]
+
+
+@dataclass
+class BuildOut:
+    build_dir: Optional[str]  # <root>/out, or None when the build failed
+    seconds: float
+    cached: bool
+    error: str = ""
+
+    @property
+    def axmodel(self) -> Optional[str]:
+        return (
+            os.path.join(self.build_dir, "compiled.axmodel") if self.build_dir else None
+        )
+
+
+def pulsar2_build(
+    root: str,
+    onnx_path: str,
+    calib: Sequence[Feeds],
+    layer_configs_: Optional[List[dict]] = None,
+    method: str = "MinMax",
+    image: str = IMAGE,
+    timeout: int = 3600,
+) -> BuildOut:
+    """`pulsar2 build` of `onnx_path` into `<root>/out`, cached: a rerun with
+    the same model bytes, calibration data and config reuses the build (the
+    key is written to `<root>/build_key`)."""
+    import time
+
+    import pulsar2_docker as pd
+
+    names = list(calib[0])
+    cfg = pulsar2_config(names, len(calib), layer_configs_, method)
+    with open(onnx_path, "rb") as fh:
+        model_bytes = fh.read()
+    key = _digest(
+        model_bytes,
+        cfg,
+        image,
+        *[np.ascontiguousarray(c[n]).tobytes() for c in calib for n in names],
+    )
+    out = os.path.join(root, "out")
+    key_file = os.path.join(root, "build_key")
+    if (
+        os.path.exists(os.path.join(out, "compiled.axmodel"))
+        and os.path.exists(key_file)
+        and open(key_file).read() == key
+    ):
+        return BuildOut(out, 0.0, True)
+    os.makedirs(os.path.join(root, "dataset"), exist_ok=True)
+    os.makedirs(os.path.join(root, "config"), exist_ok=True)
+    with open(os.path.join(root, "model.onnx"), "wb") as fh:
+        fh.write(model_bytes)
+    for n in names:
+        pd.make_numpy_calibration_tar(
+            os.path.join(root, "dataset", f"{n}.tar"), [c[n] for c in calib]
+        )
+    with open(os.path.join(root, "config", "c.json"), "w") as fh:
+        json.dump(cfg, fh, indent=1)
+    t0 = time.time()
+    r = pd.build(
+        root,
+        "model.onnx",
+        "out",
+        config_path="config/c.json",
+        image=image,
+        timeout=timeout,
+    )
+    secs = time.time() - t0
+    if not r.success:
+        return BuildOut(None, secs, False, (r.error or r.stdout_tail)[-1500:])
+    with open(key_file, "w") as fh:
+        fh.write(key)
+    return BuildOut(out, secs, False)
+
+
+def count_16bit(build_dir: str) -> int:
+    """Activation tensors a build quantised at 16 bits."""
+    tc = _doc(build_dir)["tensor_configs"]
+    return len(
+        {t for cfg in tc.values() for t, c in cfg.items() if c.get("bit_width") == 16}
+    )
+
+
+def card_run(session, axmodel: str, feeds: Sequence[Feeds], runs: int = 20):
+    """Run `axmodel` on every feed (inputs cast to what the compiled model
+    takes) and time `runs` extra calls. Returns (first outputs, NPU ms/call)."""
+    m = session.load(axmodel)
+    try:
+        order = [i.name for i in m.inputs]
+        outs = [session.run(m, [f[n] for n in order])[0] for f in feeds]
+        us0, n0 = session.exec_us, session.runs
+        for _ in range(runs):
+            session.run(m, [feeds[0][n] for n in order])
+        ms = (session.exec_us - us0) / max(session.runs - n0, 1) / 1000
+    finally:
+        session.unload(m)
+    return outs, ms
+
+
+def _default_session():
+    from axcl_session import AXSession, health_check
+
+    class _Checked:
+        """One AXSession per card visit, health-checked on entry and exit, so
+        the device lock is not held across builds."""
+
+        def __enter__(self):
+            self.s = AXSession().__enter__()
+            health_check(self.s)
+            return self.s
+
+        def __exit__(self, *exc):
+            try:
+                if exc[0] is None:
+                    health_check(self.s)
+            finally:
+                self.s.__exit__(*exc)
+
+    return _Checked()
+
+
+def _err(snr: float) -> float:
+    """Relative error (||got-ref|| / ||ref||) of an SNR in dB."""
+    return float(10 ** (-snr / 20))
+
+
+@dataclass
+class Candidate:
+    label: str
+    groups: List[str]
+    n_ops: int
+    predicted_db: Optional[float]  # replay of the spliced tables
+    card_db: Optional[float] = None
+    latency_ms: Optional[float] = None
+    tensors_16bit: Optional[int] = None
+    build_s: float = 0.0
+    cached: bool = False
+    accepted: bool = False
+    note: str = ""
+    axmodel: Optional[str] = None
+    layer_configs: List[dict] = field(default_factory=list)
+
+
+def auto(
+    model_path: str,
+    calib: Sequence[Feeds],
+    dev: Sequence[Feeds],
+    work: str,
+    slack_db: float = 1.0,
+    max_err: Optional[float] = None,
+    max_latency_ms: Optional[float] = None,
+    by: str = "auto",
+    max_candidates: int = 4,
+    margin_db: float = 3.0,
+    image: str = IMAGE,
+    session_factory: Optional[Callable] = None,
+    builder: Optional[Callable] = None,
+    runs: int = 20,
+    log: Callable = print,
+) -> dict:
+    """Mixed precision end to end, for any ONNX model with raw inputs.
+
+    1. Build U8 and whole-model U16 (cached in `work`), run both on the card
+       on `dev`: SNR of the first output against onnxruntime fp32, latency.
+    2. The accuracy budget: `max_err` (relative error, as an SNR floor) if
+       given, else `slack_db` below the card's U16 SNR. U8 meeting both
+       budgets ends here.
+    3. `search()` over `by` groups on the dev set orders the groups (`by=
+       "auto"`: op types and layers both searched, the one reaching the
+       budget with fewer widened tensors kept); every
+       prefix of that order is a candidate, with a replay-predicted SNR. The
+       first candidate whose prediction comes within `margin_db` of the
+       budget (moved into replay terms by the U16 build's card-vs-replay
+       offset) is built, run on the card, and accepted
+       if the card meets both budgets; otherwise the next prefix is tried (up
+       to `max_candidates`). Past the latency budget, longer prefixes only
+       get slower, so the search stops.
+    4. Nothing accepted: U16 if it meets the latency budget, else no choice.
+
+    Returns the report (also written to `<work>/auto_report.json` and `.md`).
+    `session_factory`/`builder` are injection points for tests.
+    """
+    from replay import load_scales
+
+    builder = builder or (
+        lambda root, layer_cfgs: pulsar2_build(
+            root, model_path, calib, layer_cfgs, image=image
+        )
+    )
+    session_factory = session_factory or _default_session
+    model = onnx.load(model_path)
+    rp = Replayer(model, dev)
+
+    def visit(axmodel):
+        with session_factory() as s:
+            outs, ms = card_run(s, axmodel, dev, runs)
+        return snr_db(rp.ref, outs), ms
+
+    cands: List[Candidate] = []
+
+    def record(c: Candidate, b: BuildOut) -> Candidate:
+        c.build_s, c.cached = round(b.seconds, 1), b.cached
+        if b.build_dir is None:
+            c.note = "build failed: " + b.error[-300:]
+            log(f"[auto] {c.label}: build failed")
+            return c
+        c.axmodel, c.tensors_16bit = b.axmodel, count_16bit(b.build_dir)
+        c.card_db, c.latency_ms = visit(b.axmodel)
+        log(
+            f"[auto] {c.label}: predicted {c.predicted_db if c.predicted_db is None else round(c.predicted_db, 2)} dB, "
+            f"card {c.card_db:.2f} dB, {c.latency_ms:.3f} ms, {c.tensors_16bit} tensors 16-bit"
+            + (" (cached build)" if c.cached else "")
+        )
+        cands.append(c)
+        return c
+
+    u8b = builder(os.path.join(work, "U8"), None)
+    u16b = builder(os.path.join(work, "U16"), u16_layer_configs(model))
+    if u8b.build_dir is None or u16b.build_dir is None:
+        raise RuntimeError(f"U8/U16 build failed: {u8b.error or u16b.error}")
+    lo, hi = load_scales(u8b.build_dir), load_scales(u16b.build_dir)
+    u8 = record(Candidate("U8", [], 0, rp.score(lo)), u8b)
+    u16 = record(Candidate("U16", ["*"], -1, rp.score(hi)), u16b)
+    floor = -20 * np.log10(max_err) if max_err is not None else u16.card_db - slack_db
+
+    def ok(c: Candidate) -> bool:
+        return (
+            c.card_db is not None
+            and c.card_db >= floor
+            and (max_latency_ms is None or c.latency_ms <= max_latency_ms)
+        )
+
+    chosen = None
+    if ok(u8):
+        u8.accepted, chosen = True, u8
+        u8.note = "U8 already meets the budget"
+    else:
+        b = Build(u8b.build_dir)
+        # the card budget in replay terms: shifted by how far the replay of
+        # the U16 build is from the card's U16
+        pred_floor = floor - (u16.card_db - u16.predicted_db)
+
+        def plan(how):
+            groups = group(b, how)
+            order = search(rp, b, lo, hi, groups, target=float("inf"))
+            prefixes = [
+                (order.groups[: k + 1], order.trace[k + 1][1])
+                for k in range(len(order.groups))
+            ]
+            reach = next(
+                (gs for gs, db in prefixes if db >= pred_floor - margin_db), None
+            )
+            cost = (
+                len(b.widened([o for g in reach for o in groups[g]]))
+                if reach
+                else float("inf")
+            )
+            return groups, order, prefixes, cost
+
+        if by == "auto":
+            # whichever grouping's first candidate (the first prefix within
+            # `margin_db` of the budget, as below) widens the fewest tensors:
+            # op types win on transformers (the residual stream), blocks on
+            # CNNs
+            plans = {how: plan(how) for how in ("op_type", "layer")}
+            by = min(plans, key=lambda h: (plans[h][3], h != "op_type"))
+            log(
+                "[auto] grouping: "
+                + ", ".join(
+                    f"{h} reaches it widening {p[3]} tensors" for h, p in plans.items()
+                )
+                + f" -> {by}"
+            )
+            groups, order, prefixes, _ = plans[by]
+        else:
+            groups, order, prefixes, _ = plan(by)
+        # the replay of a mix runs pessimistic (DistilBERT LN+Add: 17.0 dB
+        # replayed, 18.4 dB on the card), so a prefix up to `margin_db` short
+        # of the budget is still worth a build; the card decides
+        start = next(
+            (i for i, (_, db) in enumerate(prefixes) if db >= pred_floor - margin_db),
+            len(prefixes) - 1,
+        )
+        log(
+            f"[auto] search order {order.groups}; budget {floor:.2f} dB on the card "
+            f"({pred_floor:.2f} dB replayed); starting at prefix {start + 1}"
+        )
+        for gs, db in prefixes[start : start + max_candidates]:
+            sel = list({o.name: o for g in gs for o in groups[g]}.values())
+            if len(b.widened(sel)) >= len(b.widened(b.ops)):
+                break  # this prefix is whole-model U16 in all but name
+            label = "mix:" + "+".join(g.replace("AxQuantized", "") for g in gs)
+            cfg = layer_configs(sel)
+            c = Candidate(label, list(gs), len(sel), db, layer_configs=cfg)
+            record(c, builder(os.path.join(work, "mix_" + _digest(cfg)), cfg))
+            if ok(c):
+                c.accepted, chosen = True, c
+                break
+            if (
+                c.latency_ms is not None
+                and max_latency_ms is not None
+                and c.latency_ms > max_latency_ms
+            ):
+                c.note = "over the latency budget; longer prefixes are slower"
+                break
+            c.note = "card missed the budget; next prefix"
+        if chosen is None and ok(u16):
+            u16.accepted, chosen = True, u16
+            u16.note = "fallback: no mix met the budget"
+    report = {
+        "model": model_path,
+        "budget": {
+            "snr_floor_db": round(float(floor), 3),
+            "max_rel_err": _err(floor),
+            "slack_db": slack_db if max_err is None else None,
+            "max_latency_ms": max_latency_ms,
+        },
+        "grouping": by,
+        "chosen": chosen.label if chosen else None,
+        "layer_configs": chosen.layer_configs if chosen else None,
+        "axmodel": chosen.axmodel if chosen else None,
+        "candidates": [
+            {k: v for k, v in vars(c).items() if k not in ("layer_configs",)}
+            | {"card_rel_err": None if c.card_db is None else _err(c.card_db)}
+            for c in cands
+        ],
+    }
+    os.makedirs(work, exist_ok=True)
+    with open(os.path.join(work, "auto_report.json"), "w") as fh:
+        json.dump(report, fh, indent=1)
+    with open(os.path.join(work, "auto_report.md"), "w") as fh:
+        fh.write(report_markdown(report))
+    return report
+
+
+def report_markdown(report: dict) -> str:
+    rows = [
+        "| candidate | ops promoted | 16-bit tensors | predicted dB | card dB | card rel. err | latency | build | result |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for c in report["candidates"]:
+        fmt = lambda v, f: "-" if v is None else f.format(v)  # noqa: E731
+        res = "**chosen**" if c["accepted"] else (c["note"] or "")
+        rows.append(
+            f"| {c['label']} | {'all' if c['n_ops'] < 0 else c['n_ops']} | "
+            f"{fmt(c['tensors_16bit'], '{}')} | {fmt(c['predicted_db'], '{:.2f}')} | "
+            f"{fmt(c['card_db'], '{:.2f}')} | {fmt(c['card_rel_err'], '{:.1%}')} | "
+            f"{fmt(c['latency_ms'], '{:.3f} ms')} | "
+            f"{'cached' if c['cached'] else str(c['build_s']) + ' s'} | {res} |"
+        )
+    b = report["budget"]
+    head = (
+        f"Budget: card SNR >= {b['snr_floor_db']:.2f} dB (rel. err <= {b['max_rel_err']:.1%})"
+        + (f", latency <= {b['max_latency_ms']} ms" if b["max_latency_ms"] else "")
+        + f". Chosen: {report['chosen']}.\n\n"
+    )
+    return head + "\n".join(rows) + "\n"
+
+
+def _load_feeds(path: str) -> List[Feeds]:
+    z = np.load(path)
+    return [{k: z[k][i : i + 1] for k in z.files} for i in range(len(z[z.files[0]]))]
+
+
+def auto_main(argv) -> int:
+    p = argparse.ArgumentParser(
+        prog="mixed_precision.py auto",
+        description="build U8/U16, search, build and check the mix on the card",
+    )
+    p.add_argument("model", help="float ONNX with static input shapes")
+    p.add_argument("--calib", required=True, help=".npz, axis 0 = sample")
+    p.add_argument("--dev", required=True, help=".npz, axis 0 = sample")
+    p.add_argument("--work", required=True, help="build cache + report dir")
+    p.add_argument("--slack-db", type=float, default=1.0)
+    p.add_argument("--max-err", type=float, help="relative-error budget instead")
+    p.add_argument("--max-latency-ms", type=float)
+    p.add_argument("--by", default="auto", choices=["auto", "op_type", "layer"])
+    p.add_argument("--max-candidates", type=int, default=4)
+    p.add_argument("--margin-db", type=float, default=3.0)
+    a = p.parse_args(argv)
+    rep = auto(
+        os.path.abspath(a.model),
+        _load_feeds(a.calib),
+        _load_feeds(a.dev),
+        os.path.abspath(a.work),
+        a.slack_db,
+        a.max_err,
+        a.max_latency_ms,
+        a.by,
+        a.max_candidates,
+        a.margin_db,
+    )
+    print(report_markdown(rep))
+    return 0 if rep["chosen"] else 1
+
+
 def main(argv=None) -> int:
+    import sys
+
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["auto"]:
+        return auto_main(argv[1:])
     from replay import load_scales
 
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
