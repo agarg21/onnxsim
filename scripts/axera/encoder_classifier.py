@@ -34,6 +34,7 @@ import contextlib
 import io
 import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -218,6 +219,23 @@ NLI_PAIRS = [
 ]
 
 
+def dev_pairs(eval_pairs, n=64, seed=0):
+    """Text pairs for choosing a mixed-precision mix: every first/second text
+    of the built-in sets crossed, minus `eval_pairs`, shuffled -- so the
+    choice is never made on the pairs it is then evaluated on."""
+    firsts = {a for a, *_ in CALIB_PAIRS + EVAL_PAIRS} | {a for a, _ in NLI_PAIRS}
+    seconds = {b for _, b, *_ in CALIB_PAIRS + EVAL_PAIRS} | {b for _, b in NLI_PAIRS}
+    held_out = {(a, b) for a, b, *_ in eval_pairs}
+    out = [
+        (a, b)
+        for a in sorted(firsts)
+        for b in sorted(seconds)
+        if (a, b) not in held_out
+    ]
+    random.Random(seed).shuffle(out)
+    return out[:n]
+
+
 def _tokenize(tok, pairs, seq, names):
     enc = tok(
         [a for a, *_ in pairs],
@@ -302,7 +320,9 @@ def build(work, tag, onnx_path, names, calib, precision, op_types, method="MinMa
         "calibration_method": method,
         "precision_analysis": False,
     }
-    if precision != "U8":
+    if isinstance(precision, list):  # explicit layer_configs (a mixed build)
+        quant["layer_configs"] = precision
+    elif precision != "U8":
         quant["layer_configs"] = [
             {"op_types": sorted(op_types), "data_type": precision}
         ]
@@ -324,6 +344,15 @@ def build(work, tag, onnx_path, names, calib, precision, op_types, method="MinMa
         timeout=3600,
     )
     return r, time.time() - t0
+
+
+def _count_16bit(build_dir):
+    """Activation tensors the build quantised at 16 bits."""
+    with open(os.path.join(build_dir, "quant", "quant_axmodel.json")) as fh:
+        tc = json.load(fh)["tensor_configs"]
+    return len(
+        {t for cfg in tc.values() for t, c in cfg.items() if c.get("bit_width") == 16}
+    )
 
 
 def metrics(ref, got, pairs):
@@ -359,7 +388,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("models", nargs="+")
     ap.add_argument("--seq", type=int, default=128)
-    ap.add_argument("--precision", nargs="+", default=["U8"])
+    ap.add_argument("--precision", nargs="*", default=["U8"])
+    ap.add_argument(
+        "--mix",
+        nargs="*",
+        default=[],
+        metavar="NAME=FILE",
+        help="extra builds with these quant.layer_configs (a JSON list, or a "
+        "mixed_precision.py --json output); reported under NAME",
+    )
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument(
         "--calib-method", default="MinMax", help="Pulsar2 calibration_method"
@@ -367,6 +404,11 @@ def main(argv=None):
     ap.add_argument("--nli", action="store_true", help="evaluate on NLI pairs")
     ap.add_argument("--work", required=True)
     ap.add_argument("--json")
+    ap.add_argument(
+        "--dev-npz",
+        help="also write dev_pairs() tokenized as <dir>/<model>.dev.npz, the "
+        "--feeds for mixed_precision.py",
+    )
     ap.add_argument("--no-device", action="store_true")
     ap.add_argument("--runs", type=int, default=20, help="timed runs per model")
     a = ap.parse_args(argv)
@@ -389,6 +431,13 @@ def main(argv=None):
         risks = pulsar2_backend.ax650_build_risks(simp)
         feeds = _tokenize(tok, pairs, a.seq, names)
         calib = _tokenize(tok, CALIB_PAIRS, a.seq, names)
+        if a.dev_npz:
+            dev = _tokenize(tok, dev_pairs(pairs), a.seq, names)
+            os.makedirs(a.dev_npz, exist_ok=True)
+            np.savez(
+                os.path.join(a.dev_npz, tag + ".dev.npz"),
+                **{n: np.concatenate([d[n] for d in dev]) for n in names},
+            )
         ref = _ort(sp, feeds)
         raw_ref = _ort(raw, feeds)
         rec = {
@@ -396,14 +445,20 @@ def main(argv=None):
             "sim_vs_export_max_abs": float(np.abs(np.stack(ref) - np.stack(raw_ref)).max()),
             "builds": {},
         }  # fmt: skip
-        for prec in a.precision:
+        mixes = {}
+        for spec in a.mix:
+            label, path = spec.split("=", 1)
+            with open(path) as fh:
+                cfg = json.load(fh)
+            mixes[label] = cfg["layer_configs"] if isinstance(cfg, dict) else cfg
+        for prec in [*a.precision, *mixes]:
             r, secs = build(
                 a.work,
                 f"{tag}_{prec}",
                 sp,
                 names,
                 calib,
-                prec,
+                mixes.get(prec, prec),
                 set(ops),
                 a.calib_method,
             )
@@ -414,6 +469,8 @@ def main(argv=None):
             }
             if not r.success:
                 b["error"] = (r.error or r.stdout_tail)[-1500:]
+            else:
+                b["tensors_16bit"] = _count_16bit(os.path.dirname(r.axmodel_path))
             rec["builds"][prec] = b
         results.append(rec)
         evals[mid] = feeds, ref

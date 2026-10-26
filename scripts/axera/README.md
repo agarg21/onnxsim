@@ -6023,6 +6023,12 @@ looks like success.**
 The working recipe is therefore: build once, read the surviving names out of
 `<output>/quant/quant_axmodel.json`, then target those.
 
+What a promoted layer widens is its **inputs**: a U16 `Add` reads 16-bit
+operands and still writes 8 bits, and an operand that an 8-bit op also reads
+stays 8-bit (an `AxRequantizeLinear` widens it with no precision gained). To
+put one tensor at 16 bits, promote every op that reads it. Confirmed on
+encoder classifiers; `mixed_precision.py` encodes the rule.
+
 ### FP32 applies, and the backend will not always take it
 
 Asked correctly, `data_type: FP32` does apply -- 8-bit tensors dropped from 378
@@ -7418,7 +7424,10 @@ applies both. RoBERTa's `CumSum` position ids work unchanged: the op is off
 the published list but exact on the card. On the card, the
 `ms-marco-MiniLM-L-6-v2` reranker at seq 128 runs in 2.9 ms (int8) with
 exact rerank order, and DistilRoBERTa NLI keeps every label at int8.
-DistilBERT SST-2 needs U16. Tables, the exactness argument and
+DistilBERT SST-2 needs 16 bits, but only on the residual stream:
+`LayerNorm` + residual `Add` at U16 (`mixed_precision.py`) gives 12/12 labels
+at 6.76 ms, against 6.63 ms for U8 and 7.73 ms for whole-model U16. Tables,
+the exactness argument and
 reproduction steps (`encoder_classifier.py`) are in
 [`docs/axera-encoder-classifiers.md`](../../docs/axera-encoder-classifiers.md).
 
@@ -7441,6 +7450,7 @@ reproduction steps (`encoder_classifier.py`) are in
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
 | `pulsar2_docker.py` | real `pulsar2 build` (Docker) + `axcl_run_model` (device) wrapper: `build()` (with `profile=` for `trace.json`), `llm_build()` (the separate, ONNX-free `pulsar2 llm_build` LLM path -- see above), `build_from_hf_checkpoint()` (the hf-config+safetensors -> `onnxsim.reconstruct_hf_graph()` -> `build()` path -- see "An alternative LLM path" above), `run_on_device()`, `run_on_device_with_input()`, `force_rmtree()`. Manual/local-only -- needs a loaded Docker image. |
 | `convert_onnxmodelzoo.py` | batch driver over `pulsar2_docker.py`: fetch -> onnxsim -> real `pulsar2 build` (orig + simplified, `--profile` optional) -> optional on-device bit-exact diff -> CSV. Entry point for `axera-integration.yml`'s `pulsar2-docker-convert` job -- like `amd-integration.yml`'s MIGraphX check, that job is `workflow_dispatch`-only and targets a `[self-hosted, axcl]` runner this repository doesn't provision, so it's dormant until one exists. |
+| `mixed_precision.py` | picks which ops to run at U16 from one U8 and one U16 build, with no rebuild per candidate. It splices the two builds' scale tables and replays them (`replay.py`), using the rule the card showed: `layer_configs` widens an op's *inputs*, and only tensors whose every reader is promoted. It then runs a group-wise forward search and writes `layer_configs`. On BERT-style encoders it picks the residual stream (`LayerNorm` + `Add`), which gives U16 accuracy at U8 speed -- see `docs/axera-encoder-classifiers.md`. |
 | `encoder_classifier.py` | BERT-style encoder classifiers end to end: legacy export at a static `[1, seq]`, `pulsar2_backend.simplify()`, `pulsar2 build` at U8/U16 with text-pair calibration, then logit error, label agreement, rerank order and latency on the card -- see `docs/axera-encoder-classifiers.md`. |
 | `demo_hf_llm.py` | interactive one-shot demo of `build_from_hf_checkpoint()`: compile, print the phase-timing breakdown (and `--profile`'s trace.json/Netron paths), feed one prompt, print top-5 predicted next tokens. |
 | `llm_pulsar_free/` | whole-LLM decode (llama / qwen3) where every program is retargeted or emitted without Pulsar2 (`u16_retarget`, `linear_emit.emit_linear_u16`) and run as one plan per token with the K / V caches on the card; llama-160m and Qwen3-0.6B results against `llm_build` in `docs/axera-llm-pulsar-free-decode.md`. |
