@@ -30,7 +30,7 @@ GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
 GPTQ=1 python pf_plan.py --generate 48    # free-running greedy decode vs float -> <out>/gen.json
-# LLM_PF_FUSE=0..5 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
+# LLM_PF_FUSE=0..6 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
 python pf_add_offset.py <out> <out>_x     # optional: exact Add offset words (below)
 python pf_baseline_llm_build.py --build-dir <llm_build out>   # Pulsar2 llm_build on the same steps
 python pf_profile.py                      # per-program card time of the rest set
@@ -98,7 +98,7 @@ Every `axclrtEngineExecute` costs about 0.27 ms on this card whatever the progra
 computes (a `[1, 1024]` Add takes as long as a two-pass norm), and the runtime has no
 asynchronous execute. Decode speed therefore follows the number of programs run per
 token. The table above is layout `0`. Layouts `1`..`5` run neighbouring programs as one
-(`pf_layout.LAYER_FUSED*`; `4` and `5` need a per-head q / k norm):
+(`pf_layout.LAYER_FUSED*`; `4` to `6` need a per-head q / k norm):
 
 | `LLM_PF_FUSE` | merged programs (template) | per layer | per token |
 | --- | --- | --- | --- |
@@ -108,6 +108,7 @@ token. The table above is layout `0`. Layouts `1`..`5` run neighbouring programs
 | 3 | `dn` also takes the fused SiLU (`slanorm<I>`) | 6 | 170 |
 | 4 | the linear after each norm joins it: `on2g` = `on2` + `gu` (`lanorml<k>x<n>`), `dnq` = `dn` + the next layer's `qkv5` (`slanorml<k>x<n>`); layer 0 `n1q` (`nrml<n>`) | 4 | 114 |
 | 5 (Qwen3 default) | the next layer's q / k / v and its RoPE join `dn`: `dnqk` (`slanormqk<I>`: five linears q, q_rot, k, k_rot, v, then `qkf`; outputs the residual, q, and the K / V rows); layer 0 `n1qk` (`nrmqk<H>`) | 3 | 86 |
+| 6 | the programs of `5`, with rotate_half made inside `dnqk` / `n1qk` (`slanormqkr<I>` / `nrmqkr<H>`): three linears q, k, v (4096 columns instead of 7168), and q_rot / k_rot by `Split` / `Concat` of each head's halves | 3 | 86 |
 
 A merged program has several outputs where the residual stream goes on (`x` and the
 normalized `y`; `qk`'s `yq` and `yk`, which is bound to K row `p` as `rk`'s was). Only
@@ -150,6 +151,17 @@ How the merged programs are made:
   table in `npu_params` (found from the template's own weights and calibration) and its
   own core `zp_x` records, told apart by the template's zero points (refused when two
   linears' inputs share one).
+- **Rotation in the program (layout 6).** rotate_half is a permutation within each head (its
+  sign is in the sin tables), so `nrmqkr` / `slanormqkr` make q_rot and k_rot from the q and k
+  linears' outputs: Reshape to `[heads, 2, hd / 2]`, `Split` the halves, `Concat` them swapped,
+  Reshape back (`pf_templates.ROT`). Pulsar2 runs Split / Concat without a calibration of
+  their own (every side as the input) and adds two CORE jobs without records.
+  `u16_retarget` treats them as data movement (`MOVES`: every side of a Split / Concat
+  calibrated alike, `propagate`), and the strict job assignment allows one blank job per
+  Split / Concat. The cancelling RoPE-Add variant (`v1`) gets its cancellation from the
+  q / k weights instead (each head's second half about `-k` times its first half). The
+  same variants serve the same layers as in layout 5 (rest set: `v0` 14, `v1` 13, `nrmqkr`
+  `v1`).
 - **Merged CORE jobs.** With q / k / v and the RoPE in one program, Pulsar2 runs 36 CORE
   jobs for 33 compute nodes (`nrmqk`), three of them without any calibration record (data
   movement around the linears), and in other builds runs two nodes in one job. The
@@ -283,6 +295,18 @@ Notes on the table:
   layout 3's shared `qk` does: 43/48 3.42%, 43/48 2.78%. In `pf_profile.py`, layout 5
   takes `dnqk` 908 us (the down and q / k / v linears, 10.4 MB), `on2g` 764 us,
   `attn` 452 us and `lm_head` 8.3 ms per token. Resident: 198 programs.
+- **Layout 6 against 5** (2026-10-27, back to back, host load 4-7 from other jobs). The
+  card computes the same thing bit for bit: the s8 q_rot / k_rot columns were the q / k
+  columns permuted, with the same per-channel scales and the same output calibration, so
+  the permuted q / k outputs equal them. `pf_check.py` gives every program the same error as
+  layout 5's (rest 198 outputs within 9e-3, first 222 within 3.3e-2), and the 48 steps give
+  the same logit error on every step (43/48, mean 3.85%; 43/48, mean 3.09%). Card time per
+  token, medians: 75.4 / 72.2 / 73.9 / 73.5 ms against 80.4 / 81.3 / 78.8 / 77.4 ms for
+  layout 5 in four alternating pairs, so about 4-5 ms (6%) less. In `pf_profile.py`,
+  `dnqk` takes 758 us against 898 us and `n1qk` 550 us against 733 us; the other programs
+  are unchanged. The rest set is 643 MB against 738 MB (`dnqk` 7.9 MB against 11.3 MB per
+  layer). Two of three `pf_profile.py` runs of layout 6 read every program, the unchanged
+  ones included, 30-70% slow, so the profile is taken from the third run.
 - **llama-160m, merged layouts** (rebuilt the same way, round-to-nearest weights,
   layouts 0-3 back to back). Executes per token: 171 (`0`), 122 (`1`), 98 (`2`) and 86
   (`3`); resident programs 342 / 244 / 196 / 172. Without a per-head q / k norm, `rq` and
@@ -431,7 +455,7 @@ nothing of `down_proj`'s output to the residual on the card (`b` range 0.07 agai
 ## Checks
 
 - **Merged layouts** (`tests/test_axera_llm_pulsar_free.py`): the whole-plan wiring check
-  for `LLM_PF_FUSE=1..5` on the qwen3-like synthetic model, `1..3` on the llama ones. It includes the split
+  for `LLM_PF_FUSE=1..6` on the qwen3-like synthetic model, `1..3` on the llama ones. It includes the split
   first-set `down_proj`, several-output binding and `qk`'s K row. Also programs per layer,
   template names, FusedEval of each merged graph against `ReferenceEvaluator`, and the
   calibration ties. Regenerating layout `0` from the same templates is byte-identical to
@@ -477,13 +501,13 @@ nothing of `down_proj`'s output to the residual on the card (`b` range 0.07 agai
 - **Not in the repository.** Templates, recorded activations and program sets stay local
   scratch. Qwen3-0.6B's program set is 827 MB, and its templates are 49 Pulsar2 builds
   (four per fused / Add shape, one per linear shape; llama-160m: 29).
-- **Layouts `4` and `5` need a per-head q / k norm** (`qkf`): llama-160m stops at layout `3`.
+- **Layouts `4` to `6` need a per-head q / k norm** (`qkf`): llama-160m stops at layout `3`.
 - **Not merged yet.** `gu` + the SiLU: in a program where the SiLU follows two linears,
   Pulsar2 fuses Sigmoid and Mul into one job whose records are not decoded (the SiLU
-  sits in `dnqk` before `down_proj` instead). The attention stays its own program. The
-  rotated q / k columns are still duplicated (five linears per `dnqk`, 7168 columns). A
-  probe shows `Split` / `Concat` rotate halves in-program as data movement (no CORE job,
-  calibration equal to the input's), so the rotation could move into the program.
+  sits in `dnqk` before `down_proj` instead). The attention stays its own program.
+- **Layout 6 is not the default yet.** It needs the `nrmqkr` / `slanormqkr` templates
+  (`pf_templates.py`). The first set's layers after a split layer (1-3) keep a `qkv5` of
+  7168 columns and `qk`.
 - **Not ported from the scratch run.** The per-program card-vs-host diagnostics and the
   attention calibration-margin experiment (`m = 1.0 / 1.2 / 1.414` on recorded inputs) are
   left out; the margin in use is sqrt(2).

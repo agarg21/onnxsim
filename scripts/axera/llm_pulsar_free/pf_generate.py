@@ -435,7 +435,9 @@ class Generator:
         recorded norm output) and the union of ``ys`` at the real range x2.
         ``qkv = layer``: the five q / k / v linears of that layer and its q / k
         RoPE after the norm (``nrmqk`` / ``slanormqk``), the RoPE parts
-        calibrated as ``qk`` (``qk_ranges``, both sets)."""
+        calibrated as ``qk`` (``qk_ranges``, both sets); with ``fuse=6`` three
+        linears, q_rot / k_rot rotated in the program (``nrmqkr`` /
+        ``slanormqkr``; their ranges are q's / k's)."""
         H = self.cfg.H
         inits = tpl.graph(f"nrm{H}", tpl.Dims.of(self.cfg))[4]
         rgs = []
@@ -506,6 +508,8 @@ class Generator:
             }
             weights = {} if w is None else {"w": w}
             for part, n in cfg.QKV:
+                if cfg.fuse >= 6 and part in ("q_rot", "k_rot"):
+                    continue  # rotated in the program (``nrmqkr`` / ``slanormqkr``)
                 weights[f"w{src[part]}"] = wm[:, oq[part] : oq[part] + n]
             for r in rgs:
                 if "y" in r:
@@ -553,10 +557,11 @@ class Generator:
             rgs.append(rg)
             name = f"slanorm{n}"
         if qkv is not None:
+            r = "r" if self.cfg.fuse >= 6 else ""
             if name.startswith("nrm"):
-                name = f"nrmqk{H}"
+                name = f"nrmqk{r}{H}"
             elif name.startswith("slanorm"):
-                name = name.replace("slanorm", "slanormqk")
+                name = name.replace("slanorm", f"slanormqk{r}")
             else:
                 raise ValueError(f"{name}: no template with q / k / v after the norm")
         if post is not None:
@@ -881,7 +886,7 @@ class Generator:
         man[w] = ml
 
     def layer_fused5(self, st, li, man):
-        """One layer of the ``fuse=5`` layout (``pf_model.Config.programs``)."""
+        """One layer of the ``fuse=5`` / ``6`` layout (``pf_model.Config.programs``)."""
         cfg = self.cfg
         w = f"L{li}"
         A = self._acts(st, w)
@@ -1242,7 +1247,7 @@ def main():
     t0 = time.time()
     for li in range(lo_l, hi_l + 1):
         layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
-        layer += [gen.layer_fused4, gen.layer_fused5]
+        layer += [gen.layer_fused4, gen.layer_fused5, gen.layer_fused5]
         layer[cfg.fuse](st, li, man)
         json.dump(man, open(mpath, "w"), indent=1)
         ml = man[f"L{li}"]

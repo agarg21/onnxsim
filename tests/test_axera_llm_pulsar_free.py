@@ -27,6 +27,7 @@ import pf_layout as lay  # noqa: E402
 import pf_model  # noqa: E402
 import pf_plan  # noqa: E402
 import pf_templates as tpl  # noqa: E402
+import rope_rotate_half as rr  # noqa: E402
 
 F32 = np.float32
 
@@ -217,7 +218,7 @@ def _config(name, out, fuse=0):
 
 
 WIRING = [("qwen3_like", 0), ("llama_gqa", 0), ("llama_mha", 0)]
-WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5)]
+WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5, 6)]
 WIRING += [(m, f) for m in ("llama_gqa", "llama_mha") for f in (1, 2, 3)]
 
 
@@ -283,13 +284,15 @@ def test_template_names():
     assert tpl.template_dir("r", "add32").endswith(os.path.join("single", "add32"))
 
 
-@pytest.mark.parametrize("fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3)])
+@pytest.mark.parametrize(
+    "fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3), (6, 3)]
+)
 def test_programs_per_layer(fuse, runs):
     """Executes per layer of the rest set; layer 0 also runs the first norm,
     and a split first-set ``down_proj`` keeps its own programs."""
     cfg = _config("qwen3_like", ".", fuse)
     assert len(cfg.programs("rest", "L1")) == runs
-    if fuse == 5:
+    if fuse >= 5:
         assert cfg.programs("rest", "L0")[0] == "n1qk"
         assert cfg.programs("first", "L1")[:2] == ["qkv5", "qk"]
         assert cfg.kv_producer("rest", 1) == ("L0", "dnqk")
@@ -320,6 +323,30 @@ def test_merged_template_names():
         names = set(tpl.needed(_config("qwen3_like", ".", fuse)))
         assert want <= names and "crms32" not in names
     assert {"lanorm64"} <= set(tpl.needed(_config("qwen3_like", ".", 2)))
+    five, six = (set(tpl.needed(_config("qwen3_like", ".", f))) for f in (5, 6))
+    assert {"nrmqk32", "slanormqk64"} <= five and not {"nrmqkr32"} & five
+    assert {"nrmqkr32", "slanormqkr64"} <= six and not {"nrmqk32"} & six
+
+
+@pytest.mark.parametrize("name", ["nrmqkr32", "slanormqkr64"])
+def test_in_program_rotation_equals_rotated_weights(name):
+    """``fuse=6``'s q / k rotation by Split / Concat in the program computes
+    what ``fuse=5``'s two linears of rotated weights (q_rot, k_rot) do."""
+    _, body, ins, outs, inits, gens = tpl.graph(name, DIMS)
+    gen, ws = gens[1]
+    m6 = tpl.model_of(body, ins, outs, {**inits, **ws})
+    _, body5, ins5, outs5, inits5, _ = tpl.graph(name.replace("qkr", "qk"), DIMS)
+    perm = np.kron(np.eye(DIMS.nh, dtype=F32), rr.perm_matrix(DIMS.hd))
+    pk = np.kron(np.eye(DIMS.nkv, dtype=F32), rr.perm_matrix(DIMS.hd))
+    w5 = {**ws, "wqr": ws["wq"] @ perm, "wkr": ws["wk"] @ pk}
+    m5 = tpl.model_of(body5, ins5, outs5, {**inits5, **w5})
+    feeds = gen(np.random.default_rng(0))
+    got = fqm.FusedEval(m6, {})(**feeds)
+    for a, b, c in zip(
+        got, ReferenceEvaluator(m6).run(None, feeds), fqm.FusedEval(m5, {})(**feeds)
+    ):
+        np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(a, c, rtol=1e-5, atol=1e-5)
 
 
 def test_signed_inputs_skip_a_constant_weight():
