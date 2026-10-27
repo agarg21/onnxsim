@@ -513,7 +513,10 @@ class Generator:
                 for a_, b_ in tpl.NORM_QK_RENAME.items():
                     if a_ in r:
                         r[b_] = r.pop(a_)
-            Bs = [B] + ([self._acts("first", f"L{lj}")] if cfg.first_pos == 0 else [])
+            # the rest set's program on the rest set's samples; the first set's
+            # (position 0, where sin = 0 degenerates the RoPE parts) on both
+            both = self._st == "first" and cfg.first_pos == 0
+            Bs = [B] + ([self._acts("first", f"L{lj}")] if both else [])
 
             def r2(k):
                 v = np.concatenate([b[k].reshape(len(b[k]), -1) for b in Bs])
@@ -535,7 +538,7 @@ class Generator:
                     "v": r2("vp"),
                 }
             )
-            qrgs, _ = self.qk_ranges("rest", lj, B)
+            qrgs, _ = self.qk_ranges("rest", lj, B, both=both)
             rgs += qrgs
         if silu is not None:
             gate, up = silu
@@ -581,15 +584,17 @@ class Generator:
         rgs, uk = self.qk_ranges(st, li, A)
         self.merged(C, D, "qk", name, rgs, ml, dict(u_absmax=float(np.abs(uk).max())))
 
-    def qk_ranges(self, st, li, A):
+    def qk_ranges(self, st, li, A, both=None):
         """Ranges of the q / k RoPE parts (``qkf``) of layer ``li``, each part as
         its own program was calibrated (rest set: with the first set's samples
-        too); and the coarse k norm's ``u`` in fake-quant."""
+        too, unless ``both`` says otherwise); and the coarse k norm's ``u`` in
+        fake-quant."""
         cfg = self.cfg
         nh, nkv, hd, kvd = cfg.nh, cfg.nkv, cfg.hd, cfg.kvd
         w = f"L{li}"
         inits = tpl.graph(f"qkf{nh * hd}", tpl.Dims.of(cfg))[4]
-        both = st == "rest" and cfg.first_pos == 0
+        if both is None:
+            both = st == "rest" and cfg.first_pos == 0
         F_ = self._acts("first", w) if both else None
         tiles = [cfg.rope_tiles(int(p), li) for p in A["p"]]
         t0 = cfg.rope_tiles(0, li)
