@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `3127209b8` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `839d38e03` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1262,3 +1262,23 @@ All pass against onnxruntime; the default build (hand MSDA) is unchanged. The ha
 still computes each tap's location, floor and bilinear weights in scalar code, while the hand kernel does 32 sampling points
 per vector. That is the next step toward parity, and the temporal self-attention (no mask, 14 ms per layer generated vs ~3.3
 hand) needs it too.
+
+**Generated MSDA: gathered buffers in VTCM, direct sampling.** Two smaller steps on the generated MSDA (`HAND_MSDA=0`):
+- *Gathered parameters get VTCM first.* The renderer marks the parameters a kernel loads at addresses computed from loaded
+  values (`/* vtcm-gathered: j */`), and the graph emitter weighs them like a hand kernel's declared `vtcm-params`. The value
+  rows had lost the arena to plainer buffers: from DDR, every gathered 128-byte row is a cache miss.
+- *Taps straight from the value rows.* Pixel `x = ref.x * W + off.x - 0.5`, with no per-point division (`off / (W, H)` had been
+  a reciprocal for each point) and no GridSample layout round trip.
+
+| generated MSDA | before | gathered in VTCM | + direct sampling |
+|---|---:|---:|---:|
+| spatial cross-attention, per layer | 21.1 ms | 18.9 ms | 18.2 ms |
+| temporal self-attention, per layer | 14.1 ms | 11.3 ms | 11.3 ms |
+| encoder, 1 layer | 43.1 ms | 38.1 ms | 37.4 ms |
+| encoder, 3 layers | 121.2 ms | 113.4 ms | 111.6 ms |
+
+All pass; the default build (hand MSDA) is unchanged. The cross-attention's body is now ~1370 instruction packets per visible
+(camera, query, head): 8 scalar chains of address and weight math, one per sampling point, each feeding its own gathers. The
+hand kernel computes 32 points' addresses per vector instruction. Generated code needs a kernel with two vector axes (points for
+the address math, channels for the taps), which the scheduler can't express yet. Splitting it into two kernels would write
+~15-20 MB of per-point addresses and weights to DDR per layer.
