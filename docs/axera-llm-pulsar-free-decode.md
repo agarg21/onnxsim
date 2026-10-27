@@ -29,6 +29,7 @@ GPTQ=1 python pf_generate.py first
 GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
+GPTQ=1 python pf_plan.py --generate 48    # free-running greedy decode vs float -> <out>/gen.json
 # LLM_PF_FUSE=0..5 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
 python pf_baseline_llm_build.py --build-dir <llm_build out>   # Pulsar2 llm_build on the same steps
 python pf_profile.py                      # per-program card time of the rest set
@@ -43,7 +44,7 @@ python pf_profile.py                      # per-program card time of the rest se
 | `pf_generate.py` | calibration and emission of every program (`u16_retarget.retarget_graph` / `retarget`, `linear_emit.emit_linear_u16`), `manifest_<set>.json` |
 | `pf_fake_quant.py` | fake-quant evaluation of a program the way the card runs it |
 | `pf_estimate.py` | the whole decode in fake-quant on the host |
-| `pf_plan.py` | the decode on the card: every program resident, one `PLAN` per token |
+| `pf_plan.py` | the decode on the card: every program resident, one `PLAN` per token; `--generate N`: free-running greedy decode against the float model's |
 | `pf_gptq.py` | `linear_emit.gptq_weight` for every linear (CUDA torch) |
 | `pf_baseline_llm_build.py`, `pf_profile.py` | the `llm_build` reference point; per-program card time |
 
@@ -310,6 +311,44 @@ logit gap between the two is at most 0.2, against a logit standard deviation of 
 | Qwen3-0.6B, adaquant, 3 / 10 | 0.021 / 0.068 | Pulsar-free (GPTQ) |
 | Qwen3-0.6B, activation-memory-planning, 13 / 28 / 34 | 0.040 / 0.006 / 0.202 | Pulsar-free (GPTQ) |
 
+### Free-running generation (`pf_plan.py --generate`)
+
+The rows above are teacher-forced: every step gets the passage's next token.
+`--generate N` instead feeds each argmax back, after a prompt, for `N` tokens. The float
+model (`Config.float_step`) does the same on its own tokens. The run reports how many
+leading tokens agree, the first divergence, and the float model's top-1 / top-2 gap
+there; both models have seen the same prefix at that step. Four prompts
+(`pf_plan.GEN_PROMPTS`), 48 tokens each, on the card, 2026-10-27. The shipped sets were
+used: llama-160m layout 3, Qwen3-0.6B layout 5 with GPTQ.
+
+| model | prompt | agree | first divergence (float gap) |
+| --- | --- | --- | --- |
+| llama-160m | "The capital of France is" | 3 / 48 | after " Paris.\n": "T" (of "Today") for "The" (1.87) |
+| llama-160m | "Once upon a time, there was a little" | 48 / 48 | |
+| llama-160m | "def fibonacci(n):" | 4 / 48 | after " 1.\n": "z" for "1" (0.30) |
+| llama-160m | "Quantization makes a neural network smaller by" | 48 / 48 | |
+| Qwen3-0.6B | "The capital of France is" | 48 / 48 | |
+| Qwen3-0.6B | "Once upon a time, there was a little" | 1 / 48 | " girl named" for " girl who" (0.18) |
+| Qwen3-0.6B | "def fibonacci(n):" | 48 / 48 | (a correct recursive function, with newlines) |
+| Qwen3-0.6B | "Quantization makes a neural network smaller by" | 19 / 48 | (0.19) |
+
+Qwen3-0.6B diverges only where the float model is near a tie (gaps 0.18 and 0.19).
+Both continuations then stay fluent ("... girl named Lila who lived in a village called
+Willowbrook").
+
+llama-160m breaks at a newline. Both of its divergences come at the first token after a
+generated `\n`, and the float gap there is 1.87. The `\n` token makes a massive
+activation like the attention-sink position 1: the residual reaches about 650 at layers
+3..10. The calibration text has no line breaks (`pf_layout.prose` joins lines with
+spaces), and the rest set's residual ranges there are about 90..220. The step clips. The
+host estimate (`pf_estimate.Chain` on the same tokens) gives a 58% logit error at the
+newline step, and the card gives the same 58%. The next steps are 30%, 16% and 11% off,
+because the clipped K / V row stays in the cache. The programs compute what their
+calibration says; the calibration does not cover the token. Prompts without a generated
+newline agree for all 48 tokens. The fix would be calibration text that keeps its line
+breaks (or a third program set for newline-like tokens); it is not done here. Qwen3-0.6B
+has no such token: its fibonacci continuation has ten newlines and agrees throughout.
+
 ### Where the error comes from
 
 The host estimate (`pf_estimate.py`) evaluates every program in fake-quant. With
@@ -358,9 +397,12 @@ llama-160m's host estimate gives 45/47 and 46/47, 1.26% and 1.14%.
 
 ## Limits
 
-- **Teacher-forced decode only.** The runs cover 48 steps of two passages; nothing here
-  measures free-running generation or a long context. The context is 128 positions (the
-  cache has 129 rows), and there is no prefill: a prompt goes through one token at a time.
+- **Short context, no prefill.** The accuracy runs cover 48 teacher-forced steps of two
+  passages, and free-running generation was run for four prompts of 48 tokens. The
+  context is 128 positions (the cache has 129 rows), and there is no prefill: a prompt
+  goes through one token at a time.
+- **llama-160m's newline is not calibrated.** A generated `\n` makes a massive
+  activation past the rest set's ranges (free-running generation, above).
 - **Calibration covers positions 0..127 only.** Beyond that, ranges are unchecked.
 - **Not in the repository.** Templates, recorded activations and program sets stay local
   scratch. Qwen3-0.6B's program set is 827 MB, and its templates are 49 Pulsar2 builds

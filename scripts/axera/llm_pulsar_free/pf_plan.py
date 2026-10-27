@@ -17,8 +17,14 @@ the card (no rounding), to check the wiring against the float model offline.
 (``write_float_set``, under ``<out>/float_set``) instead of a generated
 program set: needs neither Pulsar2 nor the card.
 
+--generate N: free-running greedy decode of N tokens after each prompt
+(``--text``, repeatable; default ``GEN_PROMPTS``), then the float model's
+greedy decode of the same prompts: tokens agreed, the first divergence and
+both texts.
+
 usage: MODEL=llama160m pf_plan.py [--fake [--float-set]] [--doc 0] [--prompt 48]
        -> <out>/plan_doc<d>[_fake].json
+       MODEL=llama160m pf_plan.py --generate 32 [--text "..."] -> <out>/gen[_fake].json
 """
 
 from __future__ import annotations
@@ -747,12 +753,106 @@ def decode(plan: Plan, cfg: pf_model.Config, ids) -> list[dict]:
     return rows
 
 
+#: default prompts of ``--generate`` (free-running greedy decode)
+GEN_PROMPTS = (
+    "The capital of France is",
+    "Once upon a time, there was a little",
+    "def fibonacci(n):",
+    "Quantization makes a neural network smaller by",
+)
+
+
+def greedy(step, cfg: pf_model.Config, prompt, n) -> tuple[list[int], list[float]]:
+    """Free-running greedy decode: the ``prompt`` ids teacher-forced, then
+    ``n`` tokens, each the argmax of the step before it, fed back. ``step(token,
+    p)`` returns the logits at position ``p``; position 0 is skipped when the
+    model makes it zero end to end. Returns the ``n`` generated ids and each
+    generated step's top-1 / top-2 logit gap."""
+    if len(prompt) + n - 1 > cfg.S:
+        raise ValueError(
+            f"prompt {len(prompt)} + {n} tokens: past the {cfg.S}-row cache"
+        )
+    seq, gen, gaps = list(prompt), [], []
+    for p in range(len(prompt) + n - 1):
+        if p == 0 and cfg.zero_pos0:
+            continue
+        lg = np.asarray(step(seq[p], p), F32).reshape(-1)
+        if p < len(prompt) - 1:
+            continue
+        top = np.argsort(lg)[-2:]
+        gaps.append(float(lg[top[1]] - lg[top[0]]))
+        gen.append(int(top[1]))
+        seq.append(gen[-1])
+    return gen, gaps
+
+
+def float_greedy(cfg: pf_model.Config, prompt, n):
+    """``greedy`` of the float model (``Config.float_step``) on fresh caches."""
+    fK, fV = cfg.new_cache()
+    return greedy(lambda t, p: cfg.float_step(fK, fV, t, p)[0], cfg, prompt, n)
+
+
+def compare_generation(cfg, prompt, got, ref, ref_gaps) -> dict:
+    """Agreement of two greedy continuations of ``prompt``: how many leading
+    tokens are equal (``agree``), the first divergence (both tokens and the
+    reference's top-1 / top-2 gap there; both runs saw the same prefix), and
+    the texts when ``cfg`` has a tokenizer."""
+    agree = next((i for i, (a, b) in enumerate(zip(got, ref)) if a != b), len(ref))
+    row = dict(prompt=[int(t) for t in prompt], got=got, ref=ref, agree=agree)
+    if agree < len(ref):
+        row["diverge"] = dict(got=got[agree], ref=ref[agree], ref_gap=ref_gaps[agree])
+    if cfg.tokenizer_dir:
+        tok = cfg.tokenizer()
+        row.update(
+            prompt_text=tok.decode(row["prompt"]),
+            got_text=tok.decode(got),
+            ref_text=tok.decode(ref),
+        )
+    return row
+
+
+def _generate(pl: Plan, cfg: pf_model.Config, a, close) -> None:
+    """``--generate``: greedy on the plan for every prompt, then (after
+    ``close()`` releases the card) the float model's greedy on the same
+    prompts -> ``<out>/gen[_fake].json``."""
+    texts = a.text or list(GEN_PROMPTS)
+    prompts = [cfg.tokenizer().encode(t).ids for t in texts]
+    got = []
+    for ids in prompts:
+        ts = time.time()
+        g, _ = greedy(lambda t, p: pl.step(t, p)[0], cfg, ids, a.generate)
+        got.append(g)
+        print(f"{len(ids)} + {len(g)} tokens, {time.time() - ts:.1f} s", flush=True)
+    res = dict(model=cfg.name, fake=a.fake, fuse=cfg.fuse, n=a.generate)
+    res.update(close() or {})
+    rows = []
+    for ids, g in zip(prompts, got):
+        ref, gaps = float_greedy(cfg, ids, a.generate)
+        rows.append(compare_generation(cfg, ids, g, ref, gaps))
+        r = rows[-1]
+        print(f"agree {r['agree']}/{a.generate} {r.get('diverge', '')}")
+        print(f"  plan : {r['prompt_text']!r} -> {r['got_text']!r}")
+        print(f"  float: {r['prompt_text']!r} -> {r['ref_text']!r}", flush=True)
+    res["prompts"] = rows
+    path = os.path.join(cfg.out, f"gen{'_fake' if a.fake else ''}.json")
+    json.dump(res, open(path, "w"), indent=1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--fake", action="store_true")
     ap.add_argument("--float-set", action="store_true")
     ap.add_argument("--doc", type=int, default=0)
     ap.add_argument("--prompt", type=int, default=48)
+    ap.add_argument(
+        "--generate",
+        type=int,
+        default=0,
+        metavar="N",
+        help="free-running greedy decode of N tokens per prompt (--text, default "
+        "GEN_PROMPTS) against the float model's -> <out>/gen.json",
+    )
+    ap.add_argument("--text", action="append", help="a --generate prompt (repeatable)")
     a = ap.parse_args()
     cfg = pf_model.load()
     ids = cfg.passage_ids(lay.EVAL_DOCS[a.doc])[: a.prompt]
@@ -776,6 +876,18 @@ def main():
         f"{pl.n_programs} programs loaded, {pl.n_runs} per token, setup {t_setup:.1f}s",
         flush=True,
     )
+    if a.generate:
+
+        def close():
+            if sess is None:
+                return {}
+            h = A.health_check(sess)
+            print("health after", h, flush=True)
+            sess.__exit__(None, None, None)
+            return dict(health_after=h)
+
+        _generate(pl, cfg, a, close)
+        return
     rows = decode(pl, cfg, ids)
     res = dict(
         model=cfg.name,

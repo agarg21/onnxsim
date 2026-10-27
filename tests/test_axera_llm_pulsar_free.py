@@ -197,6 +197,27 @@ def test_plan_wiring_matches_float_model(name, fuse, tmp_path):
     assert max(r["rel"] for r in est) < 1e-4
 
 
+@pytest.mark.parametrize("name,fuse", [("qwen3_like", 5), ("llama_mha", 3)])
+def test_free_running_greedy_matches_float_model(name, fuse, tmp_path):
+    """``pf_plan.greedy`` (``--generate``) on the plan with float programs feeds
+    its own tokens back and continues the prompt exactly as the float model's
+    greedy decode does; ``compare_generation`` counts the agreement."""
+    cfg = _config(name, str(tmp_path), fuse)
+    root = str(tmp_path / "float_set")
+    pf_plan.write_float_set(cfg, root)
+    plan = pf_plan.Plan(lay.FakeAX(str(tmp_path / "fake")), cfg, fake=True, root=root)
+    prompt = [int(t) for t in np.random.default_rng(6).integers(1, cfg.vocab, 3)]
+    got, _ = pf_plan.greedy(lambda t, p: plan.step(t, p)[0], cfg, prompt, 5)
+    ref, gaps = pf_plan.float_greedy(cfg, prompt, 5)
+    assert len(got) == 5 and got == ref
+    row = pf_plan.compare_generation(cfg, prompt, got, ref, gaps)
+    assert row["agree"] == 5 and "diverge" not in row
+    row = pf_plan.compare_generation(cfg, prompt, got[:2] + [-1] * 3, ref, gaps)
+    assert row["agree"] == 2 and row["diverge"]["ref"] == ref[2]
+    with pytest.raises(ValueError):
+        pf_plan.greedy(None, cfg, prompt, cfg.S)
+
+
 def test_template_names():
     cfg = _config("qwen3_like", ".")
     names = tpl.needed(cfg)
