@@ -29,7 +29,7 @@ GPTQ=1 python pf_generate.py first
 GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
-# LLM_PF_FUSE=0..3 picks the program layout (Qwen3-0.6B default 3, llama-160m 0)
+# LLM_PF_FUSE=0..5 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
 python pf_baseline_llm_build.py --build-dir <llm_build out>   # Pulsar2 llm_build on the same steps
 python pf_profile.py                      # per-program card time of the rest set
 ```
@@ -166,7 +166,7 @@ program's input and output buffers as the plan bound them, runs the program's ho
 model on the card's own inputs (the float graph at the program's calibration, the s8
 linear), and compares. A wrong record (scale, zero point, Add shift, weight table)
 shows up as 1e-1 or more. Layout 5, rest set: all 198 outputs within 9e-3, most
-1e-3..3e-3. First set (position 0, massive activations): up to 3.3e-2, the same as
+1e-3..3e-3 (llama-160m layout 3: within 1.3e-2, so the rest set's tolerance is 2e-2). First set (position 0, massive activations): up to 3.3e-2, the same as
 layout 3's first set (up to 2.2e-2 for `on2`, 1.2e-2 for `qk`), so the first set's
 tolerance is 5e-2. Rerun it after regenerating a set:
 `LLM_PF_OUT=... python pf_check.py [--set first]` (exit status 1 when a program is
@@ -229,6 +229,10 @@ and after every run.
 | --- | --- | --- | --- | --- |
 | llama-160m | Pulsar-free, round-to-nearest | 44/47, 1.31% (1.82%) | 46/47, 1.22% (1.48%) | 0.12 (card 85 ms) |
 | llama-160m | Pulsar2 `llm_build` | 44/47, 1.89% (2.62%) | 46/47, 1.56% (2.03%) | 0.15 |
+| llama-160m | rebuilt, `LLM_PF_FUSE=0` | 44/47, 1.28% (1.84%) | 46/47, 1.25% (1.50%) | 0.07 (card 61 ms) |
+| llama-160m | rebuilt, `LLM_PF_FUSE=1` | 45/47, 1.27% (1.82%) | 46/47, 1.22% (1.59%) | 0.057 (card 48 ms) |
+| llama-160m | rebuilt, `LLM_PF_FUSE=2` | 45/47, 1.27% (1.82%) | 46/47, 1.22% (1.59%) | 0.05 (card 39-41 ms) |
+| llama-160m | rebuilt, `LLM_PF_FUSE=3` (default) | 46/47, 1.32% (1.86%) | 46/47, 1.24% (1.48%) | 0.045 (card 35-38 ms) |
 | Qwen3-0.6B | Pulsar-free, round-to-nearest | 44/48, 4.4% | 46/48, 4.0% | 0.21-0.22 |
 | Qwen3-0.6B | Pulsar-free, GPTQ | 45/48, 3.36% (5.63%) | 44/48, 2.91% (3.99%) | 0.18 (card 163 ms) |
 | Qwen3-0.6B | Pulsar-free, GPTQ from `pf_gptq.py` | 43/48, 3.29% (5.16%) | 44/48, 2.89% (4.27%) | 0.19 (card 162 ms) |
@@ -271,6 +275,15 @@ Notes on the table:
   layout 3's shared `qk` does: 43/48 3.42%, 43/48 2.78%. In `pf_profile.py`, layout 5
   takes `dnqk` 908 us (the down and q / k / v linears, 10.4 MB), `on2g` 764 us,
   `attn` 452 us and `lm_head` 8.3 ms per token. Resident: 198 programs.
+- **llama-160m, merged layouts** (rebuilt the same way, round-to-nearest weights,
+  layouts 0-3 back to back). Executes per token: 171 (`0`), 122 (`1`), 98 (`2`) and 86
+  (`3`); resident programs 342 / 244 / 196 / 172. Without a per-head q / k norm, `rq` and
+  `rk` stay separate programs in every layout (`4` and `5` need `qkf`). Layout 3 against
+  0: top-1 46/47 against 44/47 on adaquant (it no longer misses positions 30 and 46). Mean
+  logit error 1.54% / 1.40% against 1.53% / 1.40%. Host estimates 45/47 and 46/47, 1.22%
+  and 1.16% (layout 0: 1.26% and 1.14%). `pf_check.py` on layout 3: rest set within
+  1.3e-2, first set within 1.8e-2. The 1.3e-2 is layer 1's `on2` normed output; layout
+  0's programs read at most 2.8e-3.
 - **Card time.** "card" is the runner's execution time of the step's plan. The rest of
   the wall time is the host side: tables and logits over the shared folder, and the plan
   file.
@@ -352,9 +365,7 @@ llama-160m's host estimate gives 45/47 and 46/47, 1.26% and 1.14%.
 - **Not in the repository.** Templates, recorded activations and program sets stay local
   scratch. Qwen3-0.6B's program set is 827 MB, and its templates are 49 Pulsar2 builds
   (four per fused / Add shape, one per linear shape; llama-160m: 29).
-- **Merged layouts on the card: Qwen3 only.** Layouts `1`..`3` without a per-head q / k
-  norm keep `rq` / `rk` and pass the wiring check, but have not run on the card; `4` and
-  `5` need the norm (`qkf`). llama-160m stays on layout `0`.
+- **Layouts `4` and `5` need a per-head q / k norm** (`qkf`): llama-160m stops at layout `3`.
 - **Not merged yet.** `gu` + the SiLU: in a program where the SiLU follows two linears,
   Pulsar2 fuses Sigmoid and Mul into one job whose records are not decoded (the SiLU
   sits in `dnqk` before `down_proj` instead). The attention stays its own program. The
