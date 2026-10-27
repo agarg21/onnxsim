@@ -170,6 +170,7 @@ def _config(name, out, fuse=0):
 
 WIRING = [("qwen3_like", 0), ("llama_gqa", 0), ("llama_mha", 0)]
 WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5)]
+WIRING += [(m, f) for m in ("llama_gqa", "llama_mha") for f in (1, 2, 3)]
 
 
 @pytest.mark.parametrize("name,fuse", WIRING)

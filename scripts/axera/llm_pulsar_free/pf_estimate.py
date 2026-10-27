@@ -98,7 +98,7 @@ class Chain:
         the previous layer's ``(x1, down)``, whose Add the layer's ``n1`` holds;
         returns this layer's ``(x1, down)``."""
         cfg = self.cfg
-        nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
+        kvd = cfg.kvd
 
         def f(k):
             return self.f[(f"L{li}", k)]
@@ -115,16 +115,7 @@ class Chain:
         def sl(k, n):
             return y5[:, o[k] : o[k] + n]
 
-        qr, kr = f("qk")(
-            q=sl("q_proj", nh * hd),
-            qr=sl("q_rot", nh * hd),
-            k=sl("k_proj", kvd),
-            kr=sl("k_rot", kvd),
-            cq=t["cos_q"],
-            sq=t["sin_q"],
-            ck=t["cos_k"],
-            sk=t["sin_k"],
-        )
+        qr, kr = self.rope(f, sl, t)
         K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
         att = f("attn")(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
         x1, m = f("n2")(a=x, b=f("o_proj")(att), g=g2)
@@ -138,7 +129,7 @@ class Chain:
         """A layer of the ``fuse=2`` layout. ``x``: the embedding row (layer 0)
         or the previous layer's ``dn`` outputs ``(x, normed x)``."""
         cfg = self.cfg
-        nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
+        kvd = cfg.kvd
 
         def f(k):
             return self.f[(f"L{li}", k)]
@@ -152,16 +143,7 @@ class Chain:
         def sl(k, n):
             return y5[:, o[k] : o[k] + n]
 
-        qr, kr = f("qk")(
-            q=sl("q_proj", nh * hd),
-            qr=sl("q_rot", nh * hd),
-            k=sl("k_proj", kvd),
-            kr=sl("k_rot", kvd),
-            cq=t["cos_q"],
-            sq=t["sin_q"],
-            ck=t["cos_k"],
-            sk=t["sin_k"],
-        )
+        qr, kr = self.rope(f, sl, t)
         K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
         att = f("attn")(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
         x1, m = f("on2")(z=att, a=x, g=g2)
@@ -177,12 +159,34 @@ class Chain:
             return f("dn")(a=x1, b=f("down_proj")(act), g=gn)
         return f("dn")(z=act, a=x1, g=gn)
 
+    def rope(self, f, sl, t):
+        """q and the K row from the layer's RoPE program(s) (``qk``, or ``rq``
+        and ``rk``) on the q / k slices ``sl(part, width)``."""
+        cfg = self.cfg
+        nq, kvd = cfg.nh * cfg.hd, cfg.kvd
+        if cfg.qk_norm:
+            return f("qk")(
+                q=sl("q_proj", nq),
+                qr=sl("q_rot", nq),
+                k=sl("k_proj", kvd),
+                kr=sl("k_rot", kvd),
+                cq=t["cos_q"],
+                sq=t["sin_q"],
+                ck=t["cos_k"],
+                sk=t["sin_k"],
+            )
+        qr = f("rq")(q=sl("q_proj", nq), r=sl("q_rot", nq), c=t["cos_q"], sn=t["sin_q"])
+        kr = f("rk")(
+            q=sl("k_proj", kvd), r=sl("k_rot", kvd), c=t["cos_k"], sn=t["sin_k"]
+        )
+        return qr, kr
+
     def layer_fused4(self, li, x, K, V, p):
         """A layer of the ``fuse=4`` layout. ``x``: the embedding row (layer 0)
         or the previous layer's ``{"x": residual, "a": normed | "y5": q / k / v}``;
         returns this layer's."""
         cfg = self.cfg
-        nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
+        kvd = cfg.kvd
         wh = f"L{li}"
 
         def f(k):
@@ -199,16 +203,7 @@ class Chain:
         def sl(k, n):
             return y5[:, o[k] : o[k] + n]
 
-        qr, kr = f("qk")(
-            q=sl("q_proj", nh * hd),
-            qr=sl("q_rot", nh * hd),
-            k=sl("k_proj", kvd),
-            kr=sl("k_rot", kvd),
-            cq=t["cos_q"],
-            sq=t["sin_q"],
-            ck=t["cos_k"],
-            sk=t["sin_k"],
-        )
+        qr, kr = self.rope(f, sl, t)
         K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
         att = f("attn")(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
         if (wh, "on2g") in self.f:

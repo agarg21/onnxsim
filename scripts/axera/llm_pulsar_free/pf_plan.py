@@ -226,12 +226,7 @@ class Plan:
             def o5(k, y5=y5):
                 return (y5, oq[k] * 4)
 
-            cq, sq, ck, sk = self.tables(li)
-            ins = dict(q=o5("q_proj"), qr=o5("q_rot"), k=o5("k_proj"), kr=o5("k_rot"))
-            ins |= dict(cq=cq, sq=sq, ck=ck, sk=sk)
-            for n, v in ins.items():
-                self.bind(st, wh, "qk", "I", n, *(v if isinstance(v, tuple) else (v,)))
-            qr = self.outputs(st, wh, "qk", skip=("yk",))["yq"]  # yk: K row p, per step
+            qr = self.rope(st, wh, li, o5)
             att = self.chain(
                 st, wh, "attn", q=qr, k=self.K[li], v=self.V[li], mask=self.mask
             )
@@ -257,6 +252,30 @@ class Plan:
         io["logits"] = self.chain(st, "post", "lm_head", x=xn)
         return io
 
+    def rope(self, st, wh, li, o5):
+        """Bind the layer's RoPE program(s) on the q / k slices ``o5(part)``:
+        ``qk`` (per-head q / k norm) or ``rq`` and ``rk``; returns q's buffer
+        (the K row is bound per step)."""
+        cq, sq, ck, sk = self.tables(li)
+        if self.cfg.qk_norm:
+            self._bind_ins(
+                st,
+                wh,
+                "qk",
+                q=o5("q_proj"),
+                qr=o5("q_rot"),
+                k=o5("k_proj"),
+                kr=o5("k_rot"),
+                cq=cq,
+                sq=sq,
+                ck=ck,
+                sk=sk,
+            )
+            return self.outputs(st, wh, "qk", skip=("yk",))["yq"]
+        qr = self.chain(st, wh, "rq", q=o5("q_proj"), r=o5("q_rot"), c=cq, sn=sq)
+        self._bind_ins(st, wh, "rk", q=o5("k_proj"), r=o5("k_rot"), c=ck, sn=sk)
+        return qr
+
     def bind_set_fused2(self, st):
         """``bind_set`` of the ``fuse=2`` layout (``pf_layout.LAYER_FUSED2``)."""
         cfg = self.cfg
@@ -272,12 +291,7 @@ class Plan:
             def o5(k, y5=y5):
                 return (y5, oq[k] * 4)
 
-            cq, sq, ck, sk = self.tables(li)
-            ins = dict(q=o5("q_proj"), qr=o5("q_rot"), k=o5("k_proj"), kr=o5("k_rot"))
-            ins |= dict(cq=cq, sq=sq, ck=ck, sk=sk)
-            for n, v in ins.items():
-                self.bind(st, wh, "qk", "I", n, *(v if isinstance(v, tuple) else (v,)))
-            qr = self.outputs(st, wh, "qk", skip=("yk",))["yq"]
+            qr = self.rope(st, wh, li, o5)
             att = self.chain(
                 st, wh, "attn", q=qr, k=self.K[li], v=self.V[li], mask=self.mask
             )

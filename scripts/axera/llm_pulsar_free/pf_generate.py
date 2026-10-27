@@ -668,9 +668,7 @@ class Generator:
         )
         offs = pf_model.lay.offsets(cfg.QKV)
         ml["qkv5"]["parts"] = {k: dict(col=offs[k], n=n) for k, n in cfg.QKV}
-        if not cfg.qk_norm:
-            raise NotImplementedError("fuse=1 without a per-head q / k norm")
-        self.qk(st, li, C, D, A, ml)
+        self._rope(st, li, A, C, D, ml)
         self._attn_mlp(st, li, A, C, D, ml, fused=True)
         man[w] = ml
 
@@ -693,7 +691,7 @@ class Generator:
         )
         offs = pf_model.lay.offsets(cfg.QKV)
         ml["qkv5"]["parts"] = {k: dict(col=offs[k], n=n) for k, n in cfg.QKV}
-        self.qk(st, li, C, D, A, ml)
+        self._rope(st, li, A, C, D, ml)
         self._attn(li, A, C, D, ml)
         r2 = lambda k: A[k].reshape(len(A[k]), -1).astype(F32)  # noqa: E731
         self.norm2(
@@ -794,7 +792,7 @@ class Generator:
                 "a",
                 ["qp", "kp", "vp"],
             )
-        self.qk(st, li, C, D, A, ml)
+        self._rope(st, li, A, C, D, ml)
         self._attn(li, A, C, D, ml)
         gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
         x, x1 = r2(A, "x"), r2(A, "x1")
@@ -1032,25 +1030,13 @@ class Generator:
         man["post"] = ml
 
     # ---- one layer / the post programs --------------------------------------------------
-    def layer(self, st, li, man):
+    def _rope_programs(self, st, li, A, C, D, ml):
+        """``kc`` (Qwen3), ``rq`` and ``rk``: the layout-0 RoPE programs (also the
+        merged layouts' without a per-head q / k norm)."""
         cfg = self.cfg
         nh, nkv, hd, kvd = cfg.nh, cfg.nkv, cfg.hd, cfg.kvd
         w = f"L{li}"
-        A = self._acts(st, w)
-        D = os.path.join(self.out, st, w)
-        C = os.path.join(self.out, "cal", st, w)
-        os.makedirs(D, exist_ok=True)
-        g1, g2 = cfg.gains(li)
         shared_first = st == "first" and cfg.first_pos == 0
-        ml = {}
-        x = A["x"].astype(F32)
-        self.two_pass(C, D, "n1", x, g1, ml)
-        wq = cfg.merged_weight("qkv5", li)
-        ml["qkv5"] = self.lin(
-            st, li, "qkv5", f"{D}/qkv5.axmodel", wq, "a", ["qp", "kp", "vp"]
-        )
-        offs = pf_model.lay.offsets(cfg.QKV)
-        ml["qkv5"]["parts"] = {k: dict(col=offs[k], n=n) for k, n in cfg.QKV}
         # with qk_norm the layer's q / k gains are folded into the tables
         tiles = [cfg.rope_tiles(int(p), li) for p in A["p"]]
         rope_t = "qkrope" if cfg.qk_norm else "rope"
@@ -1120,6 +1106,33 @@ class Generator:
                     "sn": tl[1] * 2,
                 },
             )
+
+    def _rope(self, st, li, A, C, D, ml):
+        """The merged layouts' RoPE: ``qk`` with a per-head q / k norm, else
+        ``rq`` and ``rk``."""
+        if self.cfg.qk_norm:
+            self.qk(st, li, C, D, A, ml)
+        else:
+            self._rope_programs(st, li, A, C, D, ml)
+
+    def layer(self, st, li, man):
+        cfg = self.cfg
+        w = f"L{li}"
+        A = self._acts(st, w)
+        D = os.path.join(self.out, st, w)
+        C = os.path.join(self.out, "cal", st, w)
+        os.makedirs(D, exist_ok=True)
+        g1, g2 = cfg.gains(li)
+        ml = {}
+        x = A["x"].astype(F32)
+        self.two_pass(C, D, "n1", x, g1, ml)
+        wq = cfg.merged_weight("qkv5", li)
+        ml["qkv5"] = self.lin(
+            st, li, "qkv5", f"{D}/qkv5.axmodel", wq, "a", ["qp", "kp", "vp"]
+        )
+        offs = pf_model.lay.offsets(cfg.QKV)
+        ml["qkv5"]["parts"] = {k: dict(col=offs[k], n=n) for k, n in cfg.QKV}
+        self._rope_programs(st, li, A, C, D, ml)
         self._attn_mlp(st, li, A, C, D, ml)
         man[w] = ml
 

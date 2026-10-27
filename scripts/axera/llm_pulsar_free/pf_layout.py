@@ -89,13 +89,17 @@ LAYER_FUSED5 = ["attn", "on2g", "dnqk"]
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
     if fuse >= 2:
-        if not qk_norm:
-            raise NotImplementedError("fuse=2 without a per-head q / k norm")
+        if not qk_norm and fuse >= 4:
+            raise NotImplementedError(f"fuse={fuse} without a per-head q / k norm")
         if fuse >= 5:
             return list(LAYER_FUSED5)
         if fuse >= 4:
             return list(LAYER_FUSED4)
-        return list(LAYER_FUSED3 if fuse >= 3 else LAYER_FUSED2)
+        progs = list(LAYER_FUSED3 if fuse >= 3 else LAYER_FUSED2)
+        if not qk_norm:
+            i = progs.index("qk")
+            progs[i : i + 1] = ["rq", "rk"]
+        return progs
     if fuse:
         progs = list(LAYER_FUSED)
         if not qk_norm:

@@ -633,6 +633,15 @@ def needed(cfg) -> list[str]:
             names += [f"lanorm{qd}", f"lanorm{inter}"]
         if cfg.fuse >= 3:
             names += [f"slanorm{inter}"]
+        qkv = sum(n for _, n in cfg.QKV)
+        if cfg.fuse == 4:
+            names += [
+                f"nrml{qkv}",
+                f"lanorml{qd}x{2 * inter}",
+                f"slanorml{inter}x{qkv}",
+            ]
+        if cfg.fuse >= 5:
+            names += [f"lanorml{qd}x{2 * inter}", f"nrmqk{H}", f"slanormqk{inter}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]
