@@ -73,7 +73,7 @@ MODELS = {
         zero_pos0=False,
         share_linears=True,
         split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
-        fuse=3,
+        fuse=5,
     ),
 }
 #: share a linear between the sets when the first set's ranges are within this factor
