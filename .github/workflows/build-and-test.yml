@@ -36,7 +36,7 @@ jobs:
       # linux/aarch64 wheel -- manylinux_2_38, newer glibc than this job's
       # manylinux_2_28 image provides -- was never actually a concern for that
       # job specifically: it doesn't install z3-solver at all).
-      CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors
+      CIBW_TEST_REQUIRES: pytest pytest-xdist flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors
       CIBW_BEFORE_TEST: pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
       # The axera/quantization/pruning suites (tests/test_axera_*.py,
       # tests/test_axelera_*.py, tests/test_pulsar2_*.py,
@@ -87,7 +87,9 @@ jobs:
             # free-threaded runner (SIGKILL / exit 137), just as it does on the
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
             # same test still runs on the cp311-cp313 jobs (cp311/cp312 on PRs).
-            pytest_args: '-k "not test_ext"'
+            # Free-threaded tests run ~3x slower per test than cp312 and this
+            # leg is the PR critical path: spread them over the runner's cores.
+            pytest_args: '-n auto -k "not test_ext"'
         # macOS and linux/aarch64 runners are the slowest/most contended in
         # this matrix; a pull request only needs one build on each to confirm
         # the platform still works, so drop them down to the oldest supported
