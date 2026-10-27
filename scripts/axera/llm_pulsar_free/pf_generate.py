@@ -114,8 +114,9 @@ class Generator:
         return self._retarget_fused(dst, name, model, q)
 
     def _retarget_fused(self, dst, name, model, q):
-        """The program of fused graph ``model`` at calibration ``q``, from the
-        first template variant (``<name>/v*``, then ``<name>t/v*``) that accepts it."""
+        """The program of fused graph ``model`` at calibration ``q`` (or a
+        function of the template directory giving it), from the first template
+        variant (``<name>/v*``, then ``<name>t/v*``) that accepts it."""
         refused = []
         tdirs = []
         for nm in (name, name + "t"):
@@ -132,7 +133,8 @@ class Generator:
             if not os.path.exists(axm):
                 continue
             try:
-                m = ur.retarget_graph(axm, model, ur.quant_of(tdir), q)
+                qt = q(tdir) if callable(q) else q
+                m = ur.retarget_graph(axm, model, ur.quant_of(tdir), qt)
             except ValueError as e:
                 refused.append(f"{self._rel(tdir, self.root)}: {str(e)[:90]}")
                 continue
@@ -142,7 +144,7 @@ class Generator:
                 op=name,
                 template=self._rel(tdir, self.root),
                 model=self._rel(model),
-                calibration=q,
+                calibration=qt,
                 signed=sorted(signed_inputs(model)),
                 bytes=os.path.getsize(dst),
                 refused=refused,
@@ -315,22 +317,54 @@ class Generator:
                 q[i.name] = ur.unsigned_minmax(a.min(), a.max())
         return ur.propagate(model, q)
 
-    def merged(self, C, D, key, name, rgs, ml, extra=None, tie=()):
-        """Retarget merged program ``name`` at the union of its parts' ranges.
-        Each pair in ``tie`` gets one calibration (the union of both ranges):
-        a Div by an RMS of already normalized values (``d = u / r``, r ~ 1)
-        has its output's zero point equal to its input's in every template,
-        and a record holding the one zero point cannot be told apart, so the
-        target has to keep them equal too."""
+    #: a tie may widen a tensor's range at most this much (else the template is refused)
+    TIE_MAX = 4.0
+
+    def _tied(self, rg, model, tq):
+        """Ranges with every group of tensors that share one calibration in
+        template calibration ``tq`` given one range (the union): Pulsar2 leaves
+        out a write of the value a register already holds, so where a template
+        has two tensors at one scale or zero point (``d = u / r`` with r ~ 1:
+        ``u`` and ``d``; ``mean(u^2)``, ``+ eps`` and its ``Sqrt`` of
+        normalized ``u``), its records cannot carry two different values."""
+        consts = {i.name for i in model.graph.initializer}
+        groups: dict = {}
+        for t, (sc, zp) in ur.propagate(model, tq).items():
+            if t in rg and t not in consts:
+                groups.setdefault(("s", sc), set()).add(t)
+                if zp > 255:
+                    groups.setdefault(("zp", zp), set()).add(t)
+        rg = {k: list(v) for k, v in rg.items()}
+        for g in groups.values():
+            if len(g) < 2:
+                continue
+            u = self._union(*({t: rg[t]} for t in g))
+            lo = min(r[0] for r in u.values())
+            hi = max(r[1] for r in u.values())
+            for t in g:
+                span = max(rg[t][1], 0) - min(rg[t][0], 0)
+                if (max(hi, 0) - min(lo, 0)) > self.TIE_MAX * max(span, 1e-30):
+                    raise ValueError(
+                        f"template ties {sorted(g)}: {t}'s range would widen past "
+                        f"{self.TIE_MAX}x"
+                    )
+            for t in g:
+                rg[t] = [lo, hi]
+        return rg
+
+    def merged(self, C, D, key, name, rgs, ml, extra=None):
+        """Retarget merged program ``name`` at the union of its parts' ranges,
+        with the tensors the template calibrates alike tied (``_tied``)."""
         d = os.path.join(C, key)
         os.makedirs(d, exist_ok=True)
         model = os.path.join(d, "model.onnx")
         fm = tpl.float_graph(name, tpl.Dims.of(self.cfg))
         onnx.save(fm, model)
         rg = self._union(*rgs)
-        for a, b in tie:
-            rg[a] = rg[b] = self._union({a: rg[a]}, {a: rg[b]})[a]
-        q = self._calib(rg, fm)
+
+        def q(tdir):
+            return self._calib(self._tied(rg, fm, ur.quant_of(tdir)), fm)
+
         e = self._retarget_fused(os.path.join(D, f"{key}.axmodel"), name, model, q)
         e.update(extra or {})
         ml[key] = e
@@ -382,7 +416,6 @@ class Generator:
             rgs,
             ml,
             dict(u_absmax=float(np.abs(u).max())),
-            [("u", "d")],
         )
 
     def qk(self, st, li, C, D, A, ml):
@@ -457,7 +490,6 @@ class Generator:
             [rq, rkc, rk],
             ml,
             dict(u_absmax=float(np.abs(uk).max())),
-            [("kt", "ykh")],
         )
 
     def layer_fused(self, st, li, man):

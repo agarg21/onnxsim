@@ -460,51 +460,16 @@ def _core_jobs(template) -> int:
 MIN_CALIB_REG = 0x0F00
 
 
-def _max_assignment(score: np.ndarray) -> list[int]:
-    """Column of each row in the one-to-one assignment of a square ``score``
-    matrix with the largest total (Hungarian method, O(n^3))."""
-    n = len(score)
-    cost = score.max() - np.asarray(score, np.float64)
-    u, v = np.zeros(n + 1), np.zeros(n + 1)
-    p, way = np.zeros(n + 1, int), np.zeros(n + 1, int)  # p[col] = row (1-based)
-    for i in range(1, n + 1):
-        p[0], j0 = i, 0
-        minv, used = np.full(n + 1, np.inf), np.zeros(n + 1, bool)
-        while True:
-            used[j0] = True
-            i0, delta, j1 = p[j0], np.inf, 0
-            for j in range(1, n + 1):
-                if not used[j]:
-                    cur = cost[i0 - 1, j - 1] - u[i0] - v[j]
-                    if cur < minv[j]:
-                        minv[j], way[j] = cur, j0
-                    if minv[j] < delta:
-                        delta, j1 = minv[j], j
-            for j in range(n + 1):
-                if used[j]:
-                    u[p[j]] += delta
-                    v[j] -= delta
-                else:
-                    minv[j] -= delta
-            j0 = j1
-            if p[j0] == 0:
-                break
-        while j0:
-            j1 = way[j0]
-            p[j0] = p[j1]
-            j0 = j1
-    col = [0] * n
-    for j in range(1, n + 1):
-        col[p[j] - 1] = j - 1
-    return col
-
-
-def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
+def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
     """CORE job j -> node ``n<i>``, one job per compute node. Pulsar2 orders
     the jobs topologically, not in ONNX node order (a fused q / k norm + RoPE
-    runs ``x * x`` first), so each job is given the node whose template
-    formulas explain most of its calibration records (best one-to-one
-    assignment, ``_max_assignment``; ONNX order among equals)."""
+    runs ``x * x`` first). The assignment is the topological order of the
+    graph whose nodes' template formulas explain most of the jobs'
+    calibration records in total (dynamic programming over the sets of
+    computed nodes; ONNX order among equals). Restricting it to topological
+    orders matters when tensors share a calibration (a Div by an RMS of
+    normalized values, ``d = u / r``: ``u`` and ``d`` alike, ``m``, ``e``
+    and ``r`` alike): a score alone then puts a Div before its Sqrt."""
     cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
     by_node: dict[str, set[int]] = {}
     for k, v in ct.items():
@@ -520,11 +485,36 @@ def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
         ]
         for c, i in enumerate(comp):
             score[j, c] = sum(v in by_node.get(f"n{i}", ()) for v in vals)
-    # ties: the job and node closest in order (a fraction of one matching record)
-    n = len(comp)
-    order = np.abs(np.arange(n)[:, None] - np.arange(n)[None, :]) / (4.0 * n * n)
-    best = _max_assignment(score - order)
-    return {j: f"n{comp[best[j]]}" for j in range(len(cores))}
+    # tensor -> the compute node that produces it (through data-movement nodes)
+    prod: dict[str, int | None] = {}
+    for i, (op, ins, out, _) in enumerate(nodes or []):
+        prod[out] = prod.get(ins[0]) if op in PASS_THROUGH else i
+    deps = {
+        i: {prod[t] for t in nodes[i][1] if prod.get(t) is not None} if nodes else set()
+        for i in comp
+    }
+    # best total over topological orders: DP over the sets of computed nodes
+    # (order ideals of the graph); ties to the lexicographically first ONNX order
+    states: dict[frozenset, tuple[float, tuple]] = {frozenset(): (0.0, ())}
+    for j in range(len(cores)):
+        nxt: dict[frozenset, tuple[float, tuple]] = {}
+        for done, (sc, path) in states.items():
+            ready = [c for c, i in enumerate(comp) if i not in done and deps[i] <= done]
+            for c in ready:
+                key = done | {comp[c]}
+                cand = (sc + score[j, c], path + (c,))
+                best = nxt.get(key)
+                if (
+                    best is None
+                    or cand[0] > best[0]
+                    or (cand[0] == best[0] and cand[1] < best[1])
+                ):
+                    nxt[key] = cand
+        if not nxt:  # the jobs are not a topological order of this graph
+            raise ValueError("no topological order of the graph fits the CORE jobs")
+        states = nxt
+    _, path = max(states.values(), key=lambda v: (v[0], [-c for c in v[1]]))
+    return {j: f"n{comp[c]}" for j, c in enumerate(path)}
 
 
 def _check_add_shift_writes(main, nodes, assign, cn) -> None:
@@ -592,7 +582,7 @@ def retarget_graph(
     main = _segs(gs.load_model(template))[gs.MAIN]
     comp = [i for i, n in enumerate(nodes) if n[0] not in PASS_THROUGH]
     strict = _core_jobs(template) == len(comp)
-    assign = _assign_core_jobs(main, comp, ct) if strict else {}
+    assign = _assign_core_jobs(main, comp, ct, nodes) if strict else {}
     if strict:
         _check_add_shift_writes(main, nodes, assign, cn)
 
