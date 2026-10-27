@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `fb11baa2a` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `3127209b8` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1236,3 +1236,29 @@ What remains in the decoder:
 - the attention's exp, 3.0 ms;
 - fp32 -> fp16 casts in front of each projection, ~1.3 ms, and the attention's block transposes, ~1.7 ms. Both are
   DDR-bound copies that only multi-output kernels could fuse away.
+
+**Data-dependent skipping in generated kernels.** The generated MSDA had no way to skip work. The hand kernel builds, per
+query, the list of cameras that see it; BEVFormer's cameras see 19% of the (camera, query) pairs (2129 of the 2500 queries
+are seen by one camera, 367 by two). The generated spatial cross-attention computed all six and multiplied by the mask.
+The code generator now supports data-dependent skipping (`GATED_REDUCE`, on by default, generic):
+- A sum over a loop of `where(g, t, 0)`, with `g` the same in every lane of a step, accumulates `t` under `g`: a gated
+  accumulator store, an `IF` once linearized. This also applies when the term sits under a sum of unrolled terms.
+- After linearizing, `sink_into_ifs` merges adjacent `IF` blocks under one gate (a vector store split into per-lane stores).
+  It also moves into each `IF` the pure ops and loads of its own scope that only the block uses, so `t` is not computed when
+  `g` is false.
+- Memory coalescing groups gated stores by their gate, and a store's gate gets its load.
+
+The generated MSDA (`HAND_MSDA=0`) now sums `where(visible[camera, query], term, 0)` over cameras and points, all cameras in
+one GridSample. The cross-attention kernel's whole body runs inside `if (visible)`, and its accumulate is again one vector add
+(the masked select had split the term into 32 scalar lanes).
+
+| | before | now | hand MSDA (default) |
+|---|---:|---:|---:|
+| spatial cross-attention, per encoder layer | 61.4 ms | 21.1 ms | ~4.3 ms |
+| encoder, 1 layer, generated MSDA | 83.8 ms | 43.2 ms | 15.5 ms |
+| encoder, 3 layers, generated MSDA | 248.9 ms | 121.2 ms | 46.1 ms |
+
+All pass against onnxruntime; the default build (hand MSDA) is unchanged. The hand kernel stays the default. The generated one
+still computes each tap's location, floor and bilinear weights in scalar code, while the hand kernel does 32 sampling points
+per vector. That is the next step toward parity, and the temporal self-attention (no mask, 14 ms per layer generated vs ~3.3
+hand) needs it too.
