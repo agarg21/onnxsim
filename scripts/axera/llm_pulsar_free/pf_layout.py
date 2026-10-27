@@ -72,12 +72,22 @@ POST_FUSED = ["nf", "lm_head"]
 LAYER_FUSED2 = ["qkv5", "qk", "attn", "on2", "gu", "silu_f", "dn"]
 #: ``fuse=3``: ``dn`` also holds the fused SiLU (``silu_f``) before ``down_proj``
 LAYER_FUSED3 = ["qkv5", "qk", "attn", "on2", "gu", "dn"]
+#: ``fuse=4``: the linear after each norm joins it too. ``on2g``: ``on2`` +
+#: ``gu`` (outputs the residual and gate | up); ``dnq``: ``dn`` + the next
+#: layer's ``qkv5`` (outputs the residual and the next q / k / v). Layer 0
+#: starts with ``n1q`` (first norm + ``qkv5``); the last layer ends with ``dn``
+#: (the final norm), ``lm_head`` alone. A split first-set layer keeps ``on2``,
+#: ``gu``, ``silu_f``, ``down_proj`` and an Add + norm ``dn``, and the layer
+#: after it a ``qkv5`` of its own (``pf_model.Config.programs``).
+LAYER_FUSED4 = ["qk", "attn", "on2g", "dnq"]
 
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
     if fuse >= 2:
         if not qk_norm:
             raise NotImplementedError("fuse=2 without a per-head q / k norm")
+        if fuse >= 4:
+            return list(LAYER_FUSED4)
         return list(LAYER_FUSED3 if fuse >= 3 else LAYER_FUSED2)
     if fuse:
         progs = list(LAYER_FUSED)

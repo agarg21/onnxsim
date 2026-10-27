@@ -177,8 +177,63 @@ class Chain:
             return f("dn")(a=x1, b=f("down_proj")(act), g=gn)
         return f("dn")(z=act, a=x1, g=gn)
 
+    def layer_fused4(self, li, x, K, V, p):
+        """A layer of the ``fuse=4`` layout. ``x``: the embedding row (layer 0)
+        or the previous layer's ``{"x": residual, "a": normed | "y5": q / k / v}``;
+        returns this layer's."""
+        cfg = self.cfg
+        nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
+        wh = f"L{li}"
+
+        def f(k):
+            return self.f[(wh, k)]
+
+        t = cfg.rope_tiles(p, li)
+        g1, g2 = cfg.gains(li)
+        if not isinstance(x, dict):
+            x = {"x": x, "y5": f("n1q")(x=x, g=g1)}
+        res = x["x"]
+        y5 = x["y5"] if "y5" in x else f("qkv5")(x["a"])
+        o = lay.offsets(cfg.QKV)
+
+        def sl(k, n):
+            return y5[:, o[k] : o[k] + n]
+
+        qr, kr = f("qk")(
+            q=sl("q_proj", nh * hd),
+            qr=sl("q_rot", nh * hd),
+            k=sl("k_proj", kvd),
+            kr=sl("k_rot", kvd),
+            cq=t["cos_q"],
+            sq=t["sin_q"],
+            ck=t["cos_k"],
+            sk=t["sin_k"],
+        )
+        K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
+        att = f("attn")(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
+        if (wh, "on2g") in self.f:
+            x1, gu = f("on2g")(z=att, a=res, g=g2)
+        else:
+            x1, m = f("on2")(z=att, a=res, g=g2)
+            gu = f("gu")(m)
+        og = lay.offsets(cfg.GU)
+        gate = gu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
+        up = gu[:, og["up_proj"] : og["up_proj"] + cfg.I]
+        gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
+        if (wh, "down_proj") in self.f:
+            dn = f("down_proj")(f("silu_f")(gate=gate, up=up))
+            xn, a = f("dn")(a=x1, b=dn, g=gn)
+            return {"x": xn, "a": a}
+        if (wh, "dnq") in self.f:
+            xn, y5n = f("dnq")(gate=gate, up=up, a=x1, g=gn)
+            return {"x": xn, "y5": y5n}
+        xn, a = f("dn")(gate=gate, up=up, a=x1, g=gn)
+        return {"x": xn, "a": a}
+
     def layer(self, li, x, K, V, p):
         cfg = self.cfg
+        if cfg.fuse >= 4:
+            return self.layer_fused4(li, x, K, V, p)
         if cfg.fuse >= 2:
             return self.layer_fused2(li, x, K, V, p)
         if cfg.fuse:
@@ -221,6 +276,8 @@ class Chain:
         return f("res2")(x1, f("down_proj")(act))
 
     def post(self, x):
+        if self.cfg.fuse >= 4:
+            return self.f[("post", "lm_head")](x["a"]).reshape(-1)
         if self.cfg.fuse >= 2:
             return self.f[("post", "lm_head")](x[1]).reshape(-1)
         if self.cfg.fuse:

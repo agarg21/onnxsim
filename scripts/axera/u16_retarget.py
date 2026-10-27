@@ -305,8 +305,8 @@ def _rewrite(template, ct, cn, allowed, n_core=None, fixed=None) -> onnx.ModelPr
     matches one candidate of ``ct`` (allowed by ``allowed(tag, name, reg)``,
     ``tag`` one of QUANT, DEQUANT, PARAM, CORE<i> (the i-th CORE job of the
     main engine) or OTHER (other segments)) with its ``cn`` value, then
-    apply Pulsar2's write elision and re-pad the segments. ``fixed``: a
-    ``(start, end)`` byte range of ``npu_params`` left as it is (a weight table)."""
+    apply Pulsar2's write elision and re-pad the segments. ``fixed``:
+    ``(start, end)`` byte ranges of ``npu_params`` left as they are (weight tables)."""
     model = gs.load_model(template)
     by_val: dict[int, list[str]] = {}
     for k, v in sorted(ct.items()):
@@ -370,7 +370,7 @@ def _rewrite(template, ct, cn, allowed, n_core=None, fixed=None) -> onnx.ModelPr
     if params is not None:
         p = bytearray(params.raw_data)
         for off in range(0, len(p) - 3, 2):
-            if fixed is not None and off + 4 > fixed[0] and off < fixed[1]:
+            if any(off + 4 > a and off < b for a, b in fixed or ()):
                 continue
             val = struct.unpack_from("<I", p, off)[0]
             names = [
@@ -585,8 +585,6 @@ def retarget_graph(
     # a MatMul by a constant is a FullyConnected: no main-engine CORE job of its
     # own; its weights / requantization are a table in npu_params (_linear_table)
     fc = [i for i, n in enumerate(nodes) if n[0] == "MatMul" and n[1][1] in consts]
-    if len(fc) > 1:
-        raise ValueError("more than one constant-weight MatMul")
     for i in fc:
         nodes[i] = ("FullyConnected", nodes[i][1][:1], nodes[i][2], {})
         # the weights carry no calibration record (the table has them)
@@ -628,45 +626,60 @@ def retarget_graph(
 
     if not fc:
         return _rewrite(template, ct, cn, allowed)
-    x, y = nodes[fc[0]][1][0], nodes[fc[0]][2]
-    wname = m.graph.node[fc[0]].input[1]
     tmodel = gs.load_model(template)
-    tw = _template_weight(template, wname)
-    w = onnx.numpy_helper.to_array(
-        next(i for i in m.graph.initializer if i.name == wname)
-    )
-    if weights is not None:
-        w = np.asarray(weights, F)
-    old_tab = le.linear_params_u16(
-        b"", tw, *template_q[x], *template_q[y], table_only=True
-    )
     tp = bytes(
         next(i for i in tmodel.graph.initializer if i.name == "npu_params").raw_data
     )
-    at = tp.find(old_tab)
-    if at < 0 or tp.find(old_tab, at + 1) >= 0:
-        raise ValueError("the template's weight table is not found exactly once")
-    res = _rewrite(template, ct, cn, allowed, fixed=(at, at + len(old_tab)))
+    tables, zps = [], {}
+    for i in fc:
+        x, y = nodes[i][1][0], nodes[i][2]
+        wname = m.graph.node[i].input[1]
+        w = onnx.numpy_helper.to_array(
+            next(t for t in m.graph.initializer if t.name == wname)
+        )
+        if weights is not None:
+            w = weights[wname] if isinstance(weights, Mapping) else weights
+        old_tab = le.linear_params_u16(
+            b"",
+            _template_weight(template, wname),
+            *template_q[x],
+            *template_q[y],
+            table_only=True,
+        )
+        at = tp.find(old_tab)
+        if at < 0 or tp.find(old_tab, at + 1) >= 0:
+            raise ValueError(f"{wname}: the template's weight table is not found once")
+        new_tab = le.linear_params_u16(
+            b"", np.asarray(w, F), *target_q[x], *target_q[y], table_only=True
+        )
+        tables.append((at, at + len(old_tab), new_tab))
+        tz, nz = template_q[x][1], target_q[x][1]
+        if zps.get(tz, nz) != nz:
+            raise ValueError(
+                f"two linears' inputs share zero point {tz} in the template: their "
+                f"core {le.REG_CORE_ZP_X:#06x} records cannot be told apart"
+            )
+        zps[tz] = nz
+    res = _rewrite(template, ct, cn, allowed, fixed=[t[:2] for t in tables])
     params = next(i for i in res.graph.initializer if i.name == "npu_params")
-    new_tab = le.linear_params_u16(b"", w, *target_q[x], *target_q[y], table_only=True)
-    p = bytes(params.raw_data)
-    params.raw_data = p[:at] + new_tab + p[at + len(new_tab) :]
-    # the core's copy of zp_x (low half of 0x03d0, outside the main engine)
-    segs, hits = _segs(res), 0
+    p = bytearray(params.raw_data)
+    for a, b, tab in tables:
+        p[a:b] = tab
+    params.raw_data = bytes(p)
+    # each linear's core copy of zp_x (low half of 0x03d0, outside the main engine)
+    segs, hits = _segs(res), dict.fromkeys(zps, 0)
     for si, seg in enumerate(segs):
         if si == gs.MAIN:
             continue
         for i, r in enumerate(seg):
-            if (
-                r[0] == gs.A1
-                and gs._reg(r) == le.REG_CORE_ZP_X
-                and gs._val(r) & 0xFFFF == template_q[x][1]
-            ):
-                v = (gs._val(r) & 0xFFFF0000) | target_q[x][1]
-                seg[i] = gs._rec(gs.A1, le.REG_CORE_ZP_X, v)
-                hits += 1
-    if not hits:
-        raise ValueError(f"no core {le.REG_CORE_ZP_X:#06x} record holds zp_x")
+            if r[0] == gs.A1 and gs._reg(r) == le.REG_CORE_ZP_X:
+                tz = gs._val(r) & 0xFFFF
+                if tz in zps:
+                    v = (gs._val(r) & 0xFFFF0000) | zps[tz]
+                    seg[i] = gs._rec(gs.A1, le.REG_CORE_ZP_X, v)
+                    hits[tz] += 1
+    if not all(hits.values()):
+        raise ValueError(f"no core {le.REG_CORE_ZP_X:#06x} record holds a linear's zp_x")
     return wr.with_segments(res, segs)
 
 

@@ -16,7 +16,8 @@ is emitted from or fed with.
   layer), ``1`` residual Add + two-pass norm and q / k RoPE + k norm merged
   (``LAYER_FUSED``, 9), ``2`` also ``o_proj`` / ``down_proj`` into the Add +
   norm after them (``LAYER_FUSED2``, 7), ``3`` also the SiLU before
-  ``down_proj`` (``LAYER_FUSED3``, 6).
+  ``down_proj`` (``LAYER_FUSED3``, 6), ``4`` also the linear after each norm
+  (``LAYER_FUSED4``, 4).
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -186,6 +187,16 @@ class Config:
         if wh == "post":
             return list(self.post_programs)
         progs = list(self.layer_programs)
+        if self.fuse >= 4:
+            li = int(wh[1:])
+            split = self.is_split(st, li, "down_proj")
+            head = ["n1q"] if li == 0 else []
+            if li > 0 and self.is_split(st, li - 1, "down_proj"):
+                head = ["qkv5"]
+            tail = ["on2g", "dnq" if li + 1 < self.L else "dn"]
+            if split:
+                tail = ["on2", "gu", "silu_f", "down_proj", "dn"]
+            return head + ["qk", "attn"] + tail
         if self.fuse >= 2:
             li = int(wh[1:])
             if li == 0:
