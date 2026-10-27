@@ -196,3 +196,30 @@ What didn't help:
 - a TURBO clock vote;
 - more than 4 threads;
 - specializing `M = 8` at compile time.
+
+**Tap tables (2026-10, in BEVFormer through tools/onnx-remote).** In hexagon-sim timing mode
+(`--timing`; the plain mode counts instructions, not stalls), the TSA shape took 89 cycles per point,
+and 43 of them were one chain. The accumulate reads each tap's row offset from a table the HVX had
+just written; the row load waits on that scalar read. These shortened it:
+- **Two points' offsets and weights per 64-bit load.** Half the table reads.
+- **One window per point** (one level of at least 2 x 2, fp32). Each point reads the 2 x 2 window
+  `[bx, bx + 1] x [by, by + 1]` inside the map, where `bx = clamp(x0, 0, W - 2)`. At a border the
+  corners' weights move with the window; a corner outside the map has weight 0 already. Its rows are
+  then `o, o + C, o + W C, o + (W + 1) C`, so the table holds one offset per point instead of four.
+- **Offsets and weights of the queries 8 to 15 ahead, L2-prefetched.** Each thread walks a contiguous
+  query range. It issues one box at a time: an l2fetch issued while another is in flight replaces it.
+
+hexagon-sim timing, cycles per point: TSA 89 -> 75, SCA 97 -> 78. All eight case kinds pass against
+torch (fp32 / uint8, RT-DETR's 3 levels, BEVFormer's TSA / SCA). On the phone, in BEVFormer through
+onnx-remote (the table below predates this), per call:
+- decoder 848 -> 542 us;
+- over the 3 encoder layers: SCA 12.9 -> 9.9 ms, TSA 9.8 -> 6.8 ms.
+
+These didn't help, in hexagon-sim timing:
+- prefetching the tables into L1;
+- eight independent chains (two heads at once);
+- copying the tables with scalar stores;
+- reading the offsets with `vextract`;
+- a fully unrolled head (phone: within noise).
+Putting the offsets, weights and output in VTCM sped the decoder's call up (587 -> 531 us), but the
+buffers it displaced cost the rest of the decoder as much.
