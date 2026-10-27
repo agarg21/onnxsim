@@ -82,7 +82,8 @@ class FusedEval:
             )
             for n in m.graph.node
         ]
-        self.out = m.graph.output[0].name
+        self.outs = [o.name for o in m.graph.output]
+        self.out = self.outs[0]
         self.cal = {k: tuple(v) for k, v in calib.items()}
         self.signed = set(signed)
 
@@ -91,7 +92,15 @@ class FusedEval:
             return fq(a, self.cal[name], name in self.signed)
         return np.asarray(a, np.float64)
 
-    def __call__(self, **feeds) -> np.ndarray:
+    def __call__(self, **feeds):
+        """The output (a tuple of the outputs, in graph order, for several)."""
+        v = self.trace(**feeds)
+        if len(self.outs) > 1:
+            return tuple(v[o].astype(F32) for o in self.outs)
+        return v[self.out].astype(F32)
+
+    def trace(self, **feeds) -> dict:
+        """Every tensor of the graph (float64), inputs and constants included."""
         v = {
             k: (a.astype(np.float64) if a.dtype.kind == "f" else a)
             for k, a in self.consts.items()
@@ -101,7 +110,7 @@ class FusedEval:
         for op, ins, o, at in self.nodes:
             # an operand quantized for a consumer MatMul (signed) is rounded where it is produced
             v[o] = self._r(o, _node(op, [v[i] for i in ins], at))
-        return v[self.out].astype(F32)
+        return v
 
 
 def s8_weights(w) -> np.ndarray:

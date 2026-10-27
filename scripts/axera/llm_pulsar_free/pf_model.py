@@ -10,7 +10,13 @@ is emitted from or fed with.
 * ``LLM_PF_OUT``: the output directory of the pipeline (default
   ``llm_pulsar_free_out/<MODEL>`` under the current directory);
 * ``GPTQ=1``: linear programs are emitted from ``<out>/gptq/*.npz``
-  (``pf_gptq.py``) instead of round-to-nearest.
+  (``pf_gptq.py``) instead of round-to-nearest;
+* ``LLM_PF_FUSE``: the program layout (``pf_layout``), default the model's
+  ``fuse``: ``0`` one program per step (``LAYER``, 15 executes per Qwen3
+  layer), ``1`` residual Add + two-pass norm and q / k RoPE + k norm merged
+  (``LAYER_FUSED``, 9), ``2`` also ``o_proj`` / ``down_proj`` into the Add +
+  norm after them (``LAYER_FUSED2``, 7), ``3`` also the SiLU before
+  ``down_proj`` (``LAYER_FUSED3``, 6).
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -65,6 +71,7 @@ MODELS = {
         zero_pos0=False,
         share_linears=True,
         split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
+        fuse=3,
     ),
 }
 #: share a linear between the sets when the first set's ranges are within this factor
@@ -97,6 +104,7 @@ class Config:
         gptq: bool = False,
         tokenizer_dir: str | None = None,
         seq: int = lay.S,
+        fuse: int = 0,
     ):
         self.model, self.name, self.out = model, name, out
         self.L, self.H, self.hd = model.L, model.H, model.hd
@@ -116,7 +124,10 @@ class Config:
         self.ln_f = model.weight("model.norm.weight").astype(F32).reshape(1, self.H)
         self.QKV = lay.qkv_parts(self.nh, self.hd, self.kvd, self.qk_norm)
         self.GU = lay.gu_parts(self.I)
-        self.layer_programs = lay.layer_programs(self.qk_norm)
+        self.fuse = int(fuse)
+        self.layer_programs = lay.layer_programs(self.qk_norm, self.fuse)
+        self.post_programs = lay.post_programs(self.fuse)
+        self.k_program = lay.k_program(self.qk_norm, self.fuse)
         self._lg: dict = {}
         self._post = ReferenceEvaluator(
             ld.make_graph(
@@ -169,6 +180,21 @@ class Config:
         pn = {k: np.asarray(v, F32) for k, v in pn.items()}
         pn["input"] = x
         return (pn["xn"].reshape(1, self.H) @ self.head_t).reshape(-1), pn
+
+    def programs(self, st: str, wh: str) -> list[str]:
+        """The programs of set ``st`` at ``wh`` (``L<i>`` or ``post``), in order."""
+        if wh == "post":
+            return list(self.post_programs)
+        progs = list(self.layer_programs)
+        if self.fuse >= 2:
+            li = int(wh[1:])
+            if li == 0:
+                progs.insert(0, "n1")
+            if self.is_split(st, li, "down_proj"):
+                split = ["silu_f", "down_proj"] if self.fuse >= 3 else ["down_proj"]
+                i = progs.index("dn")
+                progs[i:i] = split
+        return progs
 
     # ---- program inputs and weights ---------------------------------------------------
     def gains(self, li):
@@ -297,6 +323,8 @@ def load(name: str | None = None, out: str | None = None) -> Config:
         out or os.environ.get("LLM_PF_OUT") or os.path.join("llm_pulsar_free_out", name)
     )
     os.makedirs(out, exist_ok=True)
+    if os.environ.get("LLM_PF_FUSE"):
+        spec["fuse"] = int(os.environ["LLM_PF_FUSE"])
     return Config(
         ref.Model.load(snap),
         name=name,

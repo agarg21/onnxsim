@@ -66,7 +66,6 @@ all but one of those builds (a ReduceMean output scale two ulps off).
 from __future__ import annotations
 
 import io
-import itertools
 import json
 import os
 import struct
@@ -301,12 +300,13 @@ def _base(name: str) -> str:
     return name.split("|", 1)[-1]
 
 
-def _rewrite(template, ct, cn, allowed, n_core=None) -> onnx.ModelProto:
+def _rewrite(template, ct, cn, allowed, n_core=None, fixed=None) -> onnx.ModelProto:
     """Rewrite every A1 record and ``npu_params`` word of ``template`` that
     matches one candidate of ``ct`` (allowed by ``allowed(tag, name, reg)``,
     ``tag`` one of QUANT, DEQUANT, PARAM, CORE<i> (the i-th CORE job of the
     main engine) or OTHER (other segments)) with its ``cn`` value, then
-    apply Pulsar2's write elision and re-pad the segments."""
+    apply Pulsar2's write elision and re-pad the segments. ``fixed``: a
+    ``(start, end)`` byte range of ``npu_params`` left as it is (a weight table)."""
     model = gs.load_model(template)
     by_val: dict[int, list[str]] = {}
     for k, v in sorted(ct.items()):
@@ -370,6 +370,8 @@ def _rewrite(template, ct, cn, allowed, n_core=None) -> onnx.ModelProto:
     if params is not None:
         p = bytearray(params.raw_data)
         for off in range(0, len(p) - 3, 2):
+            if fixed is not None and off + 4 > fixed[0] and off < fixed[1]:
+                continue
             val = struct.unpack_from("<I", p, off)[0]
             names = [
                 n
@@ -440,7 +442,7 @@ def _graph_candidates(nodes, q) -> dict[str, int]:
     c = {}
     for i, (op, ins, out, attrs) in enumerate(nodes):
         sub = {t: q[t] for t in {*ins, out} if t in q}
-        if op in PASS_THROUGH:
+        if op in PASS_THROUGH or op == "FullyConnected":
             got = _tensor_candidates(sub)
         else:
             used = ins[:1] if op in UNARY else ins
@@ -459,19 +461,19 @@ def _core_jobs(template) -> int:
 #: offset) all sit at or above this; below it are source / destination address
 #: writes, which a candidate value can coincide with
 MIN_CALIB_REG = 0x0F00
-#: brute-force bound of the CORE job -> node assignment (8! permutations)
-MAX_ASSIGN = 8
 
 
-def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
+def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
     """CORE job j -> node ``n<i>``, one job per compute node. Pulsar2 orders
     the jobs topologically, not in ONNX node order (a fused q / k norm + RoPE
-    runs ``x * x`` first), so each job is given the node whose template
-    formulas explain most of its calibration records (best one-to-one
-    assignment; ONNX order among equals)."""
+    runs ``x * x`` first). The assignment is the topological order of the
+    graph whose nodes' template formulas explain most of the jobs'
+    calibration records in total (dynamic programming over the sets of
+    computed nodes; ONNX order among equals). Restricting it to topological
+    orders matters when tensors share a calibration (a Div by an RMS of
+    normalized values, ``d = u / r``: ``u`` and ``d`` alike, ``m``, ``e``
+    and ``r`` alike): a score alone then puts a Div before its Sqrt."""
     cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
-    if len(comp) > MAX_ASSIGN:
-        return {j: f"n{i}" for j, i in enumerate(comp)}
     by_node: dict[str, set[int]] = {}
     for k, v in ct.items():
         node, base = k.split("|", 1)
@@ -486,36 +488,70 @@ def _assign_core_jobs(main, comp, ct) -> dict[int, str]:
         ]
         for c, i in enumerate(comp):
             score[j, c] = sum(v in by_node.get(f"n{i}", ()) for v in vals)
-    best = max(
-        itertools.permutations(range(len(comp))),
-        key=lambda pm: sum(score[j, pm[j]] for j in range(len(cores))),
-    )
-    return {j: f"n{comp[best[j]]}" for j in range(len(cores))}
+    # tensor -> the compute node that produces it (through data-movement nodes)
+    prod: dict[str, int | None] = {}
+    for i, (op, ins, out, _) in enumerate(nodes or []):
+        if op in PASS_THROUGH:
+            prod[out] = prod.get(ins[0])
+        else:  # a FullyConnected runs outside the main engine's CORE jobs
+            prod[out] = None if op == "FullyConnected" else i
+    deps = {
+        i: {prod[t] for t in nodes[i][1] if prod.get(t) is not None} if nodes else set()
+        for i in comp
+    }
+    # best total over topological orders: DP over the sets of computed nodes
+    # (order ideals of the graph); ties to the lexicographically first ONNX order
+    states: dict[frozenset, tuple[float, tuple]] = {frozenset(): (0.0, ())}
+    for j in range(len(cores)):
+        nxt: dict[frozenset, tuple[float, tuple]] = {}
+        for done, (sc, path) in states.items():
+            ready = [c for c, i in enumerate(comp) if i not in done and deps[i] <= done]
+            for c in ready:
+                key = done | {comp[c]}
+                cand = (sc + score[j, c], path + (c,))
+                best = nxt.get(key)
+                if (
+                    best is None
+                    or cand[0] > best[0]
+                    or (cand[0] == best[0] and cand[1] < best[1])
+                ):
+                    nxt[key] = cand
+        if not nxt:  # the jobs are not a topological order of this graph
+            raise ValueError("no topological order of the graph fits the CORE jobs")
+        states = nxt
+    _, path = max(states.values(), key=lambda v: (v[0], [-c for c in v[1]]))
+    return {j: f"n{comp[c]}" for j, c in enumerate(path)}
 
 
 def _check_add_shift_writes(main, nodes, assign, cn) -> None:
-    """Refuse a template that elided an Add-shift write the target needs. Two
-    Adds at one shift share one ``0x1ea0`` write; a target whose Adds shift
-    differently needs both, and the elided one cannot be restored (the second
-    Add would run at the first one's shift)."""
-    cores = [(a, b) for role, a, b, _ in le._jobs(main) if role == "CORE"]
-    adds = sorted(j for j, n in assign.items() if nodes[int(n[1:])][0] == "Add")
-    need, cur = 0, None
-    for j in adds:
-        v = cn[f"{assign[j]}|add_shift@{ADD_SHIFT:#06x}"]
-        need, cur = need + (v != cur), v
-    have = sum(
-        1
-        for j in adds
-        for r in range(*cores[j])
-        if main[r][0] == gs.A1 and gs._reg(main[r]) == ADD_SHIFT
-    )
-    if need > have:
-        raise ValueError(
-            f"the template writes {ADD_SHIFT:#06x} {have} times, the target needs "
-            f"{need}: an elided Add-shift write; use a template whose Adds shift "
-            "differently"
-        )
+    """Refuse a template that elided an Add-shift write the target needs.
+    Pulsar2 writes ``0x1ea0`` in an Add's CORE job only when the register
+    does not already hold that Add's shift (PARAM jobs reset it to 0, other
+    jobs may write it too). Walking the main segment with the target's
+    shifts, an Add whose shift differs from the register's value needs a
+    write in its own job; when the template left it out, it cannot be
+    restored (the Add would run at the previous shift)."""
+    state, core = None, 0
+    for role, a, b, _ in le._jobs(main):
+        writes = [
+            gs._val(main[r])
+            for r in range(a, b)
+            if main[r][0] == gs.A1 and gs._reg(main[r]) == ADD_SHIFT
+        ]
+        node = None
+        if role == "CORE":
+            node, core = assign.get(core), core + 1
+        if node is not None and nodes[int(node[1:])][0] == "Add":
+            want = cn[f"{node}|add_shift@{ADD_SHIFT:#06x}"]
+            if want != state and not writes:
+                raise ValueError(
+                    f"the target's {node} Add needs {ADD_SHIFT:#06x} = {want} (the "
+                    f"register holds {state}): an elided Add-shift write in the "
+                    "template; use a template whose Adds shift differently"
+                )
+            state = want
+        elif writes:
+            state = writes[-1]
 
 
 def retarget_graph(
@@ -524,6 +560,7 @@ def retarget_graph(
     template_q: Mapping[str, tuple[float, int]],
     target_q: Mapping[str, tuple[float, int]],
     out: str | None = None,
+    weights=None,
 ) -> onnx.ModelProto:
     """``retarget`` for a fused program (several ops in one native build).
     ``model`` is its float graph; the calibrations cover every tensor, inner
@@ -537,22 +574,37 @@ def retarget_graph(
     Transpose quantizes its own output; a whole-layer attention with
     Reshapes), any node's formulas may sit in any CORE job and a QUANT job may
     hold any tensor's ``1 / s`` and zero point; a record matching two formulas
-    with different targets is still refused. The DEQUANT job holds the
-    output's ``s`` and zero point; PARAM jobs and the other segments any
+    with different targets is still refused. A DEQUANT job holds an
+    output's ``s`` and zero point (any graph output unless ``out`` names one); PARAM jobs and the other segments any
     node's. Records below ``MIN_CALIB_REG`` are never rewritten.
     Data-movement nodes (``PASS_THROUGH``) contribute per-tensor formulas
     only."""
     m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
     nodes = graph_nodes(m)
     consts = {i.name for i in m.graph.initializer}
+    # a MatMul by a constant is a FullyConnected: no main-engine CORE job of its
+    # own; its weights / requantization are a table in npu_params (_linear_table)
+    fc = [i for i, n in enumerate(nodes) if n[0] == "MatMul" and n[1][1] in consts]
+    if len(fc) > 1:
+        raise ValueError("more than one constant-weight MatMul")
+    for i in fc:
+        nodes[i] = ("FullyConnected", nodes[i][1][:1], nodes[i][2], {})
+        # the weights carry no calibration record (the table has them)
+        wn = m.graph.node[i].input[1]
+        template_q = {k: v for k, v in template_q.items() if k != wn}
+        target_q = {k: v for k, v in target_q.items() if k != wn}
     graph_ins = [i.name for i in m.graph.input if i.name not in consts]
-    out = out or m.graph.output[0].name
+    outs = {out} if out else {o.name for o in m.graph.output}
     template_q, target_q = propagate(m, template_q), propagate(m, target_q)
     ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
     main = _segs(gs.load_model(template))[gs.MAIN]
-    comp = [i for i, n in enumerate(nodes) if n[0] not in PASS_THROUGH]
+    comp = [
+        i
+        for i, n in enumerate(nodes)
+        if n[0] not in PASS_THROUGH and n[0] != "FullyConnected"
+    ]
     strict = _core_jobs(template) == len(comp)
-    assign = _assign_core_jobs(main, comp, ct) if strict else {}
+    assign = _assign_core_jobs(main, comp, ct, nodes) if strict else {}
     if strict:
         _check_add_shift_writes(main, nodes, assign, cn)
 
@@ -569,12 +621,64 @@ def retarget_graph(
                 }
             return base.split(":", 1)[0] in ("inv", "zp")
         if tag == "DEQUANT":
-            return base in (f"s:{out}", f"zp:{out}")
+            return base in {f"{p}:{o}" for o in outs for p in ("s", "zp")}
         if tag.startswith("CORE") and strict:
             return node == assign[int(tag[4:])]
         return True
 
-    return _rewrite(template, ct, cn, allowed)
+    if not fc:
+        return _rewrite(template, ct, cn, allowed)
+    x, y = nodes[fc[0]][1][0], nodes[fc[0]][2]
+    wname = m.graph.node[fc[0]].input[1]
+    tmodel = gs.load_model(template)
+    tw = _template_weight(template, wname)
+    w = onnx.numpy_helper.to_array(
+        next(i for i in m.graph.initializer if i.name == wname)
+    )
+    if weights is not None:
+        w = np.asarray(weights, F)
+    old_tab = le.linear_params_u16(
+        b"", tw, *template_q[x], *template_q[y], table_only=True
+    )
+    tp = bytes(
+        next(i for i in tmodel.graph.initializer if i.name == "npu_params").raw_data
+    )
+    at = tp.find(old_tab)
+    if at < 0 or tp.find(old_tab, at + 1) >= 0:
+        raise ValueError("the template's weight table is not found exactly once")
+    res = _rewrite(template, ct, cn, allowed, fixed=(at, at + len(old_tab)))
+    params = next(i for i in res.graph.initializer if i.name == "npu_params")
+    new_tab = le.linear_params_u16(b"", w, *target_q[x], *target_q[y], table_only=True)
+    p = bytes(params.raw_data)
+    params.raw_data = p[:at] + new_tab + p[at + len(new_tab) :]
+    # the core's copy of zp_x (low half of 0x03d0, outside the main engine)
+    segs, hits = _segs(res), 0
+    for si, seg in enumerate(segs):
+        if si == gs.MAIN:
+            continue
+        for i, r in enumerate(seg):
+            if (
+                r[0] == gs.A1
+                and gs._reg(r) == le.REG_CORE_ZP_X
+                and gs._val(r) & 0xFFFF == template_q[x][1]
+            ):
+                v = (gs._val(r) & 0xFFFF0000) | target_q[x][1]
+                seg[i] = gs._rec(gs.A1, le.REG_CORE_ZP_X, v)
+                hits += 1
+    if not hits:
+        raise ValueError(f"no core {le.REG_CORE_ZP_X:#06x} record holds zp_x")
+    return wr.with_segments(res, segs)
+
+
+def _template_weight(template, name) -> np.ndarray:
+    """The template build's own weights, from the ``model.onnx`` beside its ``out/``."""
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(template))), "model.onnx"
+    )
+    tm = onnx.load(path)
+    return onnx.numpy_helper.to_array(
+        next(i for i in tm.graph.initializer if i.name == name)
+    )
 
 
 def calibrate_graph(directory: str) -> dict[str, tuple[float, int]]:

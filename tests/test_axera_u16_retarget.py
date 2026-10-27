@@ -468,3 +468,86 @@ def test_core_jobs_follow_the_records_not_the_node_order():
         got = ur._assign_core_jobs(main, comp, ur._graph_candidates(nodes, q))
         assert got[0] == first
         assert sorted(got.values()) == sorted(f"n{i}" for i in comp)
+
+
+# ---- merged programs of the Pulsar-free decode (pf_templates: nrm / anorm / qkf /
+# lanorm / slanorm), four calibrations each, under AXERA_U16_MERGED_BUILDS ------------
+M = os.environ.get(
+    "AXERA_U16_MERGED_BUILDS", "/mnt/data/cache/claude-work/tmp/qwen-fuse/templates"
+)
+#: a linear (FullyConnected, its weight table written by linear_emit) inside the
+#: program: every pair equals the native build or is refused
+MERGED_EXACT = ("lanorm2048", "lanorm3072", "slanorm3072")
+#: no linear; some pairs differ from the native build in job order or IO slot
+#: numbering only (Pulsar2 rebuild noise), at least one pair is byte-equal
+MERGED = ("nrm1024", "anorm1024", "qkf2048") + MERGED_EXACT
+
+
+def _merged(name, i):
+    return f"{M}/fused/{name}/v{i}"
+
+
+@pytest.mark.parametrize(
+    "group,t,n",
+    [(g, t, n) for g in MERGED_EXACT for t, n in itertools.permutations(range(4), 2)],
+)
+def test_merged_linear_program_equals_the_native_build_or_refuses(group, t, n):
+    td, nd = _merged(group, t), _merged(group, n)
+    template, want = _need(td), gs.load_model(_need(nd))
+    try:
+        got = ur.retarget_graph(
+            template, f"{td}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+        )
+    except ValueError as e:
+        assert any(r in str(e) for r in REFUSALS), e
+        return
+    assert ur.compare(got, want) == []
+
+
+@pytest.mark.parametrize("group", MERGED)
+def test_every_merged_group_has_a_working_template(group):
+    ok = 0
+    for t, n in itertools.permutations(range(4), 2):
+        td, nd = _merged(group, t), _merged(group, n)
+        _need(td), _need(nd)
+        try:
+            got = ur.retarget_graph(
+                f"{td}/out/compiled.axmodel",
+                f"{td}/model.onnx",
+                ur.quant_of(td),
+                ur.quant_of(nd),
+            )
+        except ValueError:
+            continue
+        ok += ur.compare(got, gs.load_model(f"{nd}/out/compiled.axmodel")) == []
+    assert ok >= 1
+
+
+def test_merged_linear_with_new_weights_equals_the_native_build():
+    """lanorm2048 retargeted to another build's calibration AND weights
+    (``default_rng(2)``, not the template's) is that build, npu_params included."""
+    td, hd = _merged("lanorm2048", 0), f"{M}/heldout/lanorm2048_w2"
+    template, want = _need(td), gs.load_model(_need(hd))
+    w = onnx.numpy_helper.to_array(
+        next(
+            i for i in onnx.load(f"{hd}/model.onnx").graph.initializer if i.name == "w"
+        )
+    )
+    got = ur.retarget_graph(
+        template, f"{hd}/model.onnx", ur.quant_of(td), ur.quant_of(hd), weights=w
+    )
+    assert ur.compare(got, want) == []
+
+
+def test_core_jobs_take_a_topological_order():
+    """anorm1024 v0 calibrates m, e and r alike and u and d alike: the jobs
+    after the second ReduceMean are still Add, Sqrt, Div in that order."""
+    d = _merged("anorm1024", 0)
+    template = _need(d)
+    nodes = ur.graph_nodes(f"{d}/model.onnx")
+    q = ur.propagate(onnx.load(f"{d}/model.onnx"), ur.quant_of(d))
+    comp = [i for i, n in enumerate(nodes) if n[0] not in ur.PASS_THROUGH]
+    main = ur._segs(gs.load_model(template))[gs.MAIN]
+    got = ur._assign_core_jobs(main, comp, ur._graph_candidates(nodes, q), nodes)
+    ops = [nodes[int(got[j][1:])][0] for j in sorted(got)]
+    assert ops[-4:] == ["Add", "Sqrt", "Div", "Mul"]

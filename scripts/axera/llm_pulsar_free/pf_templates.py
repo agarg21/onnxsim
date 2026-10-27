@@ -28,7 +28,13 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
 * ``attn<n>``: the whole layer's attention, ``q [1, nh*hd]`` as
   ``[nkv, G, hd]``, token-major K / V ``[S + 1, nkv*hd]`` (the plan's cache
   layout), mask ``[1, S + 1]`` (Reshape / Transpose inside);
-* ``silu<n>``: ``y = gate * sigmoid(gate) * up``.
+* ``silu<n>``: ``y = gate * sigmoid(gate) * up``;
+* merged programs (``pf_layout.LAYER_FUSED*``), several outputs where the
+  residual stream continues: ``nrm<n>`` (the two-pass RMSNorm), ``anorm<n>``
+  (residual Add + two-pass norm, outputs ``x`` and ``y``), ``qkf<nh*hd>``
+  (q RoPE + k coarse norm + k RoPE, outputs ``yq`` and ``yk``),
+  ``lanorm<k>`` (a ``[1, k] @ [k, H]`` FullyConnected + ``anorm``),
+  ``slanorm<k>`` (fused SiLU + ``lanorm``).
 
 usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [NAME...]
 (no NAME: every template the model needs that is not built yet; serial builds)
@@ -136,6 +142,80 @@ ATTN = """
 """
 NORM_OPS = ["Mul", "ReduceMean", "Add", "Sqrt", "Div"]
 
+# ---- merged programs (one execute each instead of two or three) ----------------------
+#: (one eps initializer per Add: Pulsar2 renames a shared one per use)
+#: the two-pass RMSNorm as one program: coarse pass to ``u``, then the RMSNorm of ``u``
+NORM2_C = """
+  sq0 = Mul(x, x)
+  m0 = ReduceMean<axes=[-1], keepdims=1>(sq0)
+  e0 = Add(m0, eps0)
+  r0 = Sqrt(e0)
+  u = Div(x, r0)
+"""
+NORM2_R = """
+  sq = Mul(u, u)
+  m = ReduceMean<axes=[-1], keepdims=1>(sq)
+  e = Add(m, eps)
+  r = Sqrt(e)
+  d = Div(u, r)
+  y = Mul(d, g)
+"""
+NORM2 = NORM2_C + NORM2_R
+#: residual Add, then the two-pass RMSNorm of its sum; outputs the sum ``x`` (the
+#: residual stream) and the normalized ``y``
+ADDNORM = "  x = Add(a, b)\n" + NORM2
+#: a linear (``z @ w``, a FullyConnected) whose output is the residual Add's
+#: second operand, then the two-pass norm: ``o_proj`` + ``res1`` + the second
+#: norm, or ``down_proj`` + ``res2`` + the next layer's first norm
+LINEAR_ADDNORM = "  b = MatMul(z, w)\n" + ADDNORM
+#: ``fuse=3``: the fused SiLU before ``down_proj`` too
+SILU_LINEAR_ADDNORM = (
+    "  sg = Sigmoid(gate)\n  sl = Mul(gate, sg)\n  z = Mul(sl, up)\n" + LINEAR_ADDNORM
+)
+#: Qwen3's q and k RoPE programs and the coarse k norm as one program: q's
+#: ``qkrope``; k's per-head coarse norm ``uk = k / r0``, ``ur = k_rot / r0``
+#: (``rot`` permutes within a head, so k_rot's head RMS is k's); k's ``qkrope``
+#: of ``uk``. Outputs ``yq`` and ``yk``.
+QKF_Q = """
+  qa = Mul(q, cq)
+  qb = Mul(qr, sq)
+  qt = Add(qa, qb)
+  qh = Reshape(q, shq)
+  qsq = Mul(qh, qh)
+  qm = ReduceMean<axes=[-1], keepdims=1>(qsq)
+  qe = Add(qm, eps_q)
+  qrr = Sqrt(qe)
+  qth = Reshape(qt, shq)
+  yqh = Div(qth, qrr)
+  yq = Reshape(yqh, shyq)
+"""
+QKF_KC = """
+  kh = Reshape(k, shk)
+  ksq = Mul(kh, kh)
+  km = ReduceMean<axes=[-1], keepdims=1>(ksq)
+  ke = Add(km, eps_k)
+  kr0 = Sqrt(ke)
+  ukh = Div(kh, kr0)
+  krh = Reshape(kr, shk)
+  urh = Div(krh, kr0)
+  uk = Reshape(ukh, shyk)
+  ur = Reshape(urh, shyk)
+"""
+QKF_K = """
+  ka = Mul(uk, ck)
+  kb = Mul(ur, sk)
+  kt = Add(ka, kb)
+  ush = Reshape(uk, shk)
+  usq = Mul(ush, ush)
+  um = ReduceMean<axes=[-1], keepdims=1>(usq)
+  ue = Add(um, eps_u)
+  urr = Sqrt(ue)
+  kth = Reshape(kt, shk)
+  ykh = Div(kth, urr)
+  yk = Reshape(ykh, shyk)
+"""
+QKF = QKF_Q + QKF_KC + QKF_K
+
 
 # ---- calibration generators of the four variants (Pulsar2 MinMax over 18 draws) ------
 def _norm_gen(n, xs, off, g=None):
@@ -204,6 +284,88 @@ def _attn_gen(d: Dims, qs, ks, vs, voff):
     return gen
 
 
+def _addnorm_gen(n, xs, off, bk, bs, g):
+    """``b = -bk * a + noise``: with ``bk`` near 1 the sum is smaller than ``a``,
+    so the residual Add's scale ratio passes 1 (shift 14)."""
+
+    def gen(r):
+        a = (r.standard_normal((1, n)) * xs + off).astype(F)
+        return {
+            "a": a,
+            "b": (-bk * a + r.standard_normal((1, n)) * bs).astype(F),
+            "g": r.uniform(g[0], g[1], (1, n)).astype(F),
+        }
+
+    return gen
+
+
+def _lanorm_gen(k, n, w, zs, aoff, bk, g):
+    """``a = -bk * (z @ w) + noise``: with ``bk`` near 1 the residual Add cancels
+    (its shift drops below 15)."""
+
+    def gen(r):
+        z = (r.standard_normal((1, k)) * zs + 0.1 * zs).astype(F)
+        b = z @ w
+        sb = float(np.abs(b).std())
+        return {
+            "z": z,
+            "a": (
+                -bk * b + r.standard_normal((1, n)) * sb * (1.5 - bk) + aoff * sb
+            ).astype(F),
+            "g": r.uniform(g[0], g[1], (1, n)).astype(F),
+        }
+
+    return gen
+
+
+def _slanorm_gen(k, n, w, gs_, us, aoff, bk, g):
+    def gen(r):
+        gate = (r.standard_normal((1, k)) * gs_ - 0.2).astype(F)
+        up = (r.standard_normal((1, k)) * us + 0.05).astype(F)
+        z = gate / (1 + np.exp(-gate)) * up
+        b = z @ w
+        sb = float(np.abs(b).std())
+        return {
+            "gate": gate,
+            "up": up,
+            "a": (
+                -bk * b + r.standard_normal((1, n)) * sb * (1.5 - bk) + aoff * sb
+            ).astype(F),
+            "g": r.uniform(g[0], g[1], (1, n)).astype(F),
+        }
+
+    return gen
+
+
+def template_weight(k: int, n: int, seed: int = 1) -> np.ndarray:
+    """A linear template's weights (``default_rng(seed).uniform(-0.1, 0.1)``)."""
+    return np.random.default_rng(seed).uniform(-0.1, 0.1, (k, n)).astype(F)
+
+
+def _qkf_gen(d: Dims, qs, ks, cs, kq, kk):
+    """``kq`` / ``kk`` > 0: q's / k's RoPE Add cancels (rotated part ~ -k x the
+    plain part, sin ~ cos), so that Add shifts 14 while the eps Adds stay at 15."""
+    nq, nk = d.nh * d.hd, d.nkv * d.hd
+
+    def side(r, n, s, k):
+        x = (r.standard_normal((1, n)) * s + 0.1 * s).astype(F)
+        c = r.uniform(-0.6 * cs, cs, (1, n)).astype(F)
+        if k:
+            xr = -x * k + r.standard_normal((1, n)).astype(F) * s * 0.05
+            sn = c * r.uniform(0.9, 1.1, (1, n))
+        else:
+            xr = r.standard_normal((1, n)) * s - 0.1 * s
+            sn = r.uniform(-cs, 0.8 * cs, (1, n))
+        return x, xr.astype(F), c, sn.astype(F)
+
+    def gen(r):
+        q, qr, cq, sq = side(r, nq, qs, kq)
+        k, kr, ck, sk = side(r, nk, ks, kk)
+        return dict(q=q, qr=qr, k=k, kr=kr, cq=cq, sq=sq, ck=ck, sk=sk)
+
+    return gen
+
+
 NORM_X = ((1.0, 0.1), (3.0, -0.4), (0.5, 0.2), (8.0, 1.0))
 NORM_G = ((-0.6, 0.6), (-0.3, 1.2), (0.1, 2.0), (-2.0, 0.5))
 #: the single-op Add's input ranges per variant
@@ -218,7 +380,10 @@ ADD_RANGES = [
 def graph(name: str, d: Dims):
     """``(op types, body, inputs {name: shape}, output shape, initializers,
     variant generators)`` of a fused template ``name``."""
-    m = re.fullmatch(r"(crms|rms|hcrms|rope|qkrope|silu|attn)(\d+)(t?)", name)
+    m = re.fullmatch(
+        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm)(\d+)(t?)",
+        name,
+    )
     if not m:
         raise ValueError(f"{name}: not a fused template name")
     kind, n, alt = m.group(1), int(m.group(2)), m.group(3)
@@ -234,6 +399,58 @@ def graph(name: str, d: Dims):
     if kind == "rms":
         gens = [_norm_gen(n, s, o, g) for (s, o), g in zip(NORM_X, NORM_G)]
         return NORM_OPS, RMS, {"x": [1, n], "g": [1, n]}, [1, n], eps, gens
+    if kind == "nrm":
+        gens = [_norm_gen(n, s, o, g) for (s, o), g in zip(NORM_X, NORM_G)]
+        eps2 = {**eps, "eps0": eps["eps"]}
+        return NORM_OPS, NORM2, {"x": [1, n], "g": [1, n]}, [1, n], eps2, gens
+    if kind == "anorm":
+        p = ((3.0, 0.2, 0.0, 1.0), (2.0, 0.1, 0.9, 0.3))
+        p += ((8.0, 1.0, 0.2, 0.5), (1.0, -0.2, 0.95, 0.1))
+        gens = [_addnorm_gen(n, *a, g) for a, g in zip(p, NORM_G)]
+        ins = {"a": [1, n], "b": [1, n], "g": [1, n]}
+        eps2 = {**eps, "eps0": eps["eps"]}
+        return NORM_OPS, ADDNORM, ins, {"x": [1, n], "y": [1, n]}, eps2, gens
+    if kind == "lanorm":
+        # n: the linear's input width; output width d.H. The weights are the
+        # template's own (a generated program's are written by linear_emit)
+        H = d.H
+        w = template_weight(n, H)
+        p = ((1.0, 0.2, 0.0, NORM_G[0]), (2.0, 0.1, 0.9, NORM_G[1]))
+        p += ((0.5, 1.0, 0.3, NORM_G[3]), (3.0, -0.2, 0.95, NORM_G[1]))
+        gens = [_lanorm_gen(n, H, w, *a) for a in p]
+        ins = {"z": [1, n], "a": [1, H], "g": [1, H]}
+        inits = {"w": w, "eps": eps["eps"], "eps0": eps["eps"]}
+        ops = ["FullyConnected", "MatMul"] + NORM_OPS
+        return ops, LINEAR_ADDNORM, ins, {"x": [1, H], "y": [1, H]}, inits, gens
+    if kind == "slanorm":
+        H = d.H
+        w = template_weight(n, H)
+        p = ((1.0, 1.0, 0.2, 0.0, NORM_G[0]), (2.0, 0.7, 0.1, 0.9, NORM_G[1]))
+        p += ((0.8, 1.5, 1.0, 0.3, NORM_G[3]), (1.5, 2.0, -0.2, 0.95, NORM_G[1]))
+        gens = [_slanorm_gen(n, H, w, *a) for a in p]
+        ins = {"gate": [1, n], "up": [1, n], "a": [1, H], "g": [1, H]}
+        inits = {"w": w, "eps": eps["eps"], "eps0": eps["eps"]}
+        ops = ["FullyConnected", "MatMul", "Sigmoid"] + NORM_OPS
+        return ops, SILU_LINEAR_ADDNORM, ins, {"x": [1, H], "y": [1, H]}, inits, gens
+    if kind == "qkf":
+        if n != d.nh * d.hd:
+            raise ValueError(f"{name}: the model's q width is {d.nh * d.hd}")
+        nk = d.nkv * d.hd
+        shapes = {
+            "shq": np.array([d.nh, d.hd], np.int64),
+            "shk": np.array([d.nkv, d.hd], np.int64),
+            "shyq": np.array([1, n], np.int64),
+            "shyk": np.array([1, nk], np.int64),
+        }
+        ins = {"q": [1, n], "qr": [1, n], "k": [1, nk], "kr": [1, nk]}
+        ins |= {"cq": [1, n], "sq": [1, n], "ck": [1, nk], "sk": [1, nk]}
+        p = ((3.0, 20.0, 0.15, 0.0, 0.0), (1.0, 60.0, 1.0, 0.95, 0.98))
+        p += ((6.0, 8.0, 0.3, 1.0, 0.0), (2.0, 30.0, 0.6, 0.0, 0.9))
+        gens = [_qkf_gen(d, *a) for a in p]
+        ops = NORM_OPS + ["Reshape"]
+        outs = {"yq": [1, n], "yk": [1, nk]}
+        eps3 = {f"eps_{t}": eps["eps"] for t in "qku"}
+        return ops, QKF, ins, outs, {**eps3, **shapes}, gens
     if kind == "hcrms":
         gens = [_norm_gen(n, s, o) for s, o in NORM_X]
         ops = NORM_OPS + ["Reshape"]
@@ -288,10 +505,14 @@ def graph(name: str, d: Dims):
 
 
 def model_of(body: str, ins: dict, out, inits: dict) -> onnx.ModelProto:
-    sig = ", ".join(f"float[{', '.join(map(str, s))}] {n}" for n, s in ins.items())
-    m = parse_model(
-        f"<{OPSET}> g ({sig}) => (float[{', '.join(map(str, out))}] y)\n{{{body}}}\n"
-    )
+    """``out``: the output shape of a one-output graph (output ``y``), or
+    ``{name: shape}`` for several outputs."""
+
+    def sig(d):
+        return ", ".join(f"float[{', '.join(map(str, s))}] {n}" for n, s in d.items())
+
+    outs = out if isinstance(out, dict) else {"y": out}
+    m = parse_model(f"<{OPSET}> g ({sig(ins)}) => ({sig(outs)})\n{{{body}}}\n")
     for n, a in inits.items():
         m.graph.initializer.append(onnx.numpy_helper.from_array(a, n))
     onnx.checker.check_model(m)
@@ -323,11 +544,19 @@ def linear_model(w: np.ndarray) -> onnx.ModelProto:
 def needed(cfg) -> list[str]:
     """Template names (``fused`` / ``add<n>`` / ``k<K>n<N>``) of a model's programs."""
     H, inter, qd, kvd = cfg.H, cfg.I, cfg.nh * cfg.hd, cfg.kvd
-    names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
-    if cfg.qk_norm:
+    if getattr(cfg, "fuse", 0):
+        names = [f"nrm{H}", f"anorm{H}", f"silu{inter}", f"attn{qd}"]
+        names += [f"qkf{qd}"] if cfg.qk_norm else [f"rope{qd}", f"rope{kvd}"]
+        if cfg.fuse >= 2:
+            names += [f"lanorm{qd}", f"lanorm{inter}"]
+        if cfg.fuse >= 3:
+            names += [f"slanorm{inter}"]
+    elif cfg.qk_norm:
+        names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]
         names += [f"hcrms{2 * kvd}"]
     else:
+        names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"rope{qd}", f"rope{kvd}"]
     widths = {"gu": 2 * inter, "down_proj": H}
     names += [
