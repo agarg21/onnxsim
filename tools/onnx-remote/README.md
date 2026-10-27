@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `d2c180397` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `faecbf574` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1300,3 +1300,21 @@ ms). The upcast alone made the temporal attention 4x slower, and the result fail
 rounding). The hand kernel stages the values through a small table instead: vector stores, then scalar loads in the per-head
 loop. Generated code would need two loop nests joined by a local buffer in one kernel, which tinygrad's scheduler can't express
 yet. That is the missing piece for a generated MSDA at the hand kernel's speed.
+
+**Hand MSDA kernel: tap tables.** The default build's MSDA (`HAND_MSDA=1`) got faster. The kernel builds each work item's tap
+offsets and weights with HVX, then reads them back as scalars to address the value rows. In hexagon-sim timing mode, that
+table-to-address chain was 43 of 89 cycles per point. Changes:
+- **Two points per 64-bit table read.** The decoder's call went from 848 to 684 us.
+- **One 2 x 2 window per point, kept inside the map.** The corners' weights shift with it at a border, so the table holds one
+  row offset per point instead of four: 684 -> 587 us.
+- **The next queries' offsets and weights L2-prefetched** inside the kernel: 587 -> 542 us. Putting them in VTCM instead was
+  slightly faster for the call but displaced other buffers.
+
+| model | before | now |
+|---|---:|---:|
+| decoder | 29.5 ms | 27.7 ms |
+| encoder, 1 layer | 15.6 ms | 13.5 ms |
+| encoder, 3 layers | 46.2 ms | 40.0 ms (SCA 12.9 -> 9.9, TSA 9.8 -> 6.8) |
+
+All pass against onnxruntime. The kernel's own hexagon-sim checks pass for all eight case kinds (fp32 / uint8, multi-level).
+Details and the dropped variants are in `scripts/android/msda_hvx/README.md`.
