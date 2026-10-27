@@ -230,8 +230,69 @@ class Chain:
         xn, a = f("dn")(gate=gate, up=up, a=x1, g=gn)
         return {"x": xn, "a": a}
 
+    def layer_fused5(self, li, x, K, V, p):
+        """A layer of the ``fuse=5`` layout. ``x``: the embedding row (layer 0)
+        or the previous layer's ``{"x": residual, "a": normed | "q": q}`` (its
+        K / V rows already written)."""
+        cfg = self.cfg
+        nh, hd, kvd = cfg.nh, cfg.hd, cfg.kvd
+        wh = f"L{li}"
+
+        def f(k):
+            return self.f[(wh, k)]
+
+        def tabs(lj):
+            t = cfg.rope_tiles(p, lj)
+            return dict(cq=t["cos_q"], sq=t["sin_q"], ck=t["cos_k"], sk=t["sin_k"])
+
+        g1, g2 = cfg.gains(li)
+        if not isinstance(x, dict):
+            qr, kr, v = f("n1qk")(x=x, g=g1, **tabs(li))
+            K[p], V[p] = kr.reshape(-1), v.reshape(-1)
+            x = {"x": x, "q": qr}
+        if "q" not in x:  # after a split first-set layer
+            y5 = f("qkv5")(x["a"])
+            o = lay.offsets(cfg.QKV)
+
+            def sl(k, n):
+                return y5[:, o[k] : o[k] + n]
+
+            qr, kr = f("qk")(
+                q=sl("q_proj", nh * hd),
+                qr=sl("q_rot", nh * hd),
+                k=sl("k_proj", kvd),
+                kr=sl("k_rot", kvd),
+                **tabs(li),
+            )
+            K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
+            x = {"x": x["x"], "q": qr}
+        res = x["x"]
+        att = f("attn")(q=x["q"], k=K, v=V, mask=cfg.mask_plan(p))
+        if (wh, "on2g") in self.f:
+            x1, gu = f("on2g")(z=att, a=res, g=g2)
+        else:
+            x1, m = f("on2")(z=att, a=res, g=g2)
+            gu = f("gu")(m)
+        og = lay.offsets(cfg.GU)
+        gate = gu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
+        up = gu[:, og["up_proj"] : og["up_proj"] + cfg.I]
+        gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
+        if (wh, "down_proj") in self.f:
+            dn = f("down_proj")(f("silu_f")(gate=gate, up=up))
+            xn, a = f("dn")(a=x1, b=dn, g=gn)
+            return {"x": xn, "a": a}
+        if (wh, "dnqk") in self.f:
+            xn, qn, kn, vn = f("dnqk")(gate=gate, up=up, a=x1, g=gn, **tabs(li + 1))
+            return {"x": xn, "q": qn, "kv": (kn, vn)}
+        xn, a = f("dn")(gate=gate, up=up, a=x1, g=gn)
+        return {"x": xn, "a": a}
+
     def layer(self, li, x, K, V, p):
         cfg = self.cfg
+        if cfg.fuse >= 5:
+            if isinstance(x, dict) and "kv" in x:  # the previous layer computed them
+                K[p], V[p] = x["kv"][0].reshape(-1), x["kv"][1].reshape(-1)
+            return self.layer_fused5(li, x, K, V, p)
         if cfg.fuse >= 4:
             return self.layer_fused4(li, x, K, V, p)
         if cfg.fuse >= 2:

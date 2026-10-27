@@ -80,12 +80,19 @@ LAYER_FUSED3 = ["qkv5", "qk", "attn", "on2", "gu", "dn"]
 #: ``gu``, ``silu_f``, ``down_proj`` and an Add + norm ``dn``, and the layer
 #: after it a ``qkv5`` of its own (``pf_model.Config.programs``).
 LAYER_FUSED4 = ["qk", "attn", "on2g", "dnq"]
+#: ``fuse=5``: the next layer's q / k / v linears and RoPE join ``dn``
+#: (``dnqk``: outputs the residual, q, and the K / V rows, bound per step onto
+#: the caches); layer 0 starts with ``n1qk``. A layer after a split first-set
+#: layer has ``qkv5`` and ``qk`` of its own.
+LAYER_FUSED5 = ["attn", "on2g", "dnqk"]
 
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
     if fuse >= 2:
         if not qk_norm:
             raise NotImplementedError("fuse=2 without a per-head q / k norm")
+        if fuse >= 5:
+            return list(LAYER_FUSED5)
         if fuse >= 4:
             return list(LAYER_FUSED4)
         return list(LAYER_FUSED3 if fuse >= 3 else LAYER_FUSED2)

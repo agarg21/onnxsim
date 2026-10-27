@@ -169,7 +169,7 @@ def _config(name, out, fuse=0):
 
 
 WIRING = [("qwen3_like", 0), ("llama_gqa", 0), ("llama_mha", 0)]
-WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4)]
+WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5)]
 
 
 @pytest.mark.parametrize("name,fuse", WIRING)
@@ -213,13 +213,18 @@ def test_template_names():
     assert tpl.template_dir("r", "add32").endswith(os.path.join("single", "add32"))
 
 
-@pytest.mark.parametrize("fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4)])
+@pytest.mark.parametrize("fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3)])
 def test_programs_per_layer(fuse, runs):
     """Executes per layer of the rest set; layer 0 also runs the first norm,
     and a split first-set ``down_proj`` keeps its own programs."""
     cfg = _config("qwen3_like", ".", fuse)
     assert len(cfg.programs("rest", "L1")) == runs
-    if fuse == 4:
+    if fuse == 5:
+        assert cfg.programs("rest", "L0")[0] == "n1qk"
+        assert cfg.programs("first", "L1")[:2] == ["qkv5", "qk"]
+        assert cfg.kv_producer("rest", 1) == ("L0", "dnqk")
+        assert cfg.kv_producer("first", 1) == ("L1", "qk")
+    elif fuse == 4:
         assert cfg.programs("rest", "L0")[0] == "n1q"
         assert cfg.programs("first", "L0")[-5:] == [
             "on2",

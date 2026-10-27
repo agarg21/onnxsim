@@ -61,6 +61,8 @@ class Plan:
         self.root = root or cfg.out
         self.g, self.h = ax.guest_dir, ax.host_dir
         self.lines: list[str] = []
+        #: model id -> {("I" | "O", index): (buffer, byte offset)}, the latest binds
+        self.binds: dict[int, dict] = {}
         self.M = {}
         self.man = {
             st: json.load(open(os.path.join(self.root, f"manifest_{st}.json")))
@@ -137,6 +139,7 @@ class Plan:
         specs = m.inputs if io_ == "I" else m.outputs
         idx = name if isinstance(name, int) else [s.name for s in specs].index(name)
         cmd = f"{m.id} {io_} {idx} {b} {off}"
+        self.binds.setdefault(m.id, {})[(io_, idx)] = (b, off)
         if now:
             r = self.ax._cmd(f"BIND {cmd}")
             if not r.startswith("OK"):
@@ -387,8 +390,92 @@ class Plan:
         io["logits"] = self.chain(st, "post", "lm_head", x=a)
         return io
 
+    def bind_set_fused5(self, st):
+        """``bind_set`` of the ``fuse=5`` layout: q of layer ``li`` comes from
+        the previous layer's ``dnqk`` (layer 0: ``n1qk``; after a split
+        first-set layer: ``qk``), K / V rows are bound per step (``step``)."""
+        cfg = self.cfg
+        og = lay.offsets(cfg.GU)
+        oq = lay.offsets(cfg.QKV)
+        io = {}
+
+        def tabs(lj):
+            cq, sq, ck, sk = self.tables(lj)
+            return dict(cq=cq, sq=sq, ck=ck, sk=sk)
+
+        self._bind_ins(st, "L0", "n1qk", x=self.x0, g=self.gain[0][0], **tabs(0))
+        x, q = self.x0, self._qbuf(st, "L0", "n1qk", 0)
+        a = None
+        for li in range(cfg.L):
+            wh = f"L{li}"
+            progs = cfg.programs(st, wh)
+            if "qkv5" in progs:
+                y5 = self.chain(st, wh, "qkv5", x=a)
+                io[li] = dict(y5=y5)
+
+                def o5(k, y5=y5):
+                    return (y5, oq[k] * 4)
+
+                self._bind_ins(
+                    st,
+                    wh,
+                    "qk",
+                    q=o5("q_proj"),
+                    qr=o5("q_rot"),
+                    k=o5("k_proj"),
+                    kr=o5("k_rot"),
+                    **tabs(li),
+                )
+                q = self._qbuf(st, wh, "qk", li)
+            att = self.chain(
+                st, wh, "attn", q=q, k=self.K[li], v=self.V[li], mask=self.mask
+            )
+            gn = self.gain[li + 1][0] if li + 1 < cfg.L else self.gf
+            g2 = self.gain[li][1]
+            if "on2g" in progs:
+                self._bind_ins(st, wh, "on2g", z=att, a=x, g=g2)
+                o = self.outputs(st, wh, "on2g")
+                x1, gu = o["x"], o["y"]
+            else:
+                self._bind_ins(st, wh, "on2", z=att, a=x, g=g2)
+                o = self.outputs(st, wh, "on2")
+                x1, m = o["x"], o["y"]
+                gu = self.chain(st, wh, "gu", x=m)
+            gate, up = (gu, og["gate_proj"] * 4), (gu, og["up_proj"] * 4)
+            if "down_proj" in progs:
+                act = self.chain(st, wh, "silu_f", gate=gate, up=up)
+                dn = self.chain(st, wh, "down_proj", x=act)
+                self._bind_ins(st, wh, "dn", a=x1, b=dn, g=gn)
+                o = self.outputs(st, wh, "dn")
+                x, a = o["x"], o["y"]
+            elif "dnqk" in progs:
+                self._bind_ins(
+                    st, wh, "dnqk", gate=gate, up=up, a=x1, g=gn, **tabs(li + 1)
+                )
+                x = self.outputs(st, wh, "dnqk", skip=("yq", "yk", "v"))["x"]
+                q = self._qbuf(st, wh, "dnqk", li + 1)
+            else:
+                self._bind_ins(st, wh, "dn", gate=gate, up=up, a=x1, g=gn)
+                o = self.outputs(st, wh, "dn")
+                x, a = o["x"], o["y"]
+        io["logits"] = self.chain(st, "post", "lm_head", x=a)
+        return io
+
+    def _qbuf(self, st, wh, key, li):
+        """Bind ``key``'s ``yq`` onto layer ``li``'s q buffer (one per layer,
+        shared by both sets)."""
+        m = self.M[(st, wh, key)]
+        idx = [o.name for o in m.outputs].index("yq")
+        k = (f"L{li}", "q", "yq")
+        if k not in self.out_bufs:
+            self.out_bufs[k] = self.buf(m.outputs[idx].nbytes)
+        self.bind(st, wh, key, "O", idx, self.out_bufs[k])
+        return self.out_bufs[k]
+
     def bind_set(self, st):
         cfg = self.cfg
+        if cfg.fuse >= 5:
+            return self.bind_set_fused5(st)
         if cfg.fuse >= 4:
             return self.bind_set_fused4(st)
         if cfg.fuse >= 2:
@@ -458,20 +545,22 @@ class Plan:
                 self.lines.append(f"X {self.M[(st, wh, pk)].id}")
 
         ov = lay.offsets(cfg.QKV)["v_proj"]
-        kp, kout = cfg.k_program
+        kout = cfg.k_program[1]
+        prod = {cfg.kv_producer(st, lj): lj for lj in range(cfg.L)}
         for li in range(cfg.L):
             wh = f"L{li}"
-            progs = cfg.programs(st, wh)
-            before_k, after_k = progs[: progs.index(kp)], progs[progs.index(kp) + 1 :]
-            for k in before_k:
+            for k in cfg.programs(st, wh):
+                lj = prod.get((wh, k))
+                if lj is not None:  # this program writes layer lj's K (and V) row
+                    row = p * kvd * 4
+                    self.bind(st, wh, k, "O", kout, self.K[lj], row, now=False)
+                    v_out = k in ("n1qk", "dnqk")
+                    if v_out:
+                        self.bind(st, wh, k, "O", "v", self.V[lj], row, now=False)
                 X(wh, k)
-            # the K program's output: K row p
-            self.bind(st, wh, kp, "O", kout, self.K[li], p * kvd * 4, now=False)
-            X(wh, kp)
-            y5 = self.io[st][li]["y5"]
-            self.lines.append(f"C {self.V[li]} {p * kvd * 4} {y5} {ov * 4} {kvd * 4}")
-            for k in after_k:
-                X(wh, k)
+                if lj is not None and not v_out:
+                    y5 = self.io[st][lj]["y5"]
+                    self.lines.append(f"C {self.V[lj]} {row} {y5} {ov * 4} {kvd * 4}")
         for k in cfg.programs(st, "post"):
             X("post", k)
         nb = self.M[(st, "post", "lm_head")].outputs[0].nbytes
@@ -490,7 +579,7 @@ def _io_stub(k, n):
 
 
 #: merged programs that hold a linear (their float graphs carry its weights)
-MERGED_LINEAR = ("on2", "dn", "on2g", "dnq", "n1q")
+MERGED_LINEAR = ("on2", "dn", "on2g", "dnq", "n1q", "dnqk", "n1qk")
 
 
 def _float_program(cfg, d, wh, k, ml, fused):
@@ -517,11 +606,23 @@ def _float_program(cfg, d, wh, k, ml, fused):
             {"w": ("down_proj", li), "w2": ("qkv5", li + 1)},
         ),
         "n1q": (f"nrml{qkv}", {"w2": ("qkv5", li)}),
+        "dnqk": (
+            f"slanormqk{cfg.I}",
+            {"w": ("down_proj", li), "qkv": ("qkv5", li + 1)},
+        ),
+        "n1qk": (f"nrmqk{cfg.H}", {"qkv": ("qkv5", li)}),
     }[k]
     fg = tpl.float_graph(name, d)
     for wn, (key, lj) in ws.items():
-        wi = next(i for i in fg.graph.initializer if i.name == wn)
-        wi.CopyFrom(onnx.numpy_helper.from_array(cfg.merged_weight(key, lj), wn))
+        w = cfg.merged_weight(key, lj)
+        parts = {wn: w}
+        if wn == "qkv":  # the five q / k / v linears: column slices of qkv5
+            o = lay.offsets(cfg.QKV)
+            src = dict(q_proj="q", q_rot="qr", k_proj="k", k_rot="kr", v_proj="v")
+            parts = {f"w{src[p]}": w[:, o[p] : o[p] + n] for p, n in cfg.QKV}
+        for pn, pw in parts.items():
+            wi = next(i for i in fg.graph.initializer if i.name == pn)
+            wi.CopyFrom(onnx.numpy_helper.from_array(np.ascontiguousarray(pw), pn))
     return fg
 
 
@@ -568,7 +669,12 @@ def write_float_set(cfg: pf_model.Config, root: str) -> None:
             ml = {}
             for k in cfg.programs(st, wh):
                 shared = ("rq", "rk", "kc", "qk")
-                if st == "first" and cfg.first_pos == 0 and k in shared:
+                if (
+                    st == "first"
+                    and cfg.first_pos == 0
+                    and k in shared
+                    and k in man_rest[wh]
+                ):
                     ml[k] = dict(man_rest[wh][k], shared="rest")
                 elif k in fused or k in MERGED_LINEAR:
                     path = os.path.join(D, f"{k}.axmodel")

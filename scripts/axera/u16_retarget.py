@@ -461,6 +461,8 @@ def _core_jobs(template) -> int:
 #: offset) all sit at or above this; below it are source / destination address
 #: writes, which a candidate value can coincide with
 MIN_CALIB_REG = 0x0F00
+#: at most this many pairs of compute nodes run as one CORE job (strict mode)
+MAX_MERGED = 4
 
 
 def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
@@ -479,15 +481,20 @@ def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
         node, base = k.split("|", 1)
         if not (base.startswith("zp:") and v < 256):
             by_node.setdefault(node, set()).add(v)
-    score = np.zeros((len(cores), len(comp)))
-    for j, (a, b) in enumerate(cores):
-        vals = [
+    vals = [
+        [
             gs._val(main[r])
             for r in range(a, b)
             if main[r][0] == gs.A1 and gs._reg(main[r]) >= MIN_CALIB_REG
         ]
-        for c, i in enumerate(comp):
-            score[j, c] = sum(v in by_node.get(f"n{i}", ()) for v in vals)
+        for a, b in cores
+    ]
+    sets = [by_node.get(f"n{i}", set()) for i in comp]
+
+    def score(j, cs):
+        u = set().union(*(sets[c] for c in cs))
+        return sum(v in u for v in vals[j])
+
     # tensor -> the compute node that produces it (through data-movement nodes)
     prod: dict[str, int | None] = {}
     for i, (op, ins, out, _) in enumerate(nodes or []):
@@ -499,28 +506,63 @@ def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
         i: {prod[t] for t in nodes[i][1] if prod.get(t) is not None} if nodes else set()
         for i in comp
     }
+
+    def ready(done):
+        return [c for c, i in enumerate(comp) if i not in done and deps[i] <= done]
+
     # best total over topological orders: DP over the sets of computed nodes
-    # (order ideals of the graph); ties to the lexicographically first ONNX order
+    # (order ideals of the graph); ties to the lexicographically first ONNX
+    # order. With fewer jobs than nodes, Pulsar2 ran some pairs of nodes as one
+    # job: a job may then take two nodes (the second ready after the first).
+    # With more jobs than nodes, the extra jobs hold no calibration record (data
+    # movement, e.g. around a FullyConnected): such a job may take no node.
+    merges = max(len(comp) - len(cores), 0)
+    empties = max(len(cores) - len(comp), 0)
+    allv = set().union(*sets) if sets else set()
+    blank = [not any(v in allv for v in vals[j]) for j in range(len(cores))]
+    if sum(blank) < empties:
+        raise ValueError(
+            f"{len(cores)} CORE jobs for {len(comp)} compute nodes, only "
+            f"{sum(blank)} without calibration records"
+        )
     states: dict[frozenset, tuple[float, tuple]] = {frozenset(): (0.0, ())}
     for j in range(len(cores)):
         nxt: dict[frozenset, tuple[float, tuple]] = {}
+
+        def offer(key, cand):
+            best = nxt.get(key)
+            if (
+                best is None
+                or cand[0] > best[0]
+                or (cand[0] == best[0] and cand[1] < best[1])
+            ):
+                nxt[key] = cand
+
         for done, (sc, path) in states.items():
-            ready = [c for c, i in enumerate(comp) if i not in done and deps[i] <= done]
-            for c in ready:
-                key = done | {comp[c]}
-                cand = (sc + score[j, c], path + (c,))
-                best = nxt.get(key)
-                if (
-                    best is None
-                    or cand[0] > best[0]
-                    or (cand[0] == best[0] and cand[1] < best[1])
-                ):
-                    nxt[key] = cand
+            skipped = sum(1 for p in path if not p)
+            spare = merges - (len(done) - (j - skipped))
+            if blank[j] and skipped < empties:
+                offer(done, (sc, path + ((),)))
+            for c in ready(done):
+                d1 = done | {comp[c]}
+                offer(d1, (sc + score(j, (c,)), path + ((c,),)))
+                if spare > 0:
+                    for c2 in ready(d1):
+                        if c2 > c or comp[c] in deps[comp[c2]]:
+                            offer(
+                                d1 | {comp[c2]},
+                                (sc + score(j, (c, c2)), path + ((c, c2),)),
+                            )
         if not nxt:  # the jobs are not a topological order of this graph
             raise ValueError("no topological order of the graph fits the CORE jobs")
         states = nxt
-    _, path = max(states.values(), key=lambda v: (v[0], [-c for c in v[1]]))
-    return {j: f"n{comp[c]}" for j, c in enumerate(path)}
+    full = {k: v for k, v in states.items() if len(k) == len(comp)}
+    if not full:
+        raise ValueError("no topological order of the graph fits the CORE jobs")
+    _, path = max(
+        full.values(), key=lambda v: (v[0], [-c[0] if c else 1 for c in v[1]])
+    )
+    return {j: "+".join(f"n{comp[c]}" for c in cs) for j, cs in enumerate(path)}
 
 
 def _check_add_shift_writes(main, nodes, assign, cn) -> None:
@@ -541,8 +583,13 @@ def _check_add_shift_writes(main, nodes, assign, cn) -> None:
         node = None
         if role == "CORE":
             node, core = assign.get(core), core + 1
-        if node is not None and nodes[int(node[1:])][0] == "Add":
-            want = cn[f"{node}|add_shift@{ADD_SHIFT:#06x}"]
+        adds = [
+            n for n in (node or "").split("+") if n and nodes[int(n[1:])][0] == "Add"
+        ]
+        if len(adds) > 1:
+            raise ValueError(f"one CORE job holds two Adds ({node})")
+        if adds:
+            want = cn[f"{adds[0]}|add_shift@{ADD_SHIFT:#06x}"]
             if want != state and not writes:
                 raise ValueError(
                     f"the target's {node} Add needs {ADD_SHIFT:#06x} = {want} (the "
@@ -601,8 +648,15 @@ def retarget_graph(
         for i, n in enumerate(nodes)
         if n[0] not in PASS_THROUGH and n[0] != "FullyConnected"
     ]
-    strict = _core_jobs(template) == len(comp)
-    assign = _assign_core_jobs(main, comp, ct, nodes) if strict else {}
+    # a CORE job per compute node, a few pairs of nodes run as one job, or a few
+    # extra jobs without calibration records
+    strict = abs(len(comp) - _core_jobs(template)) <= MAX_MERGED
+    assign = {}
+    if strict:
+        try:
+            assign = _assign_core_jobs(main, comp, ct, nodes)
+        except ValueError:  # e.g. a Softmax in two jobs: any node in any CORE job
+            strict = False
     if strict:
         _check_add_shift_writes(main, nodes, assign, cn)
 
@@ -621,7 +675,7 @@ def retarget_graph(
         if tag == "DEQUANT":
             return base in {f"{p}:{o}" for o in outs for p in ("s", "zp")}
         if tag.startswith("CORE") and strict:
-            return node == assign[int(tag[4:])]
+            return node in assign[int(tag[4:])].split("+")  # "": none
         return True
 
     if not fc:
@@ -679,7 +733,9 @@ def retarget_graph(
                     seg[i] = gs._rec(gs.A1, le.REG_CORE_ZP_X, v)
                     hits[tz] += 1
     if not all(hits.values()):
-        raise ValueError(f"no core {le.REG_CORE_ZP_X:#06x} record holds a linear's zp_x")
+        raise ValueError(
+            f"no core {le.REG_CORE_ZP_X:#06x} record holds a linear's zp_x"
+        )
     return wr.with_segments(res, segs)
 
 

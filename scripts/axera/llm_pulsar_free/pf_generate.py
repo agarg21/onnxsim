@@ -419,6 +419,7 @@ class Generator:
         w=None,
         silu=None,
         post=None,
+        qkv=None,
     ):
         """The two-pass RMSNorm as one program (``nrm<H>``), or with the
         residual Add before it (``anorm<H>``: ``x = a + b``, outputs ``x`` and
@@ -431,7 +432,10 @@ class Generator:
         ``post = (w2, x2, ys)``: a second linear on the norm's output (``yn``,
         the graph's ``y`` is then ``yn @ w2``; ``nrml`` / ``lanorml`` /
         ``slanorml``), calibrated as that linear's own program: ``x2`` (the
-        recorded norm output) and the union of ``ys`` at the real range x2."""
+        recorded norm output) and the union of ``ys`` at the real range x2.
+        ``qkv = layer``: the five q / k / v linears of that layer and its q / k
+        RoPE after the norm (``nrmqk`` / ``slanormqk``), the RoPE parts
+        calibrated as ``qk`` (``qk_ranges``, both sets)."""
         H = self.cfg.H
         inits = tpl.graph(f"nrm{H}", tpl.Dims.of(self.cfg))[4]
         rgs = []
@@ -487,6 +491,52 @@ class Generator:
 
             rgs.append({"yn": r2(x2), "y": r2(*ys)})
             weights = {"w2": w2, **({"w": w} if w is not None else {})}
+        if qkv is not None:
+            lj = qkv
+            cfg = self.cfg
+            B = self._acts("rest", f"L{lj}")
+            oq = pf_model.lay.offsets(cfg.QKV)
+            wm = cfg.merged_weight("qkv5", lj)
+            src = {
+                "q_proj": "q",
+                "q_rot": "qr",
+                "k_proj": "k",
+                "k_rot": "kr",
+                "v_proj": "v",
+            }
+            weights = {} if w is None else {"w": w}
+            for part, n in cfg.QKV:
+                weights[f"w{src[part]}"] = wm[:, oq[part] : oq[part] + n]
+            for r in rgs:
+                if "y" in r:
+                    r["yn"] = r.pop("y")
+                for a_, b_ in tpl.NORM_QK_RENAME.items():
+                    if a_ in r:
+                        r[b_] = r.pop(a_)
+            Bs = [B] + ([self._acts("first", f"L{lj}")] if cfg.first_pos == 0 else [])
+
+            def r2(k):
+                v = np.concatenate([b[k].reshape(len(b[k]), -1) for b in Bs])
+                lo, hi = float(v.min()), float(v.max())
+                return [2 * min(lo, 0.0), 2 * max(hi, 0.0)]
+
+            here = self._acts(self._st, f"L{lj}")
+            xa = here["a"].reshape(len(here["a"]), -1)
+            rgs.append(
+                {
+                    "yn": [
+                        2 * min(float(xa.min()), 0.0),
+                        2 * max(float(xa.max()), 0.0),
+                    ],
+                    "q": r2("qp"),
+                    "qr": r2("qp"),
+                    "k": r2("kp"),
+                    "kr": r2("kp"),
+                    "v": r2("vp"),
+                }
+            )
+            qrgs, _ = self.qk_ranges("rest", lj, B)
+            rgs += qrgs
         if silu is not None:
             gate, up = silu
             n = gate.shape[-1]
@@ -499,6 +549,13 @@ class Generator:
             )
             rgs.append(rg)
             name = f"slanorm{n}"
+        if qkv is not None:
+            if name.startswith("nrm"):
+                name = f"nrmqk{H}"
+            elif name.startswith("slanorm"):
+                name = name.replace("slanorm", "slanormqk")
+            else:
+                raise ValueError(f"{name}: no template with q / k / v after the norm")
         if post is not None:
             n2 = post[0].shape[1]
             if name.startswith("nrm"):
@@ -515,13 +572,23 @@ class Generator:
         """``rq`` + ``kc`` + ``rk`` as one program (``qkf<nh*hd>``), each part
         calibrated as its own program was (``layer``)."""
         cfg = self.cfg
-        nh, nkv, hd, kvd = cfg.nh, cfg.nkv, cfg.hd, cfg.kvd
+        nh, hd = cfg.nh, cfg.hd
         w = f"L{li}"
         if st == "first" and cfg.first_pos == 0:
             ml["qk"] = dict(self._manifest("rest")[w]["qk"], shared="rest")
             return
         name = f"qkf{nh * hd}"
-        inits = tpl.graph(name, tpl.Dims.of(cfg))[4]
+        rgs, uk = self.qk_ranges(st, li, A)
+        self.merged(C, D, "qk", name, rgs, ml, dict(u_absmax=float(np.abs(uk).max())))
+
+    def qk_ranges(self, st, li, A):
+        """Ranges of the q / k RoPE parts (``qkf``) of layer ``li``, each part as
+        its own program was calibrated (rest set: with the first set's samples
+        too); and the coarse k norm's ``u`` in fake-quant."""
+        cfg = self.cfg
+        nh, nkv, hd, kvd = cfg.nh, cfg.nkv, cfg.hd, cfg.kvd
+        w = f"L{li}"
+        inits = tpl.graph(f"qkf{nh * hd}", tpl.Dims.of(cfg))[4]
         both = st == "rest" and cfg.first_pos == 0
         F_ = self._acts("first", w) if both else None
         tiles = [cfg.rope_tiles(int(p), li) for p in A["p"]]
@@ -575,15 +642,7 @@ class Generator:
             },
             inits,
         )
-        self.merged(
-            C,
-            D,
-            "qk",
-            name,
-            [rq, rkc, rk],
-            ml,
-            dict(u_absmax=float(np.abs(uk).max())),
-        )
+        return [rq, rkc, rk], uk
 
     def layer_fused(self, st, li, man):
         """One layer of the merged layout (``pf_layout.LAYER_FUSED``)."""
@@ -810,6 +869,123 @@ class Generator:
                 w=cfg.merged_weight("down_proj", li),
                 silu=(r2(A, "gate"), r2(A, "up")),
                 post=nxt,
+            )
+        for k in ("gu", "qkv5"):
+            if k in ml:
+                parts = cfg.GU if k == "gu" else cfg.QKV
+                o = pf_model.lay.offsets(parts)
+                ml[k]["parts"] = {p: dict(col=o[p], n=n) for p, n in parts}
+        man[w] = ml
+
+    def layer_fused5(self, st, li, man):
+        """One layer of the ``fuse=5`` layout (``pf_model.Config.programs``)."""
+        cfg = self.cfg
+        w = f"L{li}"
+        A = self._acts(st, w)
+        D = os.path.join(self.out, st, w)
+        C = os.path.join(self.out, "cal", st, w)
+        os.makedirs(D, exist_ok=True)
+        progs = cfg.programs(st, w)
+        g1, g2 = cfg.gains(li)
+        ml = {}
+        self._st = st
+
+        def r2(B, k):
+            return B[k].reshape(len(B[k]), -1).astype(F32)
+
+        if "n1qk" in progs:
+            self.norm2(C, D, "n1qk", ml, g1, x=r2(A, "x"), qkv=li)
+        if "qkv5" in progs:  # after a split first-set layer
+            ml["qkv5"] = self.lin(
+                st,
+                li,
+                "qkv5",
+                f"{D}/qkv5.axmodel",
+                cfg.merged_weight("qkv5", li),
+                "a",
+                ["qp", "kp", "vp"],
+            )
+            rgs, uk = self.qk_ranges("rest", li, self._acts("rest", w))
+            self.merged(
+                C,
+                D,
+                "qk",
+                f"qkf{cfg.nh * cfg.hd}",
+                rgs,
+                ml,
+                dict(u_absmax=float(np.abs(uk).max())),
+            )
+        self._attn(li, A, C, D, ml)
+        gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
+        x, x1 = r2(A, "x"), r2(A, "x1")
+        if "on2g" in progs:
+            self.norm2(
+                C,
+                D,
+                "on2g",
+                ml,
+                g2,
+                a=x,
+                b=r2(A, "op"),
+                z=r2(A, "att"),
+                w=cfg.merged_weight("o_proj", li),
+                post=(
+                    cfg.merged_weight("gu", li),
+                    r2(A, "m"),
+                    [r2(A, "gate"), r2(A, "up")],
+                ),
+            )
+        else:  # a split first-set layer
+            self.norm2(
+                C,
+                D,
+                "on2",
+                ml,
+                g2,
+                a=x,
+                b=r2(A, "op"),
+                z=r2(A, "att"),
+                w=cfg.merged_weight("o_proj", li),
+            )
+            ml["gu"] = self.lin(
+                st,
+                li,
+                "gu",
+                f"{D}/gu.axmodel",
+                cfg.merged_weight("gu", li),
+                "m",
+                ["gate", "up"],
+            )
+            gate, up = r2(A, "gate"), r2(A, "up")
+            ml["silu_f"] = self.fused(
+                f"{C}/silu_f",
+                f"{D}/silu_f.axmodel",
+                f"silu{cfg.I}",
+                {"gate": list(gate) + list(gate * K2), "up": list(up) + list(up * K2)},
+            )
+            ml["down_proj"] = self.lin(
+                st,
+                li,
+                "down_proj",
+                f"{D}/down_proj.axmodel",
+                cfg.merged_weight("down_proj", li),
+                "act",
+                ["down"],
+            )
+            self.norm2(C, D, "dn", ml, gn, a=x1, b=r2(A, "down"))
+        if "dnqk" in progs or ("dn" in progs and "down_proj" not in progs):
+            self.norm2(
+                C,
+                D,
+                "dnqk" if "dnqk" in progs else "dn",
+                ml,
+                gn,
+                a=x1,
+                b=r2(A, "down"),
+                z=r2(A, "act"),
+                w=cfg.merged_weight("down_proj", li),
+                silu=(r2(A, "gate"), r2(A, "up")),
+                qkv=li + 1 if "dnqk" in progs else None,
             )
         for k in ("gu", "qkv5"):
             if k in ml:
@@ -1048,7 +1224,8 @@ def main():
     t0 = time.time()
     for li in range(lo_l, hi_l + 1):
         layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
-        (layer[cfg.fuse] if cfg.fuse < 4 else gen.layer_fused4)(st, li, man)
+        layer += [gen.layer_fused4, gen.layer_fused5]
+        layer[cfg.fuse](st, li, man)
         json.dump(man, open(mpath, "w"), indent=1)
         ml = man[f"L{li}"]
         tnames = sorted(
@@ -1060,7 +1237,7 @@ def main():
         n1, n2 = [("n1_rms", "n2_rms"), ("n1", "n2")][min(cfg.fuse, 1)]
         if cfg.fuse >= 2:
             n1 = "on2" if "on2" in ml else "on2g"
-            n2 = next(k for k in ("dnq", "dn") if k in ml)
+            n2 = next(k for k in ("dnqk", "dnq", "dn") if k in ml)
         print(
             f"{st} L{li}: {len(ml)} programs, templates {tnames}, u max "
             f"{ml[n1]['u_absmax']:.1f}/{ml[n2]['u_absmax']:.1f}, "
@@ -1069,7 +1246,7 @@ def main():
         )
     if hi_l == cfg.L - 1:
         post = [gen.post, gen.post_fused, gen.post_fused2, gen.post_fused2]
-        (post[cfg.fuse] if cfg.fuse < 4 else gen.post_fused2)(st, man)
+        (post[cfg.fuse] if cfg.fuse < 4 else gen.post_fused2)(st, man)  # noqa
         json.dump(man, open(mpath, "w"), indent=1)
         print(f"{st} post done, {time.time() - t0:.0f}s", flush=True)
 
