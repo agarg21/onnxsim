@@ -86,6 +86,8 @@ DIMS = tpl.Dims(H=32, I=64, nh=4, nkv=2, hd=16, eps=1e-6, vocab=64)
         "qkf64",
         "lanorm64",
         "slanorm64",
+        "alanorm64",
+        "alanorml64x128",
     ],
 )
 def test_fused_eval_float_matches_reference(name):
@@ -218,8 +220,8 @@ def _config(name, out, fuse=0):
 
 
 WIRING = [("qwen3_like", 0), ("llama_gqa", 0), ("llama_mha", 0)]
-WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5, 6)]
-WIRING += [(m, f) for m in ("llama_gqa", "llama_mha") for f in (1, 2, 3)]
+WIRING += [("qwen3_like", f) for f in (1, 2, 3, 4, 5, 6, 7)]
+WIRING += [(m, f) for m in ("llama_gqa", "llama_mha") for f in (1, 2, 3, 7)]
 
 
 @pytest.mark.parametrize("name,fuse", WIRING)
@@ -285,14 +287,21 @@ def test_template_names():
 
 
 @pytest.mark.parametrize(
-    "fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3), (6, 3)]
+    "fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6), (4, 4), (5, 3), (6, 3), (7, 2)]
 )
 def test_programs_per_layer(fuse, runs):
     """Executes per layer of the rest set; layer 0 also runs the first norm,
     and a split first-set ``down_proj`` keeps its own programs."""
     cfg = _config("qwen3_like", ".", fuse)
     assert len(cfg.programs("rest", "L1")) == runs
-    if fuse >= 5:
+    if fuse == 7:
+        assert cfg.programs("rest", "L0") == ["n1qk", "aon2g", "dnqk"]
+        assert cfg.programs("first", "L0")[:3] == ["n1qk", "attn", "on2"]  # split
+        assert cfg.kv_producer("rest", 1) == ("L0", "dnqk")
+        llama = _config("llama_gqa", ".", fuse)
+        assert llama.programs("rest", "L1") == ["qkv5", "rq", "rk", "aon2", "gu", "dn"]
+        assert llama.kv_producer("rest", 1) == ("L1", "rk")
+    elif fuse >= 5:
         assert cfg.programs("rest", "L0")[0] == "n1qk"
         assert cfg.programs("first", "L1")[:2] == ["qkv5", "qk"]
         assert cfg.kv_producer("rest", 1) == ("L0", "dnqk")
@@ -326,6 +335,8 @@ def test_merged_template_names():
     five, six = (set(tpl.needed(_config("qwen3_like", ".", f))) for f in (5, 6))
     assert {"nrmqk32", "slanormqk64"} <= five and not {"nrmqkr32"} & five
     assert {"nrmqkr32", "slanormqkr64"} <= six and not {"nrmqk32"} & six
+    assert "alanorml64x128" in tpl.needed(_config("qwen3_like", ".", 7))
+    assert "alanorm32" in tpl.needed(_config("llama_gqa", ".", 7))  # nh * hd = 32
 
 
 @pytest.mark.parametrize("name", ["nrmqkr32", "slanormqkr64"])

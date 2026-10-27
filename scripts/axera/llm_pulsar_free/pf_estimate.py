@@ -165,8 +165,11 @@ class Chain:
 
         qr, kr = self.rope(f, sl, t)
         K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
-        att = f("attn")(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
-        x1, m = f("on2")(z=att, a=x, g=g2)
+        att_in = dict(q=qr, k=K, v=V, mask=cfg.mask_plan(p))
+        if (f"L{li}", "aon2") in self.f:  # fuse=7: the attention is in aon2
+            x1, m = f("aon2")(**att_in, a=x, g=g2)
+        else:
+            x1, m = f("on2")(z=f("attn")(**att_in), a=x, g=g2)
         gu = f("gu")(m)
         og = lay.offsets(cfg.GU)
         gate = gu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
@@ -282,11 +285,13 @@ class Chain:
             K[p], V[p] = kr.reshape(-1), sl("v_proj", kvd).reshape(-1)
             x = {"x": x["x"], "q": qr}
         res = x["x"]
-        att = f("attn")(q=x["q"], k=K, v=V, mask=cfg.mask_plan(p))
-        if (wh, "on2g") in self.f:
-            x1, gu = f("on2g")(z=att, a=res, g=g2)
+        att_in = dict(q=x["q"], k=K, v=V, mask=cfg.mask_plan(p))
+        if (wh, "aon2g") in self.f:  # fuse=7: the attention is in aon2g
+            x1, gu = f("aon2g")(**att_in, a=res, g=g2)
+        elif (wh, "on2g") in self.f:
+            x1, gu = f("on2g")(z=f("attn")(**att_in), a=res, g=g2)
         else:
-            x1, m = f("on2")(z=att, a=res, g=g2)
+            x1, m = f("on2")(z=f("attn")(**att_in), a=res, g=g2)
             gu = f("gu")(m)
         og = lay.offsets(cfg.GU)
         gate = gu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
@@ -304,11 +309,13 @@ class Chain:
 
     def layer(self, li, x, K, V, p):
         cfg = self.cfg
-        if cfg.fuse >= 5:
+        # fuse=7 without a per-head q / k norm is layout 3 with aon2
+        big = cfg.fuse if cfg.qk_norm else min(cfg.fuse, 3)
+        if big >= 5:
             if isinstance(x, dict) and "kv" in x:  # the previous layer computed them
                 K[p], V[p] = x["kv"][0].reshape(-1), x["kv"][1].reshape(-1)
             return self.layer_fused5(li, x, K, V, p)
-        if cfg.fuse >= 4:
+        if big >= 4:
             return self.layer_fused4(li, x, K, V, p)
         if cfg.fuse >= 2:
             return self.layer_fused2(li, x, K, V, p)
@@ -352,7 +359,7 @@ class Chain:
         return f("res2")(x1, f("down_proj")(act))
 
     def post(self, x):
-        if self.cfg.fuse >= 4:
+        if self.cfg.fuse >= 4 and self.cfg.qk_norm:
             return self.f[("post", "lm_head")](x["a"]).reshape(-1)
         if self.cfg.fuse >= 2:
             return self.f[("post", "lm_head")](x[1]).reshape(-1)

@@ -19,9 +19,11 @@ is emitted from or fed with.
   ``down_proj`` (``LAYER_FUSED3``, 6), ``4`` also the linear after each norm
   (``LAYER_FUSED4``, 4), ``5`` also the next layer's q / k / v linears and
   RoPE into ``dn`` (``LAYER_FUSED5``, 3), ``6`` the same programs with
-  rotate_half made in ``dnqk`` / ``n1qk`` (three linears instead of five).
+  rotate_half made in ``dnqk`` / ``n1qk`` (three linears instead of five),
+  ``7`` also the attention into the program after it (``LAYER_FUSED7``, 2;
+  without a per-head q / k norm layout 3's ``attn`` + ``on2``, 6).
   Qwen3-0.6B defaults to 5, llama-160m (no per-head q / k norm: ``4`` to
-  ``6`` do not apply) to 3.
+  ``6`` do not apply, ``7`` is layout 3 with ``aon2``) to 3.
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -190,7 +192,7 @@ class Config:
     def kv_producer(self, st: str, li: int) -> tuple[str, str]:
         """``(where, program)`` that computes layer ``li``'s K row (and, with
         ``fuse=5``, its V row: ``yk`` and ``v``)."""
-        if self.fuse < 5:
+        if self.fuse < 5 or not self.qk_norm:
             return f"L{li}", self.k_program[0]
         if li == 0:
             return "L0", "n1qk"
@@ -203,7 +205,7 @@ class Config:
         if wh == "post":
             return list(self.post_programs)
         progs = list(self.layer_programs)
-        if self.fuse >= 4:
+        if self.fuse >= 4 and self.qk_norm:
             li = int(wh[1:])
             five = self.fuse >= 5
             split = self.is_split(st, li, "down_proj")
@@ -212,14 +214,20 @@ class Config:
                 head = ["qkv5", "qk"] if five else ["qkv5"]
             dnq = "dnqk" if five else "dnq"
             tail = ["on2g", dnq if li + 1 < self.L else "dn"]
+            attn = ["attn"]
+            if self.fuse >= 7:  # the attention joins on2g
+                attn, tail[0] = [], "aon2g"
             if split:
-                tail = ["on2", "gu", "silu_f", "down_proj", "dn"]
-            return head + ([] if five else ["qk"]) + ["attn"] + tail
+                attn, tail = ["attn"], ["on2", "gu", "silu_f", "down_proj", "dn"]
+            return head + ([] if five else ["qk"]) + attn + tail
         if self.fuse >= 2:
             li = int(wh[1:])
             if li == 0:
                 progs.insert(0, "n1")
             if self.is_split(st, li, "down_proj"):
+                if "aon2" in progs:  # fuse=7: the split layer keeps attn and on2
+                    i = progs.index("aon2")
+                    progs[i : i + 1] = ["attn", "on2"]
                 split = ["silu_f", "down_proj"] if self.fuse >= 3 else ["down_proj"]
                 i = progs.index("dn")
                 progs[i:i] = split

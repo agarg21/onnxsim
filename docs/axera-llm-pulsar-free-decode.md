@@ -30,7 +30,7 @@ GPTQ=1 python pf_estimate.py --doc 0      # host estimate (fake-quant), no card
 python pf_plan.py --fake --float-set      # wiring check against the float model, no card / Pulsar2
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
 GPTQ=1 python pf_plan.py --generate 48    # free-running greedy decode vs float -> <out>/gen.json
-# LLM_PF_FUSE=0..6 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
+# LLM_PF_FUSE=0..7 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
 python pf_add_offset.py <out> <out>_x     # optional: exact Add offset words (below)
 python pf_baseline_llm_build.py --build-dir <llm_build out>   # Pulsar2 llm_build on the same steps
 python pf_profile.py                      # per-program card time of the rest set
@@ -109,6 +109,7 @@ token. The table above is layout `0`. Layouts `1`..`5` run neighbouring programs
 | 4 | the linear after each norm joins it: `on2g` = `on2` + `gu` (`lanorml<k>x<n>`), `dnq` = `dn` + the next layer's `qkv5` (`slanorml<k>x<n>`); layer 0 `n1q` (`nrml<n>`) | 4 | 114 |
 | 5 (Qwen3 default) | the next layer's q / k / v and its RoPE join `dn`: `dnqk` (`slanormqk<I>`: five linears q, q_rot, k, k_rot, v, then `qkf`; outputs the residual, q, and the K / V rows); layer 0 `n1qk` (`nrmqk<H>`) | 3 | 86 |
 | 6 | the programs of `5`, with rotate_half made inside `dnqk` / `n1qk` (`slanormqkr<I>` / `nrmqkr<H>`): three linears q, k, v (4096 columns instead of 7168), and q_rot / k_rot by `Split` / `Concat` of each head's halves | 3 | 86 |
+| 7 (opt-in) | the attention joins the program after it: `aon2g` = `attn` + `on2g` (`alanorml<k>x<n>`); without a per-head q / k norm (llama-160m) layout 3's `attn` + `on2` = `aon2` (`alanorm<k>`) | 2 (llama: 6) | 58 (llama: 74) |
 
 A merged program has several outputs where the residual stream goes on (`x` and the
 normalized `y`; `qk`'s `yq` and `yk`, which is bound to K row `p` as `rk`'s was). Only
@@ -147,6 +148,20 @@ How the merged programs are made:
   after a split first-set layer keeps its own `qkv5` and `qk`. The rest set's `dnqk` is
   calibrated on the rest set's samples; the first set's RoPE parts on both sets (at
   position 0 sin = 0 makes `r * sn` a zero range).
+- **Layout 7's attention.** The program before the attention (`dnqk`, or `rk` and the V
+  copy) writes the step's K / V rows into the caches, so the attention cannot join it
+  without moving the new row into the program (the cache input and the row output
+  would be one device buffer in one execute). The program after it has no such
+  dependency: `aon2g` reads q, both whole caches and the mask, as `attn` did. Each
+  part keeps its calibration; the attention's output and the linear's input are one
+  tensor (Reshape is data movement), at the union of both ranges (`z`, the linear's
+  real range x2). Retargeting `alanorml2048x6144` between its four variants gives the
+  native build byte for byte wherever it is not refused. For llama-160m's `alanorm768`,
+  `v1` / `v2` retargeted to `v0`'s calibration differ from the native `v0` in 193
+  records (unchecked: native `v0` is laid out differently or the retarget is wrong);
+  every generated `aon2` came from `v1` and passes `pf_check.py`. Calibrating that tensor at the
+  attention's own range instead was worse on the card (96 steps: 3.60% / 2.98% against
+  3.56% / 2.97%).
 - **Several linears in one program** (`on2g`, `dnq`, `dnqk`: two to six). Each has its
   table in `npu_params` (found from the template's own weights and calibration) and its
   own core `zp_x` records, told apart by the template's zero points (refused when two
@@ -303,6 +318,8 @@ and after every run.
 | Qwen3-0.6B | rebuilt (see below), `LLM_PF_FUSE=3` | 44/48, 3.37% (5.89%) | 43/48, 2.77% (3.53%) | card 94-95 ms |
 | Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=4` (not taken) | 44/48, 3.46% (6.37%) | 42/48, 2.84% (4.41%) | card 77-78 ms |
 | Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=5` (default) | 43/48, 3.47% (6.00%) | 43/48, 2.77% (3.68%) | 0.08-0.09 (card 68-70 ms) |
+| Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=7` | 44/48, 3.55% (6.18%) | 43/48, 2.81% (3.80%) | 0.074-0.079 (card 57-58 ms) |
+| llama-160m | rebuilt, `LLM_PF_FUSE=7` | 45/47, 1.29% (1.84%) | 46/47, 1.26% (1.58%) | card 34 ms |
 | Qwen3-0.6B | Pulsar2 `llm_build` | 45/48, 7.47% (9.73%) | 47/48, 7.27% (9.66%) | 0.29 |
 | Qwen3-0.6B | layout 5 + exact Add offsets (`pf_add_offset.py`) | 45/48, 2.85% (6.04%) | 44/48, 2.24% (3.56%) | card 70 ms |
 | llama-160m | layout 3 + exact Add offsets (`pf_add_offset.py`) | 45/47, 1.23% (1.75%) | 46/47, 1.14% (1.40%) | card 37 ms |
@@ -350,6 +367,25 @@ Notes on the table:
   are unchanged. The rest set is 643 MB against 738 MB (`dnqk` 7.9 MB against 11.3 MB per
   layer). Two of three `pf_profile.py` runs of layout 6 read every program, the unchanged
   ones included, 30-70% slow, so the profile is taken from the third run.
+- **Layout 7, back to back** (2026-10-27). Qwen3-0.6B: 58 executes and 145 resident
+  programs per token against 86 and 198. Card time, medians of alternating runs (host
+  load 6.5-8.5): 57.2-57.6 ms against 66.2-66.4 ms for layout 6; in an earlier session
+  at host load 3-5, the attention merge on top of layout 5 gave 61.5-62.3 ms against
+  69.3-69.8 ms. Layout 7's programs are layout 6's plus `aon2g`, and layout 6 computes
+  what layout 5 does bit for bit, so its 48 steps equal the merge on top of layout 5:
+  mean logit error 3.94% / 3.18% against 3.85% / 3.09%, top-1 44/48 and 43/48 against
+  43/48 and 43/48 (it no longer misses adaquant position 17). Over 96 steps the
+  difference is 3.56% / 2.97% against 3.51% / 2.93%, top-1 90/96 and 87/96 against 89
+  and 87, and steps 48-95 alone are equal (mean difference +0.002 / -0.001 points).
+  Host estimate 45/48 2.45% and 44/48 2.20% (layout 5: 2.34%, 2.18%). llama-160m (layout
+  3 with `aon2`): 74 executes and 148 programs against 86 and 172, card 33.6-34.3 ms
+  against 38.5-38.7 ms; mean 1.55% / 1.42% against 1.54% / 1.40%, top-1 45/47 and 46/47
+  against 46/47 and 46/47 (the extra miss is adaquant position 30, float gap 0.036,
+  which layout 0 also missed). `pf_check.py` (with `card_add`): every `aon2g` / `aon2`
+  output within 1.3e-3 on both sets of both models. Every program layout 7 shares with
+  layout 6 (llama-160m: layout 3) is byte-identical. Layout 7 is not the default: on the
+  48 steps its mean error is 0.1 points higher on Qwen3, and llama-160m misses one more
+  near tie.
 - **llama-160m, merged layouts** (rebuilt the same way, round-to-nearest weights,
   layouts 0-3 back to back). Executes per token: 171 (`0`), 122 (`1`), 98 (`2`) and 86
   (`3`); resident programs 342 / 244 / 196 / 172. Without a per-head q / k norm, `rq` and
@@ -552,7 +588,8 @@ nothing of `down_proj`'s output to the residual on the card (`b` range 0.07 agai
 - **Layouts `4` to `6` need a per-head q / k norm** (`qkf`): llama-160m stops at layout `3`.
 - **Not merged yet.** `gu` + the SiLU: in a program where the SiLU follows two linears,
   Pulsar2 fuses Sigmoid and Mul into one job whose records are not decoded (the SiLU
-  sits in `dnqk` before `down_proj` instead). The attention stays its own program.
+  sits in `dnqk` before `down_proj` instead). The attention joins the program after it
+  (layout 7) but not the one before it, which writes its K / V rows.
 - **Layout 6 is not the default yet.** It needs the `nrmqkr` / `slanormqkr` templates
   (`pf_templates.py`). The first set's layers after a split layer (1-3) keep a `qkv5` of
   7168 columns and `qk`.
