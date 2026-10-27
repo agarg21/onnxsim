@@ -85,6 +85,9 @@ LAYER_FUSED4 = ["qk", "attn", "on2g", "dnq"]
 #: the caches); layer 0 starts with ``n1qk``. A layer after a split first-set
 #: layer has ``qkv5`` and ``qk`` of its own.
 LAYER_FUSED5 = ["attn", "on2g", "dnqk"]
+#: ``fuse=6``: the programs of ``fuse=5``; ``dnqk`` / ``n1qk`` hold three
+#: linears (q, k, v) and make rotate_half of q and k in the program (Split /
+#: Concat: data movement) instead of two more linears of rotated weights
 
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:

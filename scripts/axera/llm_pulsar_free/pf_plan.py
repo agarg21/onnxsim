@@ -614,6 +614,7 @@ def _float_program(cfg, d, wh, k, ml, fused):
     if k == "dn" and "down_proj" in ml:  # after a split down_proj: Add + norm
         return tpl.float_graph(f"anorm{cfg.H}", d)
     silu = "s" if cfg.fuse >= 3 else ""
+    rot = "r" if cfg.fuse >= 6 else ""  # q_rot / k_rot made in the program
     name, ws = {
         "on2": (f"lanorm{qd}", {"w": ("o_proj", li)}),
         "dn": (f"{silu}lanorm{cfg.I}", {"w": ("down_proj", li)}),
@@ -627,10 +628,10 @@ def _float_program(cfg, d, wh, k, ml, fused):
         ),
         "n1q": (f"nrml{qkv}", {"w2": ("qkv5", li)}),
         "dnqk": (
-            f"slanormqk{cfg.I}",
+            f"slanormqk{rot}{cfg.I}",
             {"w": ("down_proj", li), "qkv": ("qkv5", li + 1)},
         ),
-        "n1qk": (f"nrmqk{cfg.H}", {"qkv": ("qkv5", li)}),
+        "n1qk": (f"nrmqk{rot}{cfg.H}", {"qkv": ("qkv5", li)}),
     }[k]
     fg = tpl.float_graph(name, d)
     for wn, (key, lj) in ws.items():
@@ -640,6 +641,8 @@ def _float_program(cfg, d, wh, k, ml, fused):
             o = lay.offsets(cfg.QKV)
             src = dict(q_proj="q", q_rot="qr", k_proj="k", k_rot="kr", v_proj="v")
             parts = {f"w{src[p]}": w[:, o[p] : o[p] + n] for p, n in cfg.QKV}
+            if rot:
+                parts = {t: parts[t] for t in ("wq", "wk", "wv")}
         for pn, pw in parts.items():
             wi = next(i for i in fg.graph.initializer if i.name == pn)
             wi.CopyFrom(onnx.numpy_helper.from_array(np.ascontiguousarray(pw), pn))

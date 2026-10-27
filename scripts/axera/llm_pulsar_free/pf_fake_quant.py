@@ -4,8 +4,8 @@ calibration (MatMul operands signed: s16 codes, zero point 0), float math in
 between; linears with the card's s8 per-output-channel weights.
 
 Fused graphs are evaluated node by node (Mul, Add, Div, Sqrt, ReduceMean,
-MatMul, Transpose, Softmax, Sigmoid, Reshape); a tensor without a calibration
-(a Reshape's output, or every tensor with an empty calibration) passes through
+MatMul, Transpose, Softmax, Sigmoid, Reshape, Split, Concat); a tensor without
+a calibration (a Reshape's output, or every tensor with an empty calibration) passes through
 unrounded, so ``FusedEval(model, {})`` is the float function of the program.
 
 ``card_add=True`` evaluates each U16 Add of two calibrated tensors as the card
@@ -67,6 +67,8 @@ def _node(op, x, at):
         return 1 / (1 + np.exp(-x[0]))
     if op == "Reshape":
         return x[0].reshape([int(d) for d in x[1]])
+    if op == "Concat":
+        return np.concatenate(x, axis=at["axis"])
     raise NotImplementedError(op)
 
 
@@ -152,7 +154,7 @@ class FusedEval:
             (
                 n.op_type,
                 list(n.input),
-                n.output[0],
+                list(n.output),
                 {a.name: onnx.helper.get_attribute_value(a) for a in n.attribute},
             )
             for n in m.graph.node
@@ -194,16 +196,22 @@ class FusedEval:
         }
         for k, a in feeds.items():
             v[k] = self._r(k, a)
-        for op, ins, o, at in self.nodes:
-            if op == "Add" and self.card_add and self._card_add_ok(ins, o):
-                v[o] = card_add(
+        for op, ins, outs, at in self.nodes:
+            if op == "Add" and self.card_add and self._card_add_ok(ins, outs[0]):
+                v[outs[0]] = card_add(
                     *(v[i] for i in ins),
-                    *(self.cal[t] for t in (*ins, o)),
+                    *(self.cal[t] for t in (*ins, outs[0])),
                     exact_offset=self.exact_offset,
                 )
                 continue
+            x = [v[i] for i in ins]
             # an operand quantized for a consumer MatMul (signed) is rounded where it is produced
-            v[o] = self._r(o, _node(op, [v[i] for i in ins], at))
+            if op == "Split":  # equal parts (opset 17, no ``split`` input)
+                ys = np.split(x[0], len(outs), axis=at.get("axis", 0))
+            else:
+                ys = [_node(op, x, at)]
+            for o, y in zip(outs, ys):
+                v[o] = self._r(o, y)
         return v
 
 

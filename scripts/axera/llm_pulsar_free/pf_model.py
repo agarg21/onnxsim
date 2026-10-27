@@ -18,8 +18,10 @@ is emitted from or fed with.
   norm after them (``LAYER_FUSED2``, 7), ``3`` also the SiLU before
   ``down_proj`` (``LAYER_FUSED3``, 6), ``4`` also the linear after each norm
   (``LAYER_FUSED4``, 4), ``5`` also the next layer's q / k / v linears and
-  RoPE into ``dn`` (``LAYER_FUSED5``, 3). Qwen3-0.6B defaults to 5,
-  llama-160m (no per-head q / k norm: ``4`` and ``5`` do not apply) to 3.
+  RoPE into ``dn`` (``LAYER_FUSED5``, 3), ``6`` the same programs with
+  rotate_half made in ``dnqk`` / ``n1qk`` (three linears instead of five).
+  Qwen3-0.6B defaults to 5, llama-160m (no per-head q / k norm: ``4`` to
+  ``6`` do not apply) to 3.
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions

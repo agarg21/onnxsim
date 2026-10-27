@@ -101,6 +101,10 @@ def _fbits(v) -> int:
 #: data-movement ops: no calibration of their own (Pulsar2's quant json can leave
 #: their output, e.g. a fused program's graph output, without an entry)
 PASS_THROUGH = ("Reshape", "Transpose", "Flatten", "Squeeze", "Unsqueeze")
+#: data movement with several inputs or outputs (rotate-half inside a program:
+#: ``Split`` a head into halves, ``Concat`` them swapped). Pulsar2 runs them
+#: without a job and calibrates every side alike
+MOVES = PASS_THROUGH + ("Split", "Concat")
 
 
 def propagate(
@@ -110,9 +114,14 @@ def propagate(
     a calibration of its own given its neighbour's."""
     m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
     q = dict(q)
+    consts = {i.name for i in m.graph.initializer}
     moves = [
         (n.input[0], n.output[0]) for n in m.graph.node if n.op_type in PASS_THROUGH
     ]
+    for n in m.graph.node:  # every side of a Split / Concat alike
+        if n.op_type in ("Split", "Concat"):
+            ts = [t for t in [*n.input, *n.output] if t and t not in consts]
+            moves += [(a, b) for a in ts for b in ts if a != b]
     changed = True
     while changed:
         changed = False
@@ -426,6 +435,8 @@ def graph_nodes(model) -> list[tuple[str, tuple, str, dict]]:
             sh = dims[n.input[0]]
             axes = next((list(a.ints) for a in n.attribute if a.name == "axes"), [-1])
             attrs["count"] = int(np.prod([sh[a] for a in axes]))
+        if len(n.output) > 1:  # a Split: every output
+            attrs["outputs"] = list(n.output)
         out.append((n.op_type, tuple(n.input), n.output[0], attrs))
     return out
 
@@ -441,8 +452,8 @@ def _tensor_candidates(q) -> dict[str, int]:
 def _graph_candidates(nodes, q) -> dict[str, int]:
     c = {}
     for i, (op, ins, out, attrs) in enumerate(nodes):
-        sub = {t: q[t] for t in {*ins, out} if t in q}
-        if op in PASS_THROUGH or op == "FullyConnected":
+        sub = {t: q[t] for t in {*ins, out, *attrs.get("outputs", ())} if t in q}
+        if op in MOVES or op == "FullyConnected":
             got = _tensor_candidates(sub)
         else:
             used = ins[:1] if op in UNARY else ins
@@ -497,9 +508,11 @@ def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
 
     # tensor -> the compute node that produces it (through data-movement nodes)
     prod: dict[str, int | None] = {}
-    for i, (op, ins, out, _) in enumerate(nodes or []):
-        if op in PASS_THROUGH:
-            prod[out] = prod.get(ins[0])
+    for i, (op, ins, out, attrs) in enumerate(nodes or []):
+        if op in MOVES:  # a Concat's halves come from one node in practice
+            src = next((prod[t] for t in ins if prod.get(t) is not None), None)
+            for o in attrs.get("outputs", [out]):
+                prod[o] = src
         else:  # a FullyConnected runs outside the main engine's CORE jobs
             prod[out] = None if op == "FullyConnected" else i
     deps = {
@@ -624,7 +637,7 @@ def retarget_graph(
     with different targets is still refused. A DEQUANT job holds an
     output's ``s`` and zero point (any graph output unless ``out`` names one); PARAM jobs and the other segments any
     node's. Records below ``MIN_CALIB_REG`` are never rewritten.
-    Data-movement nodes (``PASS_THROUGH``) contribute per-tensor formulas
+    Data-movement nodes (``MOVES``) contribute per-tensor formulas
     only."""
     m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
     nodes = graph_nodes(m)
@@ -644,13 +657,13 @@ def retarget_graph(
     ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
     main = _segs(gs.load_model(template))[gs.MAIN]
     comp = [
-        i
-        for i, n in enumerate(nodes)
-        if n[0] not in PASS_THROUGH and n[0] != "FullyConnected"
+        i for i, n in enumerate(nodes) if n[0] not in MOVES and n[0] != "FullyConnected"
     ]
     # a CORE job per compute node, a few pairs of nodes run as one job, or a few
     # extra jobs without calibration records
-    strict = abs(len(comp) - _core_jobs(template)) <= MAX_MERGED
+    # (a Split / Concat may take a job without records of its own)
+    moves = sum(1 for n in nodes if n[0] in ("Split", "Concat"))
+    strict = abs(len(comp) - _core_jobs(template)) <= MAX_MERGED + moves
     assign = {}
     if strict:
         try:

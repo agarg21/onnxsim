@@ -32,7 +32,9 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
 * ``nrmqk<H>`` / ``slanormqk<I>`` (``fuse=5``): ``nrm`` / ``slanorm``, then
   the five q / k / v linears from the norm's output and ``qkf`` (outputs
   ``yq``, ``yk``, ``v``); a variant generator may come with its own weights
-  (``(gen, {initializer: weights})``);
+  (``(gen, {initializer: weights})``); ``nrmqkr<H>`` / ``slanormqkr<I>``
+  (``fuse=6``) the same with three linears q, k, v, rotate_half of q and k
+  made in the program by Split / Concat (``ROT``);
 * merged programs (``pf_layout.LAYER_FUSED*``), several outputs where the
   residual stream continues: ``nrm<n>`` (the two-pass RMSNorm), ``anorm<n>``
   (residual Add + two-pass norm, outputs ``x`` and ``y``), ``qkf<nh*hd>``
@@ -221,6 +223,15 @@ QKF_K = """
   yk = Reshape(ykh, shyk)
 """
 QKF = QKF_Q + QKF_KC + QKF_K
+#: rotate_half's permutation of ``{t}`` per head, in the program (``fuse=6``):
+#: ``[nh, 2, hd / 2]``, the halves swapped (the sign is in the sin tables). Pulsar2
+#: runs Split / Concat as data movement, without a job, calibrated as ``{t}``
+ROT = """
+  {t}3 = Reshape({t}, sh{t}3)
+  {t}1, {t}2 = Split<axis=1>({t}3)
+  {t}r3 = Concat<axis=1>({t}2, {t}1)
+  {t}r = Reshape({t}r3, {sh})
+"""
 
 
 # ---- calibration generators of the four variants (Pulsar2 MinMax over 18 draws) ------
@@ -388,7 +399,8 @@ def graph(name: str, d: Dims):
     variant generators)`` of a fused template ``name``."""
     m = re.fullmatch(
         r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
-        r"|nrml|lanorml|slanorml|nrmqk|slanormqk)(\d+)(?:x(\d+))?(t?)",
+        r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk)"
+        r"(\d+)(?:x(\d+))?(t?)",
         name,
     )
     if not m:
@@ -455,24 +467,35 @@ def graph(name: str, d: Dims):
         inits = {"w": w, "eps": eps["eps"], "eps0": eps["eps"]}
         ops = ["FullyConnected", "MatMul", "Sigmoid"] + NORM_OPS
         return ops, SILU_LINEAR_ADDNORM, ins, {"x": [1, H], "y": [1, H]}, inits, gens
-    if kind in ("nrmqk", "slanormqk"):
+    if kind in ("nrmqk", "slanormqk", "nrmqkr", "slanormqkr"):
         # the norm (nrm<H>, or slanorm<I>), then five linears q, q_rot, k, k_rot,
-        # v from its output and the qkf RoPE: outputs (x,) yq, yk, v
-        base = "nrm" if kind == "nrmqk" else "slanorm"
+        # v from its output and the qkf RoPE: outputs (x,) yq, yk, v.
+        # ``nrmqkr`` / ``slanormqkr`` (``fuse=6``): three linears q, k, v, and
+        # q_rot / k_rot made in the program (``ROT``, data movement)
+        rot = kind.endswith("r")
+        base = "nrm" if kind.startswith("nrm") else "slanorm"
         ops, body, ins, outs, inits, gens = graph(f"{base}{n}", d)
         _, qbody, qins, qouts, qinits, _ = graph(f"qkf{d.nh * d.hd}", d)
         nq, nk = d.nh * d.hd, d.nkv * d.hd
         body = body.replace("  y = Mul(d, g)", "  yn = Mul(d, g)")
         for a, b in NORM_QK_RENAME.items():  # qkf's sin table is ``sq``
             body = body.replace(f"  {a} = ", f"  {b} = ").replace(f"({a})", f"({b})")
-        body += "".join(
-            f"  {t} = MatMul(yn, w{t})\n" for t in ("q", "qr", "k", "kr", "v")
-        )
+        widths = {"q": nq, "qr": nq, "k": nk, "kr": nk, "v": nk}
+        if rot:
+            widths = {t: widths[t] for t in ("q", "k", "v")}
+        body += "".join(f"  {t} = MatMul(yn, w{t})\n" for t in widths)
+        if rot:
+            body += ROT.format(t="q", sh="shyq") + ROT.format(t="k", sh="shyk")
+            half = d.hd // 2
+            qinits = {
+                **qinits,
+                "shq3": np.array([d.nh, 2, half], np.int64),
+                "shk3": np.array([d.nkv, 2, half], np.int64),
+            }
         body += qbody
         ins = {**ins, **{t: qins[t] for t in ("cq", "sq", "ck", "sk")}}
         outs = {**({"x": outs["x"]} if isinstance(outs, dict) else {}), **qouts}
         outs["v"] = [1, nk]
-        widths = {"q": nq, "qr": nq, "k": nk, "kr": nk, "v": nk}
         variants = ((0.0, 0.0), (0.95, 0.98), (1.0, 0.0), (0.0, 0.9))
         out_gens = []
         for i, (kq, kk) in enumerate(variants):
@@ -482,10 +505,16 @@ def graph(name: str, d: Dims):
             }
             noise = np.random.default_rng(20 + i)
             for t, kx in (("q", kq), ("k", kk)):
-                if (
-                    kx
-                ):  # the rotated part cancels the plain part: that RoPE Add shifts < 15
-                    w = ws[f"w{t}"]
+                if not kx:
+                    continue
+                # the rotated part cancels the plain part: that RoPE Add shifts < 15
+                w = ws[f"w{t}"]
+                if rot:  # each head's second half ~ -kx x its first half
+                    wh = w.reshape(d.H, -1, 2, d.hd // 2).copy()
+                    lo = wh[:, :, 0]
+                    wh[:, :, 1] = -kx * lo + 0.05 * noise.uniform(-0.1, 0.1, lo.shape)
+                    ws[f"w{t}"] = wh.reshape(w.shape).astype(F)
+                else:
                     ws[f"w{t}r"] = (
                         -kx * w + 0.05 * noise.uniform(-0.1, 0.1, w.shape)
                     ).astype(F)
@@ -505,6 +534,8 @@ def graph(name: str, d: Dims):
             out_gens.append((gen, ws))
         inits = {**inits, **qinits, **out_gens[0][1]}
         ops = list(dict.fromkeys(["FullyConnected", "MatMul", *ops, *qops_of(d)]))
+        if rot:
+            ops += ["Split", "Concat"]
         return ops, body, ins, outs, inits, out_gens
     if kind == "qkf":
         if n != d.nh * d.hd:
@@ -641,7 +672,9 @@ def needed(cfg) -> list[str]:
                 f"slanorml{inter}x{qkv}",
             ]
         if cfg.fuse >= 5:
-            names += [f"lanorml{qd}x{2 * inter}", f"nrmqk{H}", f"slanormqk{inter}"]
+            r = "r" if cfg.fuse >= 6 else ""
+            names += [f"lanorml{qd}x{2 * inter}", f"nrmqk{r}{H}"]
+            names += [f"slanormqk{r}{inter}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]

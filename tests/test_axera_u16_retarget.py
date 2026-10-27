@@ -435,6 +435,26 @@ def test_propagate_through_data_movement():
     assert q["y"] == (2e-3, 0)
 
 
+def test_propagate_through_split_and_concat():
+    """rotate_half in a program (``pf_templates.ROT``): every side of the Split
+    and the Concat takes the input's calibration, the shape constants none."""
+    model = onnx.parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> '
+        "g (float[1,64] q) => (float[1,64] y) "
+        "{ s3 = Constant<value = int64[3] {2, 2, 16}>() "
+        "s2 = Constant<value = int64[2] {1, 64}>() "
+        "q3 = Reshape(q, s3) q1, q2 = Split<axis=1>(q3) "
+        "r3 = Concat<axis=1>(q2, q1) y = Reshape(r3, s2) }"
+    )
+    q = ur.propagate(model, {"q": (1e-3, 100)})
+    assert {t: q[t] for t in ("q3", "q1", "q2", "r3", "y")} == dict.fromkeys(
+        ("q3", "q1", "q2", "r3", "y"), (1e-3, 100)
+    )
+    nodes = ur.graph_nodes(model)
+    split = next(n for n in nodes if n[0] == "Split")
+    assert split[3]["outputs"] == ["q1", "q2"]
+
+
 # Qwen3-0.6B layer 11's k norm + RoPE, built natively at its own calibration: its RoPE
 # Add shifts 14 and its eps Add 15, so the native program writes 0x1ea0 for both
 NATIVE_QKROPE = f"{B}/gen_model/native_L11_rk"
@@ -484,6 +504,9 @@ MERGED = ("nrm1024", "anorm1024", "qkf2048") + MERGED_EXACT
 #: several linears and the q / k RoPE in one program (fuse=4 / fuse=5)
 MERGED += ("nrml7168", "lanorml2048x6144", "slanorml3072x7168")
 MERGED += ("nrmqk1024", "slanormqk3072")
+#: fuse=6: three linears and rotate_half by Split / Concat in the program (two
+#: more CORE jobs without records); built in a templates overlay
+MERGED += ("nrmqkr1024", "slanormqkr3072")
 
 
 def _merged(name, i):
