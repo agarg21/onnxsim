@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `839d38e03` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `d2c180397` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1282,3 +1282,21 @@ All pass; the default build (hand MSDA) is unchanged. The cross-attention's body
 hand kernel computes 32 points' addresses per vector instruction. Generated code needs a kernel with two vector axes (points for
 the address math, channels for the taps), which the scheduler can't express yet. Splitting it into two kernels would write
 ~15-20 MB of per-point addresses and weights to DDR per layer.
+
+**Generated MSDA: arithmetic sampling, and what vectorizing it would take.** The generated MSDA's sampling is now arithmetic only:
+- floor by `+- 1.5 * 2^23` and a `max`/`min` step;
+- corner validity as `max`/`min` products;
+- the row index through the mantissa of `index + 2^23`.
+
+Cross-attention went from 18.2 to 16.5 ms per layer. Generated-MSDA encoder: 37.4 -> 35.7 ms (1 layer), 111.6 -> 106.0 ms (3
+layers), all pass. This needed a fix in tinygrad's simplifier: with float reassociation on, it folded `(t + c) - c` back to `t`.
+Fused, it reordered `r - t` into `(R - t) - c` and lost `t`'s fraction at magnitude `2^23`. It no longer reassociates around a
+float constant of `2^20` or more, which leaves the default models unchanged.
+
+Tried and dropped: vectorizing the per-point address math. An output-axis upcast made the 8 heads x 8 points 64 lanes, and a
+forward (SLP) vectorizer turned the per-lane scalar chains into vector ops (kernel 2998 -> 767 lines). But taking ~512
+addresses and weights back out lane by lane per (query, camera) cost what the vector math saved (cross-attention 17.5 vs 16.5
+ms). The upcast alone made the temporal attention 4x slower, and the result failed the output check on the phone (qf32
+rounding). The hand kernel stages the values through a small table instead: vector stores, then scalar loads in the per-head
+loop. Generated code would need two loop nests joined by a local buffer in one kernel, which tinygrad's scheduler can't express
+yet. That is the missing piece for a generated MSDA at the hand kernel's speed.
