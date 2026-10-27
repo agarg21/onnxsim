@@ -175,6 +175,49 @@ How the merged programs are made:
   calibration tensor. Checked against native builds: all 24 variant pairs of `lanorm2048`
   / `lanorm3072`, `slanorm3072` (or refused), and `lanorm2048` with weights the template
   never saw (`tests/test_axera_u16_retarget.py`).
+- **Byte identity with native builds.** Pulsar2 is not byte-reproducible. A rebuild of
+  a template variant (same model, config and dataset, so the same calibration) is never
+  byte-equal to the original. Of 15 rebuilds (every variant of `nrm1024`, `anorm1024`
+  and `qkf2048`, v0 twice), none was. Segment 0's slot table comes out permuted, and in
+  9 the graph inputs are listed in another order. The A8 slot records (and the A7
+  records that follow them) follow that order, including where they sit among a job's
+  other records. The order is a per-build coin flip, not a function of the calibration,
+  so there is no native order a retarget could pick. `u16_retarget.compare_jobs` compares up to it: each job's other records in
+  order, its A7 / A8 records as a multiset (or their count, when the IO orders differ),
+  the slot table as a set, and `npu_params` byte for byte. Every rebuild equals its
+  original under it.
+
+  The merged groups' variant pairs come in three kinds. Some are refused (zero points
+  below 256, ties, elided Add shifts). The rest equal the target's native build under
+  `compare_jobs`, except where the native build stores its Add constants differently
+  from the template. Pulsar2 keeps each distinct Add constant once in
+  `npu_params` and loads each with a DMA job of its own. That adds a job, a sync, and
+  shifts later scratch addresses by `0x20`. An eps Add's ratio `s_eps / s_e` rounds to 0
+  for most calibrations. Where `e`'s range is small it rounds to a few units
+  (`nrm1024` v2, `anorm1024` v1 / v3), and the two eps Adds stop sharing a constant. A
+  residual update's ratio can round to 0 and then share the eps Adds' `(0x8000, 0)`.
+  These follow the calibration (the rebuilds agree), and the template fixes the program's
+  constant layout. So such a pair cannot be byte-equal without adding or removing a job.
+  Where the template shares a constant that the target needs twice, `retarget_graph`
+  leaves the shared word as the template's. llama-160m's layer-0 coarse norm is an
+  example: it has the ratio 1.0 for `m0` against 0.99994, and no eps, which is about
+  eps. That pass's output is normalized again by the second pass.
+  `add_const_sharing` gives the sharing. For the shipped sets it differs from the
+  template's for 17 of 176 Qwen3-0.6B layout-5 programs and 4 of 122 llama-160m layout-3
+  programs. Both sets pass `pf_check.py`.
+
+  `nrmqk1024`'s four variants refuse each other, and `slanormqk3072`'s templates in use
+  (v0, v1) refuse the other variants. Six held-out native builds, two per template in
+  use, cover them. Each is the variant's own draws with the norm input scaled 1.7x and
+  the gain 1.3x, or its generator with another seed. Pulsar2's MinMax gives tensors that
+  the template ties (`u` / `d`, `e` / `urr`, `kt` / `kth` / `ykh` / `yk`: a normalized
+  tensor and its copy divided by an RMS of about 1) scales one float32 ulp apart, where
+  the template has one scale. `pf_generate` ties them the same way for a real target. With the template's ties
+  on the build's calibration, the retargeted program equals the build except for the
+  moved scales' float32 lanes, 2-12 ulps apart (`nrmqk1024` v1: 16 of 2564 records;
+  `slanormqk3072` v0 needs no tie and is equal outright). This is stronger than
+  `pf_check.py` for `nrmqk1024`: a native program at a calibration the template never saw,
+  record for record.
 
 **Per-program card check (`pf_check.py`).** After a few real steps it reads back every
 program's input and output buffers as the plan bound them, runs the program's host
@@ -479,6 +522,11 @@ nothing of `down_proj`'s output to the residual on the card (`b` range 0.07 agai
 
   `pf_estimate.py` reproduces the runs' host estimates exactly, and `pf_plan.py --fake` the
   float wiring check (llama-160m: median 1.1e-4).
+- **Native identity** (`tests/test_axera_u16_retarget.py`, scratch builds): every
+  rebuild equals its original under `compare_jobs`. Every accepted pair of the 11 merged
+  groups equals the target's native build under it, or the native build's `npu_params`
+  has another length (the Add constants). The held-out builds of `nrmqk1024` v1 and
+  `slanormqk3072` v0 / v1 are covered too.
 - **The card's Add** (`tests/test_axera_llm_pulsar_free.py`): `card_add` has
   llama-160m layer 1's 1.55-code bias, and none with `exact_add_offset`.
   `tests/test_axera_u16_retarget.py`: `exact_add_offsets` on a native `anorm` build
