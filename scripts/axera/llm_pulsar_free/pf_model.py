@@ -18,7 +18,8 @@ is emitted from or fed with.
   norm after them (``LAYER_FUSED2``, 7), ``3`` also the SiLU before
   ``down_proj`` (``LAYER_FUSED3``, 6), ``4`` also the linear after each norm
   (``LAYER_FUSED4``, 4), ``5`` also the next layer's q / k / v linears and
-  RoPE into ``dn`` (``LAYER_FUSED5``, 3).
+  RoPE into ``dn`` (``LAYER_FUSED5``, 3). Qwen3-0.6B defaults to 5,
+  llama-160m (no per-head q / k norm: ``4`` and ``5`` do not apply) to 3.
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -58,6 +59,7 @@ MODELS = {
         revision="aca9b687d1425f863dcf5de9a4c96e3fe36266dd",
         first_pos=1,
         zero_pos0=True,
+        fuse=3,
     ),
     # Per-head q / k RMSNorm before RoPE (qk_norm). The linears are shared by
     # both calibration sets (one copy of the weights on the card; calibration =
