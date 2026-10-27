@@ -178,6 +178,19 @@ class Config:
         pn["input"] = x
         return (pn["xn"].reshape(1, self.H) @ self.head_t).reshape(-1), pn
 
+    def programs(self, st: str, wh: str) -> list[str]:
+        """The programs of set ``st`` at ``wh`` (``L<i>`` or ``post``), in order."""
+        if wh == "post":
+            return list(self.post_programs)
+        progs = list(self.layer_programs)
+        if self.fuse >= 2:
+            li = int(wh[1:])
+            if li == 0:
+                progs.insert(0, "n1")
+            if self.is_split(st, li, "down_proj"):
+                progs.insert(progs.index("dn"), "down_proj")
+        return progs
+
     # ---- program inputs and weights ---------------------------------------------------
     def gains(self, li):
         lw = self.model.layer_weights(li)

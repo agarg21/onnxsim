@@ -712,13 +712,19 @@ def linear_params_u16(
     zp_x: int,
     s_y: float,
     zp_y: int,
+    table_only: bool = False,
 ) -> bytes:
     """``npu_params`` of a U16 layer for weights ``w [in, out]``; the IO tail is the
-    template's."""
+    template's. ``table_only``: the weight / requantization table alone (a
+    fused program's ``npu_params`` holds it next to other constants)."""
     w = np.asarray(w, np.float32)
     if w.ndim != 2:
         raise ValueError(f"expected weights [in, out], got {w.shape}")
     k, n = w.shape
+    if table_only:
+        codes, s_w = weight_codes(w)
+        bias, m = _requant_f64(codes, s_w, s_x, zp_x, s_y, zp_y)
+        return _u16_table(codes, bias, m).tobytes()
     head = u16_table_bytes(k, n)
     if len(template_params) - head not in U16_TAILS:
         raise ValueError(

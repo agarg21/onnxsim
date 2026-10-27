@@ -158,6 +158,10 @@ NORM2 = NORM2_C + NORM2_R
 #: residual Add, then the two-pass RMSNorm of its sum; outputs the sum ``x`` (the
 #: residual stream) and the normalized ``y``
 ADDNORM = "  x = Add(a, b)\n" + NORM2
+#: a linear (``z @ w``, a FullyConnected) whose output is the residual Add's
+#: second operand, then the two-pass norm: ``o_proj`` + ``res1`` + the second
+#: norm, or ``down_proj`` + ``res2`` + the next layer's first norm
+LINEAR_ADDNORM = "  b = MatMul(z, w)\n" + ADDNORM
 #: Qwen3's q and k RoPE programs and the coarse k norm as one program: q's
 #: ``qkrope``; k's per-head coarse norm ``uk = k / r0``, ``ur = k_rot / r0``
 #: (``rot`` permutes within a head, so k_rot's head RMS is k's); k's ``qkrope``
@@ -285,6 +289,28 @@ def _addnorm_gen(n, xs, off, bk, bs, g):
     return gen
 
 
+def _lanorm_gen(k, n, w, zs, aoff, bk, g):
+    """``a = -bk * (z @ w) + noise``: with ``bk`` near 1 the residual Add cancels
+    (its shift drops below 15)."""
+
+    def gen(r):
+        z = (r.standard_normal((1, k)) * zs + 0.1 * zs).astype(F)
+        b = z @ w
+        sb = float(np.abs(b).std())
+        return {
+            "z": z,
+            "a": (-bk * b + r.standard_normal((1, n)) * sb * (1.5 - bk) + aoff * sb).astype(F),
+            "g": r.uniform(g[0], g[1], (1, n)).astype(F),
+        }
+
+    return gen
+
+
+def template_weight(k: int, n: int, seed: int = 1) -> np.ndarray:
+    """A linear template's weights (``default_rng(seed).uniform(-0.1, 0.1)``)."""
+    return np.random.default_rng(seed).uniform(-0.1, 0.1, (k, n)).astype(F)
+
+
 def _qkf_gen(d: Dims, qs, ks, cs, kq, kk):
     """``kq`` / ``kk`` > 0: q's / k's RoPE Add cancels (rotated part ~ -k x the
     plain part, sin ~ cos), so that Add shifts 14 while the eps Adds stay at 15."""
@@ -324,7 +350,7 @@ def graph(name: str, d: Dims):
     """``(op types, body, inputs {name: shape}, output shape, initializers,
     variant generators)`` of a fused template ``name``."""
     m = re.fullmatch(
-        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf)(\d+)(t?)", name
+        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm)(\d+)(t?)", name
     )
     if not m:
         raise ValueError(f"{name}: not a fused template name")
@@ -352,6 +378,18 @@ def graph(name: str, d: Dims):
         ins = {"a": [1, n], "b": [1, n], "g": [1, n]}
         eps2 = {**eps, "eps0": eps["eps"]}
         return NORM_OPS, ADDNORM, ins, {"x": [1, n], "y": [1, n]}, eps2, gens
+    if kind == "lanorm":
+        # n: the linear's input width; output width d.H. The weights are the
+        # template's own (a generated program's are written by linear_emit)
+        H = d.H
+        w = template_weight(n, H)
+        p = ((1.0, 0.2, 0.0, NORM_G[0]), (2.0, 0.1, 0.9, NORM_G[1]))
+        p += ((0.5, 1.0, 0.3, NORM_G[3]), (3.0, -0.2, 0.95, NORM_G[1]))
+        gens = [_lanorm_gen(n, H, w, *a) for a in p]
+        ins = {"z": [1, n], "a": [1, H], "g": [1, H]}
+        inits = {"w": w, "eps": eps["eps"], "eps0": eps["eps"]}
+        ops = ["FullyConnected", "MatMul"] + NORM_OPS
+        return ops, LINEAR_ADDNORM, ins, {"x": [1, H], "y": [1, H]}, inits, gens
     if kind == "qkf":
         if n != d.nh * d.hd:
             raise ValueError(f"{name}: the model's q width is {d.nh * d.hd}")
@@ -467,6 +505,8 @@ def needed(cfg) -> list[str]:
     if getattr(cfg, "fuse", 0):
         names = [f"nrm{H}", f"anorm{H}", f"silu{inter}", f"attn{qd}"]
         names += [f"qkf{qd}"] if cfg.qk_norm else [f"rope{qd}", f"rope{kvd}"]
+        if cfg.fuse >= 2:
+            names += [f"lanorm{qd}", f"lanorm{inter}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]

@@ -300,12 +300,13 @@ def _base(name: str) -> str:
     return name.split("|", 1)[-1]
 
 
-def _rewrite(template, ct, cn, allowed, n_core=None) -> onnx.ModelProto:
+def _rewrite(template, ct, cn, allowed, n_core=None, fixed=None) -> onnx.ModelProto:
     """Rewrite every A1 record and ``npu_params`` word of ``template`` that
     matches one candidate of ``ct`` (allowed by ``allowed(tag, name, reg)``,
     ``tag`` one of QUANT, DEQUANT, PARAM, CORE<i> (the i-th CORE job of the
     main engine) or OTHER (other segments)) with its ``cn`` value, then
-    apply Pulsar2's write elision and re-pad the segments."""
+    apply Pulsar2's write elision and re-pad the segments. ``fixed``: a
+    ``(start, end)`` byte range of ``npu_params`` left as it is (a weight table)."""
     model = gs.load_model(template)
     by_val: dict[int, list[str]] = {}
     for k, v in sorted(ct.items()):
@@ -369,6 +370,8 @@ def _rewrite(template, ct, cn, allowed, n_core=None) -> onnx.ModelProto:
     if params is not None:
         p = bytearray(params.raw_data)
         for off in range(0, len(p) - 3, 2):
+            if fixed is not None and off + 4 > fixed[0] and off < fixed[1]:
+                continue
             val = struct.unpack_from("<I", p, off)[0]
             names = [
                 n
@@ -439,7 +442,7 @@ def _graph_candidates(nodes, q) -> dict[str, int]:
     c = {}
     for i, (op, ins, out, attrs) in enumerate(nodes):
         sub = {t: q[t] for t in {*ins, out} if t in q}
-        if op in PASS_THROUGH:
+        if op in PASS_THROUGH or op == "FullyConnected":
             got = _tensor_candidates(sub)
         else:
             used = ins[:1] if op in UNARY else ins
@@ -488,7 +491,10 @@ def _assign_core_jobs(main, comp, ct, nodes=None) -> dict[int, str]:
     # tensor -> the compute node that produces it (through data-movement nodes)
     prod: dict[str, int | None] = {}
     for i, (op, ins, out, _) in enumerate(nodes or []):
-        prod[out] = prod.get(ins[0]) if op in PASS_THROUGH else i
+        if op in PASS_THROUGH:
+            prod[out] = prod.get(ins[0])
+        else:  # a FullyConnected runs outside the main engine's CORE jobs
+            prod[out] = None if op == "FullyConnected" else i
     deps = {
         i: {prod[t] for t in nodes[i][1] if prod.get(t) is not None} if nodes else set()
         for i in comp
@@ -554,6 +560,7 @@ def retarget_graph(
     template_q: Mapping[str, tuple[float, int]],
     target_q: Mapping[str, tuple[float, int]],
     out: str | None = None,
+    weights=None,
 ) -> onnx.ModelProto:
     """``retarget`` for a fused program (several ops in one native build).
     ``model`` is its float graph; the calibrations cover every tensor, inner
@@ -575,12 +582,29 @@ def retarget_graph(
     m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
     nodes = graph_nodes(m)
     consts = {i.name for i in m.graph.initializer}
+    # a MatMul by a constant is a FullyConnected: no main-engine CORE job of its
+    # own; its weights / requantization are a table in npu_params (_linear_table)
+    fc = [
+        i for i, n in enumerate(nodes) if n[0] == "MatMul" and n[1][1] in consts
+    ]
+    if len(fc) > 1:
+        raise ValueError("more than one constant-weight MatMul")
+    for i in fc:
+        nodes[i] = ("FullyConnected", nodes[i][1][:1], nodes[i][2], {})
+        # the weights carry no calibration record (the table has them)
+        wn = m.graph.node[i].input[1]
+        template_q = {k: v for k, v in template_q.items() if k != wn}
+        target_q = {k: v for k, v in target_q.items() if k != wn}
     graph_ins = [i.name for i in m.graph.input if i.name not in consts]
     outs = {out} if out else {o.name for o in m.graph.output}
     template_q, target_q = propagate(m, template_q), propagate(m, target_q)
     ct, cn = _graph_candidates(nodes, template_q), _graph_candidates(nodes, target_q)
     main = _segs(gs.load_model(template))[gs.MAIN]
-    comp = [i for i, n in enumerate(nodes) if n[0] not in PASS_THROUGH]
+    comp = [
+        i
+        for i, n in enumerate(nodes)
+        if n[0] not in PASS_THROUGH and n[0] != "FullyConnected"
+    ]
     strict = _core_jobs(template) == len(comp)
     assign = _assign_core_jobs(main, comp, ct, nodes) if strict else {}
     if strict:
@@ -604,7 +628,59 @@ def retarget_graph(
             return node == assign[int(tag[4:])]
         return True
 
-    return _rewrite(template, ct, cn, allowed)
+    if not fc:
+        return _rewrite(template, ct, cn, allowed)
+    x, y = nodes[fc[0]][1][0], nodes[fc[0]][2]
+    wname = m.graph.node[fc[0]].input[1]
+    tmodel = gs.load_model(template)
+    tw = _template_weight(template, wname)
+    w = onnx.numpy_helper.to_array(
+        next(i for i in m.graph.initializer if i.name == wname)
+    )
+    if weights is not None:
+        w = np.asarray(weights, F)
+    old_tab = le.linear_params_u16(
+        b"", tw, *template_q[x], *template_q[y], table_only=True
+    )
+    tp = bytes(
+        next(i for i in tmodel.graph.initializer if i.name == "npu_params").raw_data
+    )
+    at = tp.find(old_tab)
+    if at < 0 or tp.find(old_tab, at + 1) >= 0:
+        raise ValueError("the template's weight table is not found exactly once")
+    res = _rewrite(template, ct, cn, allowed, fixed=(at, at + len(old_tab)))
+    params = next(i for i in res.graph.initializer if i.name == "npu_params")
+    new_tab = le.linear_params_u16(b"", w, *target_q[x], *target_q[y], table_only=True)
+    p = bytes(params.raw_data)
+    params.raw_data = p[:at] + new_tab + p[at + len(new_tab) :]
+    # the core's copy of zp_x (low half of 0x03d0, outside the main engine)
+    segs, hits = _segs(res), 0
+    for si, seg in enumerate(segs):
+        if si == gs.MAIN:
+            continue
+        for i, r in enumerate(seg):
+            if (
+                r[0] == gs.A1
+                and gs._reg(r) == le.REG_CORE_ZP_X
+                and gs._val(r) & 0xFFFF == template_q[x][1]
+            ):
+                v = (gs._val(r) & 0xFFFF0000) | target_q[x][1]
+                seg[i] = gs._rec(gs.A1, le.REG_CORE_ZP_X, v)
+                hits += 1
+    if not hits:
+        raise ValueError(f"no core {le.REG_CORE_ZP_X:#06x} record holds zp_x")
+    return wr.with_segments(res, segs)
+
+
+def _template_weight(template, name) -> np.ndarray:
+    """The template build's own weights, from the ``model.onnx`` beside its ``out/``."""
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(template))), "model.onnx"
+    )
+    tm = onnx.load(path)
+    return onnx.numpy_helper.to_array(
+        next(i for i in tm.graph.initializer if i.name == name)
+    )
 
 
 def calibrate_graph(directory: str) -> dict[str, tuple[float, int]]:
