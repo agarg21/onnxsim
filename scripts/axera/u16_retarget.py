@@ -875,3 +875,82 @@ def compare(got, want) -> list[str]:
             if x != y and not lo <= i < hi and x[0] != gs.A8
         ]
     return diffs
+
+
+def _io_order(model) -> list[str]:
+    blob = gs.parse_blob(bytes(mre.mcode_initializer(model).raw_data))
+    return [name for name, _ in blob["inputs"]]
+
+
+def _canonical_jobs(model, keep_a8: bool) -> list:
+    """Per segment: segment 0's slot table as a set, then every job (records
+    up to and including its ``a9`` launch, zero padding dropped) as its
+    records in order but the IO-slot ones (A8, and the A7 that follows one),
+    and those as a sorted multiset (``keep_a8``) or their count."""
+    out = []
+    for si, seg in enumerate(_segs(model)):
+        lo, hi = gs.slot_table(seg) if si == 0 else (0, 0)
+        jobs, cur = [], []
+        for r in seg[:lo] + seg[hi:]:
+            if r == bytes(8):
+                continue
+            cur.append(r)
+            if r[0] == gs.A9:
+                jobs.append(cur)
+                cur = []
+        jobs.append(cur)
+        out.append(
+            (
+                tuple(sorted(seg[lo:hi])),
+                tuple(
+                    (
+                        tuple(r for r in j if r[0] not in (gs.A7, gs.A8)),
+                        tuple(sorted(r for r in j if r[0] in (gs.A7, gs.A8)))
+                        if keep_a8
+                        else sum(r[0] in (gs.A7, gs.A8) for r in j),
+                    )
+                    for j in jobs
+                ),
+            )
+        )
+    return out
+
+
+def compare_jobs(got, want) -> list[str]:
+    """``compare`` up to Pulsar2's rebuild noise: two native builds of one
+    calibration list their graph inputs in different orders (a per-build coin
+    flip), and the A8 slot records (with the A7 records that follow them)
+    follow that order, also in their position among a job's other records.
+    Here every job's other records must match in order, its A7 / A8 records
+    as a multiset (only their count when the IO orders differ), the slot
+    table as a set, and ``npu_params`` byte for byte. Returns the segments
+    (and ``npu_params``) that differ."""
+    same_io = _io_order(got) == _io_order(want)
+    diffs = []
+    pa = next(i.raw_data for i in got.graph.initializer if i.name == "npu_params")
+    pb = next(i.raw_data for i in want.graph.initializer if i.name == "npu_params")
+    if pa != pb:
+        diffs.append("npu_params")
+    ca, cb = _canonical_jobs(got, same_io), _canonical_jobs(want, same_io)
+    if len(ca) != len(cb):
+        return diffs + [f"{len(ca)} segments vs {len(cb)}"]
+    diffs += [f"segment {si}" for si, (a, b) in enumerate(zip(ca, cb)) if a != b]
+    return diffs
+
+
+def add_const_sharing(nodes, q) -> tuple[int, ...]:
+    """Which Adds of a fused graph share one ``npu_params`` constant at
+    calibration ``q``: for each Add (graph order) the index of the first Add
+    with the same ``add_const`` word. Pulsar2 stores each distinct constant
+    once and loads each with its own DMA job, so two calibrations with
+    different sharing compile to programs with different job counts (an
+    eps Add's ratio ``s_eps / s_e`` rounds to 0 or to a few units; a residual
+    update's ratio can round to 0 and meet the eps Adds' ``(0x8000, 0)``).
+    A retarget keeps the template's jobs."""
+    vals = [
+        candidates("Add", {t: q[t] for t in (*ins, out)}, ins, out)["add_const"]
+        for op, ins, out, _ in nodes
+        if op == "Add"
+    ]
+    first: dict[int, int] = {}
+    return tuple(first.setdefault(v, i) for i, v in enumerate(vals))

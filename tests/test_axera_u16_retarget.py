@@ -646,3 +646,152 @@ def test_exact_add_offsets_change_only_the_offset_records():
         return next(i.raw_data for i in m.graph.initializer if i.name == "npu_params")
 
     assert params(got) == params(old)
+
+
+# ---- byte identity with native builds, up to Pulsar2's rebuild noise ---------------
+#: native rebuilds (same model, config and dataset) of template variants:
+#: <RB>/<group>/v<i>/r<k>/out/{compiled.axmodel,quant/quant_axmodel.json}
+RB = os.environ.get(
+    "AXERA_U16_MERGED_REBUILDS", "/mnt/data/cache/claude-work/tmp/qwen-fuse/D/rb"
+)
+#: native builds held out from the templates: <HO>/<group>_v<i>_<how>/
+HO = os.environ.get(
+    "AXERA_U16_MERGED_HELDOUT", "/mnt/data/cache/claude-work/tmp/qwen-fuse/D/heldout"
+)
+REBUILT = [(g, i, 1) for g in ("nrm1024", "anorm1024", "qkf2048") for i in range(4)]
+REBUILT += [(g, 0, 2) for g in ("nrm1024", "anorm1024", "qkf2048")]
+
+
+@pytest.mark.parametrize("group,i,k", REBUILT)
+def test_native_rebuild_differs_only_in_io_order(group, i, k):
+    """Pulsar2 is not byte-reproducible: a rebuild of one variant (same
+    model, config, dataset; the same calibration) may list the graph inputs
+    in another order, and the A8 slot records follow it. ``compare_jobs``
+    sees no difference."""
+    rd, od = f"{RB}/{group}/v{i}/r{k}", _merged(group, i)
+    rebuilt, orig = _need(rd), _need(od)
+    assert ur.quant_of(rd) == ur.quant_of(od)
+    assert ur.compare_jobs(gs.load_model(rebuilt), gs.load_model(orig)) == []
+
+
+def _params_len(path):
+    m = gs.load_model(path)
+    return len(next(i.raw_data for i in m.graph.initializer if i.name == "npu_params"))
+
+
+@pytest.mark.parametrize(
+    "group,t,n",
+    [(g, t, n) for g in MERGED for t, n in itertools.permutations(range(4), 2)],
+)
+def test_merged_retarget_equals_the_native_build_up_to_io_order(group, t, n):
+    """Every accepted pair is the native build of the target calibration up
+    to the IO order (``compare_jobs``), unless the native build stores its
+    Add constants differently (another ``npu_params`` length: Pulsar2 keeps
+    each distinct Add constant once and loads it with a DMA job of its own;
+    see ``add_const_sharing``), which a retarget cannot change."""
+    td, nd = _merged(group, t), _merged(group, n)
+    template, native = _need(td), _need(nd)
+    try:
+        got = ur.retarget_graph(
+            template, f"{nd}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+        )
+    except ValueError as e:
+        assert any(r in str(e) for r in REFUSALS), e
+        return
+    diffs = ur.compare_jobs(got, gs.load_model(native))
+    if _params_len(template) == _params_len(native):
+        assert diffs == []
+    else:
+        assert "npu_params" in diffs
+
+
+def test_add_const_sharing_predicts_the_constant_jobs():
+    """nrm1024 v2's two eps Adds need different constants (its ``e`` range
+    is small, so ``s_eps / s_e`` rounds to 1 unit, not 0): its native build
+    has one more ``npu_params`` word than v1's, whose eps Adds share one."""
+    d1, d2 = _merged("nrm1024", 1), _merged("nrm1024", 2)
+    p1, p2 = _need(d1), _need(d2)
+    nodes = ur.graph_nodes(f"{d1}/model.onnx")
+
+    def sharing(d):
+        return ur.add_const_sharing(
+            nodes, ur.propagate(f"{d}/model.onnx", ur.quant_of(d))
+        )
+
+    assert sharing(d1) == (0, 0) and sharing(d2) == (0, 1)
+    assert _params_len(p2) == _params_len(p1) + 2
+
+
+def _tie_to(tq, q):
+    """``q`` with every group of tensors that template calibration ``tq``
+    calibrates alike given one value (as ``pf_generate``'s ties do: a real
+    target always has them); returns it and the tensors whose value moved."""
+    q, moved = dict(q), set()
+    groups: dict = {}
+    for k, (sc, zp) in tq.items():
+        if k in q:
+            groups.setdefault(("s", sc), []).append(k)
+            if zp > 255:
+                groups.setdefault(("zp", zp), []).append(k)
+    for (kind, _), ts in groups.items():
+        i = 0 if kind == "s" else 1
+        for t in ts[1:]:
+            if q[t][i] != q[ts[0]][i]:
+                moved.add(t)
+                q[t] = (q[ts[0]][0], q[t][1]) if i == 0 else (q[t][0], q[ts[0]][1])
+    return q, moved
+
+
+@pytest.mark.parametrize(
+    "held,t",
+    [
+        ("nrmqk1024_v1_s1.7,1.3", 1),
+        ("nrmqk1024_v1_401", 1),
+        ("slanormqk3072_v0_s1.7,1.3", 0),
+        ("slanormqk3072_v0_401", 0),
+        ("slanormqk3072_v1_s1.7,1.3", 1),
+        ("slanormqk3072_v1_401", 1),
+    ],
+)
+def test_layout5_template_equals_a_held_out_native_build(held, t):
+    """The templates real layout-5 targets take (nrmqk1024 v1; slanormqk3072
+    v0 / v1), retargeted to native builds they never saw: the variant's own
+    draws with the norm input scaled 1.7x and the gain 1.3x (``s1.7,1.3``:
+    every range but the normalized tensors' moves), or its generator with
+    another seed (``401``). Pulsar2's MinMax gives tensors the
+    template ties (``u`` / ``d``, ``e`` / ``urr``, ``kt`` / ``kth`` / ``ykh`` /
+    ``yk``: a normalized tensor and its copy divided by an RMS of ~1) scales one
+    float32 ulp apart, where the template has one scale and a real target too
+    (``pf_generate`` ties them); slanormqk3072 v0 needs no tie. With the
+    template's ties on the build's calibration, the retargeted program is the
+    native build up to the IO order, but for the records of the moved scales:
+    float32 lanes up to 16 ulps apart (one ulp per moved scale, compounded)."""
+    group = held.split("_")[0]
+    hd, td = f"{HO}/{held}", _merged(group, t)
+    want, template = _need(hd), _need(td)
+    tq = ur.propagate(f"{td}/model.onnx", ur.quant_of(td))
+    q, moved = _tie_to(tq, ur.propagate(f"{hd}/model.onnx", ur.quant_of(hd)))
+    got = ur.retarget_graph(template, f"{hd}/model.onnx", tq, q)
+    want = gs.load_model(want)
+    diffs = ur.compare_jobs(got, want)
+    if not moved:
+        assert diffs == []
+        return
+    # the moved scales' float32 lanes, up to 16 ulps apart: take the native's
+    # values there, and the rest must be the native program up to the IO order
+    segs, lanes = [], 0
+    for a, b in zip(ur._segs(got), ur._segs(want)):
+        assert len(a) == len(b)
+        seg = list(a)
+        for i, (x, y) in enumerate(zip(a, b)):
+            if (
+                x != y
+                and x[0] == gs.A1 == y[0]
+                and gs._reg(x) == gs._reg(y)
+                and gs._reg(x) in gs.LANES_LO + gs.LANES_HI
+                and abs(gs._val(x) - gs._val(y)) <= 16
+            ):
+                seg[i], lanes = y, lanes + 1
+        segs.append(seg)
+    assert 0 < lanes <= 8 * 4 * len(moved)
+    assert ur.compare_jobs(ur.wr.with_segments(got, segs), want) == []
