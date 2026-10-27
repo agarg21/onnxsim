@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `af25ceac1` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `e8c040985` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1173,3 +1173,31 @@ lives below tinygrad:
 Per head, the generated attention now spends about 0.14 ms on the exp, 0.05 ms each on the max and sum reduces, and 0.05 ms on
 P V. Its S^T is below the profile's cutoff. The hand softmax does the max, exp, sum and normalization in one 0.215 ms pass over
 the tiles, and that fusion is the remaining gap (about 0.1 ms per head).
+
+**Generated attention by default.** The generated attention went from 0.34 to about 0.2 ms per head, under the hand path's
+0.26 ms, so it is now the default: the decoder takes 36.5 ms with it and 37.9 ms with the hand kernels (`HMX_ATTN=2`, or 1
+for the single fused call). The softmax still runs as separate kernels. Instead of fusing them, this round removed the work
+and the stalls between the HMX operations:
+
+| per head, V69 | before | now | what changed |
+|---|---:|---:|---|
+| S^T (HMX) | 50 us | 39 us | each raw tile's place computed from the loop counters, the VTCM check done once per call (it was a divide, a modulo and a range check, ~25 scalar packets between each store and the next load) |
+| max | 45 us | 14 us | no key-padding bias: the max and the sums cover only the valid row pairs (N even), and the max is clamped at -15 so the padding keys' zero scores can't overflow the exp |
+| exp | 137 us | 74 us | no bias load; fp16 exp2 kernels four vectors wide (`HVX_EW_EXP_LANES=256`): at two vectors the qf16 polynomial ran one HVX op per packet |
+| P V (HMX) | 47 us | 31 us | each single output tile is converted to rows after the next tile's loads are issued (`HMX_DEFER_ONE`), and V^T's tiles are L2-prefetched |
+| sums | 49 us | 30 us | fp16 over runs of up to 16 row pairs, then fp32. Summed in fp32 throughout, each row pair cost 7 packets: LLVM widens to a qf32 pair, re-interleaves the lanes and converts after every add |
+
+The max and the sums now spread 30 rows over 4 threads as 15 slices instead of 3 threads (`HVX_THREAD_BALANCE`).
+
+| model | before | now (generated attention) | hand attention (`HMX_ATTN=2`) | vs onnxruntime on the plain export |
+|---|---:|---:|---:|---|
+| decoder | 38.2 ms | 36.5 ms | 37.9 ms | max rel 1.22e-3 |
+| encoder, 1 layer | 18.0 ms | 17.5 ms | | max rel 3.2e-4 |
+| encoder, 3 layers | 51.9 ms | 50.8 ms | | max rel 1.2e-3 |
+
+The encoders have no such attention; they gain from the deferred single-tile outputs and the thread balance in their own
+Gemms and reduces. A one-layer attention micro model (Q/K/V projections of a 900 x 256 input, 8 heads of 32) shows every
+per-head call in the profile, which the full decoder's 254-call cap hides. Building it exposed a separate bug, now fixed. LLVM
+keeps a value widened from fp16 in qf32, and a multiply of it by a constant was never renormalized. A MatMul -> scalar Mul ->
+head Transpose chain had the scale fused into the fp16 product's cast back, and came out with cos 0.007 on the phone (it is
+exact in hexagon-sim). Such a multiply now goes through the sf barrier helper, as products of two computed values already did.
