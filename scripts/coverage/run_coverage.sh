@@ -102,6 +102,12 @@ python3 -m pytest \
 #    the whole run over (exit 64). Those counts are legitimate, so downgrade the
 #    suspicious-hit error to a warning and keep going.
 #
+#    --gcov-ignore-parse-errors=negative_hits.warn_once_per_file: gcc's gcov can
+#    emit a negative branch count (a known gcc bug, GCC bugzilla 68080) for some
+#    lines; gcovr 8.x treats it as a parse error and aborts the whole run (exit
+#    64). It is a counter artifact, not a missing test, so warn once per file
+#    and keep going.
+#
 #    --exclude-directory '.*/_deps/.*': skip gcov'ing CMake's FetchContent
 #    dependencies (protobuf, abseil, ...) entirely. Their .gcda/.gcno end up
 #    stale relative to each other under sccache (a cache-hit replays an old
@@ -126,6 +132,7 @@ gcovr \
   --exclude '.*third_party.*' \
   --exclude-directory '.*/_deps/.*' \
   --gcov-ignore-parse-errors=suspicious_hits.warn \
+  --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
   --gcov-ignore-errors=output_error \
   --gcov-ignore-errors=no_working_dir_found \
   --print-summary \
