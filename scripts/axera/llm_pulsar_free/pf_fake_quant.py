@@ -7,6 +7,12 @@ Fused graphs are evaluated node by node (Mul, Add, Div, Sqrt, ReduceMean,
 MatMul, Transpose, Softmax, Sigmoid, Reshape); a tensor without a calibration
 (a Reshape's output, or every tensor with an empty calibration) passes through
 unrounded, so ``FusedEval(model, {})`` is the float function of the program.
+
+``card_add=True`` evaluates each U16 Add of two calibrated tensors as the card
+does (``card_add``) instead of in float: the scale ratios are u16 fixed point,
+and Pulsar2's offset word takes the unrounded ratios, so the sum carries a
+constant bias of ``zp_a * (A - r_a) + zp_b * (B - r_b)`` output codes (up to
+~1.5 codes when the zero points are large and a ratio is just above 1).
 """
 
 from __future__ import annotations
@@ -64,11 +70,80 @@ def _node(op, x, at):
     raise NotImplementedError(op)
 
 
+def card_add(a, b, ca, cb, cy, exact_offset: bool = False) -> np.ndarray:
+    """``a + b`` the way the card's U16 Add computes it, ``a`` and ``b`` on
+    their grids ``ca`` / ``cb`` ``(scale, zero point)``, the result on ``cy``'s:
+    ``(qa * A + qb * B + off) / 2^n`` rounded half up, with the ratios
+    ``A, B = round(s_a / s_y * 2^n), round(s_b / s_y * 2^n)`` (``n = 15 - k``,
+    ``u16_retarget.add_shift``) and Pulsar2's offset word
+    ``off = int((zp_y - zp_a * f32(s_a / s_y) - zp_b * f32(s_b / s_y)) * 2^n)``
+    (``u16_retarget.candidates``), which takes the unrounded ratios.
+    ``exact_offset``: the program carries ``u16_retarget.exact_add_offset``
+    instead (``pf_add_offset.py``)."""
+    import u16_retarget as ur
+
+    (sa, za), (sb, zb), (sy, zy) = ca, cb, cy
+    ra, rb = sa / sy, sb / sy
+    n = 15 - ur.add_shift(ra, rb)
+    big_a, big_b = round(ra * 2.0**n), round(rb * 2.0**n)
+    off = int((zy - za * float(F32(ra)) - zb * float(F32(rb))) * 2**n)
+    if exact_offset:
+        off = zy * 2**n - za * big_a - zb * big_b
+    qa = np.rint(np.asarray(a, np.float64) / sa).astype(np.int64) + za
+    qb = np.rint(np.asarray(b, np.float64) / sb).astype(np.int64) + zb
+    acc = qa * big_a + qb * big_b + off
+    q = np.clip((acc + 2 ** (n - 1)) >> n, 0, 65535)
+    return (q - zy) * float(sy)
+
+
+def add_bias(ca, cb, cy) -> float:
+    """``card_add``'s systematic error in output codes: with the ratios in
+    fixed point and the offset word from the unrounded ratios, the card's sum
+    is off by ``(zp_a * A + zp_b * B + off) / 2^n - zp_y`` codes (plus the
+    negligible relative ratio error on the inputs' own values)."""
+    import u16_retarget as ur
+
+    (sa, za), (sb, zb), (sy, zy) = ca, cb, cy
+    ra, rb = sa / sy, sb / sy
+    n = 15 - ur.add_shift(ra, rb)
+    off = int((zy - za * float(F32(ra)) - zb * float(F32(rb))) * 2**n)
+    return (za * round(ra * 2.0**n) + zb * round(rb * 2.0**n) + off) / 2.0**n - zy
+
+
+def debias_add(ca, cb, lo, hi, widen=0.02, tol=0.02) -> tuple[float, int]:
+    """The U16 MinMax calibration of an Add's output range ``[lo, hi]``,
+    widened by the least relative amount (at most ``widen``) that brings
+    ``add_bias`` within ``tol`` codes (else the widening with the smallest
+    bias): the fixed-point ratios' rounding moves with the output scale. A
+    ratio of a few hundred units (an input range much narrower than the
+    output's) needs a widening of up to ~1 / that to sweep one unit."""
+    import u16_retarget as ur
+
+    best = None
+    for t in np.arange(0.0, widen, 2e-6):
+        cy = ur.unsigned_minmax(lo * (1 + t), hi * (1 + t))
+        b = abs(add_bias(ca, cb, cy))
+        if b <= tol:
+            return cy
+        if best is None or b < best[0]:
+            best = (b, cy)
+    return best[1]
+
+
 class FusedEval:
     """A fused program's float graph at calibration ``calib`` (tensor ->
-    ``(scale, zero point)``); ``signed`` names the s16 tensors."""
+    ``(scale, zero point)``); ``signed`` names the s16 tensors. ``card_add``:
+    Adds of two calibrated tensors as the card computes them (``card_add``),
+    with ``exact_offset`` their offset words as ``pf_add_offset.py`` writes them."""
 
-    def __init__(self, model, calib, signed=()):
+    def __init__(
+        self,
+        model,
+        calib,
+        signed=(),
+        card_add: bool = False,
+        exact_offset: bool = False,
+    ):
         m = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
         self.consts = {
             i.name: onnx.numpy_helper.to_array(i) for i in m.graph.initializer
@@ -86,6 +161,18 @@ class FusedEval:
         self.out = self.outs[0]
         self.cal = {k: tuple(v) for k, v in calib.items()}
         self.signed = set(signed)
+        self.card_add, self.exact_offset = card_add, exact_offset
+
+    def _card_add_ok(self, ins, out) -> bool:
+        """Both operands and the output on U16 grids (no constant, no s16)."""
+        ts = (*ins, out)
+        return all(
+            t in self.cal
+            and t not in self.consts
+            and t not in self.signed
+            and self.cal[t][0] > 0
+            for t in ts
+        )
 
     def _r(self, name, a):
         if name in self.cal and name not in self.consts:
@@ -108,6 +195,13 @@ class FusedEval:
         for k, a in feeds.items():
             v[k] = self._r(k, a)
         for op, ins, o, at in self.nodes:
+            if op == "Add" and self.card_add and self._card_add_ok(ins, o):
+                v[o] = card_add(
+                    *(v[i] for i in ins),
+                    *(self.cal[t] for t in (*ins, o)),
+                    exact_offset=self.exact_offset,
+                )
+                continue
             # an operand quantized for a consumer MatMul (signed) is rounded where it is produced
             v[o] = self._r(o, _node(op, [v[i] for i in ins], at))
         return v
@@ -134,12 +228,18 @@ class LinearEval:
 
 
 class AddEval:
-    """A residual Add at its calibration (``a``, ``b``, ``y``)."""
+    """A residual Add at its calibration (``a``, ``b``, ``y``); ``card_add``:
+    the card's fixed-point Add (``card_add``) instead of a float sum."""
 
-    def __init__(self, cal):
+    def __init__(self, cal, card_add: bool = False, exact_offset: bool = False):
         self.cal = {k: tuple(v) for k, v in cal.items()}
+        self.card_add, self.exact_offset = card_add, exact_offset
 
     def __call__(self, a, b) -> np.ndarray:
-        return fq(fq(a, self.cal["a"]) + fq(b, self.cal["b"]), self.cal["y"]).astype(
-            F32
-        )
+        a, b = fq(a, self.cal["a"]), fq(b, self.cal["b"])
+        if self.card_add:
+            c = self.cal
+            return card_add(
+                a, b, c["a"], c["b"], c["y"], exact_offset=self.exact_offset
+            ).astype(F32)
+        return fq(a + b, self.cal["y"]).astype(F32)

@@ -8,7 +8,8 @@ on ``rest``; compared with the float model, teacher-forced.
 --float: no rounding anywhere and float weights (a wiring check against
 ``Config.float_step``). Ablations: --exact KEYS leaves those programs exact,
 --float-weights KEYS keeps those linears' float weights (activations still
-rounded).
+rounded). --card-add: every U16 Add as the card's fixed-point Add
+(``pf_fake_quant.card_add``), with its zero-point bias.
 
 usage: MODEL=llama160m pf_estimate.py [--doc 0] [--prompt 48] [--float]
        -> <out>/est_doc<d>[_float].json
@@ -48,7 +49,14 @@ class Chain:
     manifests and the programs' float graphs are, default ``cfg.out``)."""
 
     def __init__(
-        self, cfg, st, exact=False, exact_keys=(), float_weights=(), root=None
+        self,
+        cfg,
+        st,
+        exact=False,
+        exact_keys=(),
+        float_weights=(),
+        root=None,
+        card_add=False,
     ):
         self.cfg = cfg
         root = root or cfg.out
@@ -63,6 +71,8 @@ class Chain:
                         os.path.join(root, e["model"]),
                         {} if ex else e["calibration"],
                         e["signed"],
+                        card_add=card_add,
+                        exact_offset=e.get("add_offset") == "exact",
                     )
                 elif e["kind"] == "split":
                     w = cfg.merged_weight(k, li, gptq=False)
@@ -77,7 +87,11 @@ class Chain:
                     lo = LinearEval(
                         r, sp["lo"]["calibration"]["x"], sp["lo"]["calibration"]["y"]
                     )
-                    ad = AddEval(sp["add"]["calibration"])
+                    ad = AddEval(
+                        sp["add"]["calibration"],
+                        card_add,
+                        e.get("add_offset") == "exact",
+                    )
                     self.f[(wh, k)] = (lambda hi, lo, ad: lambda x: ad(hi(x), lo(x)))(
                         hi, lo, ad
                     )
@@ -91,7 +105,13 @@ class Chain:
                             w, c["x"], c["y"], w8=k not in float_weights
                         )
                 else:
-                    self.f[(wh, k)] = _exact_add if ex else AddEval(e["calibration"])
+                    self.f[(wh, k)] = (
+                        _exact_add
+                        if ex
+                        else AddEval(
+                            e["calibration"], card_add, e.get("add_offset") == "exact"
+                        )
+                    )
 
     def layer_fused(self, li, x, K, V, p):
         """A layer of the merged layout. ``x``: the embedding row (layer 0) or
@@ -379,12 +399,18 @@ def main():
         "--exact", default="", help="comma-separated program keys left exact"
     )
     ap.add_argument("--float-weights", default="", help="comma-separated linear keys")
+    ap.add_argument(
+        "--card-add", action="store_true", help="the card's fixed-point U16 Adds"
+    )
     a = ap.parse_args()
     cfg = pf_model.load()
     ids = cfg.passage_ids(lay.EVAL_DOCS[a.doc])[: a.prompt]
     keys = set(filter(None, a.exact.split(",")))
     fw = set(filter(None, a.float_weights.split(",")))
-    chains = {st: Chain(cfg, st, a.float, keys, fw) for st in ("first", "rest")}
+    chains = {
+        st: Chain(cfg, st, a.float, keys, fw, card_add=a.card_add)
+        for st in ("first", "rest")
+    }
     rows = run(cfg, ids, chains)
     res = dict(
         model=cfg.name,
@@ -396,7 +422,11 @@ def main():
     json.dump(
         res,
         open(
-            os.path.join(cfg.out, f"est_doc{a.doc}{'_float' if a.float else ''}.json"),
+            os.path.join(
+                cfg.out,
+                f"est_doc{a.doc}{'_float' if a.float else ''}"
+                f"{'_card_add' if a.card_add else ''}.json",
+            ),
             "w",
         ),
         indent=1,
