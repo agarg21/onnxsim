@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `823bd8f93` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `af25ceac1` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1143,3 +1143,33 @@ and transposed: S^T = K Q^T on the HMX, softmax over S^T's rows, O^T = V^T P^T o
 
 The hand attention keeps S in the HMX tile layout from its S call through the softmax to P V, so it never converts S to
 row-major or packs P (its S and P V calls take under 0.02 ms each per head). That is most of the remaining 0.3 ms per head.
+
+**Raw-tile attention.** The generated attention now keeps S^T and P in the HMX tile layout too, which took `HMX_ATTN=3` from
+51.9 to 42.7 ms. Converting S^T's tiles to rows had been ~0.125 of the 0.18 ms S^T call per head. Tinygrad's tensor cores
+don't apply when the tile layout is visible as a view (the key axis splits into row pairs and their parity), so the layout
+lives below tinygrad:
+- *Raw-tile buffers.* An fp16 buffer of 1024 k + 1000 elements is marked as raw tiles by its size. Tinygrad indexes it as a
+  row-major matrix in both matmuls, so the tensor cores apply as usual. The HMX renderer writes the S^T tiles as they are,
+  straight into VTCM (`__hmx_store_raw`), and P V reads P's K panel in place (`__hmx_mac_span_raw`). The softmax kernels read
+  the same memory as `(query tiles, key tiles, 16 row pairs, 64 lanes)`: the max over the keys is a vector max over the row
+  pairs, then a max over lane pairs. The sums come from a reduce over P, so V^T needs no ones row and P V only one M tile.
+- *VTCM.* Raw-tile regions are placed first, 2 KB aligned. Calls that read them are pulled up to just after their last
+  dependency: call sinking had moved a layer's last P V behind the other heads, its P missed the VTCM arena, and that P V
+  copied its tiles in from DDR (0.3 ms instead of 0.05).
+- *Deferred HMX output* (`HMX_DEFER`, now default). An output tile pair goes to a free VTCM slot pair and is converted to rows
+  after the next tile's load pair is issued, instead of right after its own store. This helps every generated Gemm.
+- *No prefetch on VTCM.* The emitter now writes kernels after placing regions. A kernel's `dcfetch` prefetches of parameters
+  placed in VTCM become no-ops: VTCM isn't behind L2, and the exp over the tiles went from 0.165 to 0.137 ms per head.
+- *Heuristic.* An elementwise kernel whose unit-stride axis fills whole HVX vectors no longer upcasts a broadcast axis for
+  reuse when that makes its loads gathers. That upcast had run the exp and the max's broadcast copy scalar. A stack of
+  per-head outputs keeps its upcast: a comparison reads its axis.
+
+| model | before | now, hand attention (default) | `HMX_ATTN=3` | vs onnxruntime on the plain export |
+|---|---:|---:|---:|---|
+| decoder | 40.5 ms | 38.2 ms | 51.9 -> 42.7 ms | max rel 1.15e-3 (`HMX_ATTN=3`: 9.9e-4) |
+| encoder, 1 layer | 18.6 ms | 18.0 ms | | max rel 3.2e-4 |
+| encoder, 3 layers | 53.8 ms | 51.9 ms | | max rel 1.2e-3 |
+
+Per head, the generated attention now spends about 0.14 ms on the exp, 0.05 ms each on the max and sum reduces, and 0.05 ms on
+P V. Its S^T is below the profile's cutoff. The hand softmax does the max, exp, sum and normalization in one 0.215 ms pass over
+the tiles, and that fusion is the remaining gap (about 0.1 ms per head).
