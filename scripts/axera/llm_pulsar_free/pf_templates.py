@@ -42,7 +42,9 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
   ``lanorm<k>`` (a ``[1, k] @ [k, H]`` FullyConnected + ``anorm``),
   ``slanorm<k>`` (fused SiLU + ``lanorm``); ``nrml<n>``, ``lanorml<k>x<n>``,
   ``slanorml<k>x<n>``: the same with a second linear after the norm
-  (``y = yn @ w2``, ``[1, H] @ [H, n]``; ``fuse=4``).
+  (``y = yn @ w2``, ``[1, H] @ [H, n]``; ``fuse=4``);
+  ``alanorm<k>`` / ``alanorml<k>x<n>`` (``fuse=7``): ``attn<k>`` whose output
+  is the linear's input ``z`` of ``lanorm<k>`` / ``lanorml<k>x<n>``.
 
 usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [NAME...]
 (no NAME: every template the model needs that is not built yet; serial builds)
@@ -335,6 +337,36 @@ def _lanorm_gen(k, n, w, zs, aoff, bk, g):
     return gen
 
 
+def attn_ref(d: Dims, q, k, v, mask) -> np.ndarray:
+    """``ATTN`` in numpy: ``[1, nh*hd]`` (GQA, token-major K / V)."""
+    G = d.nh // d.nkv
+    qh = q.reshape(d.nkv, G, d.hd)
+    kt = k.reshape(d.S + 1, d.nkv, d.hd).transpose(1, 2, 0)
+    s = qh @ kt + mask
+    e = np.exp(s - s.max(-1, keepdims=True))
+    vt = v.reshape(d.S + 1, d.nkv, d.hd).transpose(1, 0, 2)
+    return ((e / e.sum(-1, keepdims=True)) @ vt).reshape(1, -1).astype(F)
+
+
+def _alanorm_gen(d: Dims, w, ap, bk, aoff, g):
+    """The attention's draws (``_attn_gen(*ap)``), its output ``z`` the
+    linear's input; ``a`` cancels ``z @ w`` by ``bk`` as in ``_lanorm_gen``."""
+    ag = _attn_gen(d, *ap)
+
+    def gen(r):
+        f = ag(r)
+        b = attn_ref(d, f["q"], f["k"], f["v"], f["mask"]) @ w
+        sb = float(np.abs(b).std())
+        n = b.shape[1]
+        f["a"] = (
+            -bk * b + r.standard_normal((1, n)) * sb * (1.5 - bk) + aoff * sb
+        ).astype(F)
+        f["g"] = r.uniform(g[0], g[1], (1, n)).astype(F)
+        return f
+
+    return gen
+
+
 def _slanorm_gen(k, n, w, gs_, us, aoff, bk, g):
     def gen(r):
         gate = (r.standard_normal((1, k)) * gs_ - 0.2).astype(F)
@@ -399,7 +431,7 @@ def graph(name: str, d: Dims):
     variant generators)`` of a fused template ``name``."""
     m = re.fullmatch(
         r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
-        r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk)"
+        r"|nrml|lanorml|slanorml|nrmqkr|slanormqkr|nrmqk|slanormqk|alanorml?)"
         r"(\d+)(?:x(\d+))?(t?)",
         name,
     )
@@ -407,6 +439,26 @@ def graph(name: str, d: Dims):
         raise ValueError(f"{name}: not a fused template name")
     kind, n, alt = m.group(1), int(m.group(2)), m.group(4)
     n2 = int(m.group(3)) if m.group(3) else None
+    if kind in ("alanorm", "alanorml"):
+        # ``fuse=7``: the attention (``attn<n>``), its output ``z`` the input
+        # of ``lanorm<n>`` (``alanorml<n>x<n2>``: of ``lanorml<n>x<n2>``)
+        aops, abody, ains, _, ainits, _ = graph(f"attn{n}", d)
+        ops, body, ins, outs, inits, _ = graph(
+            kind[1:] + str(n) + (f"x{n2}" if n2 else ""), d
+        )
+        abody = abody.replace("  y = Reshape(o, sho)", "  z = Reshape(o, sho)")
+        ins = {**ains, **{k: v for k, v in ins.items() if k != "z"}}
+        ap = (
+            (0.3, 2.0, 0.5, 0.05),
+            (0.15, 3.0, 1.0, -0.1),
+            (0.5, 1.0, 0.3, 0.02),
+            (0.2, 4.0, 0.8, 0.1),
+        )
+        p = ((0.0, 0.0, NORM_G[0]), (0.9, 0.1, NORM_G[1]))
+        p += ((0.3, 1.0, NORM_G[3]), (0.95, -0.2, NORM_G[1]))
+        gens = [_alanorm_gen(d, inits["w"], a_, *b_) for a_, b_ in zip(ap, p)]
+        ops = list(dict.fromkeys([*aops, *ops]))
+        return ops, abody + body, ins, outs, {**ainits, **inits}, gens
     if kind in ("nrml", "lanorml", "slanorml"):
         # a second linear after the norm: ``y = yn @ w2`` (``[1, H] @ [H, n2]``)
         base = kind[:-1]
@@ -671,10 +723,12 @@ def needed(cfg) -> list[str]:
                 f"lanorml{qd}x{2 * inter}",
                 f"slanorml{inter}x{qkv}",
             ]
-        if cfg.fuse >= 5:
+        if cfg.fuse >= 5 and cfg.qk_norm:
             r = "r" if cfg.fuse >= 6 else ""
             names += [f"lanorml{qd}x{2 * inter}", f"nrmqk{r}{H}"]
             names += [f"slanormqk{r}{inter}"]
+        if cfg.fuse >= 7:
+            names += [f"alanorml{qd}x{2 * inter}" if cfg.qk_norm else f"alanorm{qd}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]

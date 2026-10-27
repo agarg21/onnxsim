@@ -332,9 +332,18 @@ class Generator:
         return out
 
     @staticmethod
-    def _calib(rg, model):
-        """U16 MinMax of every range, and of the graph's float constants."""
-        q = {k: ur.unsigned_minmax(lo, hi) for k, (lo, hi) in rg.items()}
+    def _calib(rg, model, signed=()):
+        """U16 MinMax of every range, and of the graph's float constants;
+        ``signed``: tensors calibrated as a dynamic MatMul operand
+        (``ur.signed_absmax``, as ``ur.calibrate_graph`` does)."""
+        q = {
+            k: (
+                ur.signed_absmax(max(abs(lo), abs(hi)))
+                if k in signed
+                else ur.unsigned_minmax(lo, hi)
+            )
+            for k, (lo, hi) in rg.items()
+        }
         for i in model.graph.initializer:
             a = onnx.numpy_helper.to_array(i)
             if a.dtype.kind == "f":
@@ -376,7 +385,7 @@ class Generator:
                 rg[t] = [lo, hi]
         return rg
 
-    def merged(self, C, D, key, name, rgs, ml, extra=None, w=None):
+    def merged(self, C, D, key, name, rgs, ml, extra=None, w=None, signed=()):
         """Retarget merged program ``name`` at the union of its parts' ranges,
         with the tensors the template calibrates alike tied (``_tied``). ``w``:
         the weights of its linear, or ``{initializer: weights}`` of its linears
@@ -396,7 +405,7 @@ class Generator:
         rg = self._union(*rgs)
 
         def q(tdir):
-            return self._calib(self._tied(rg, fm, ur.quant_of(tdir)), fm)
+            return self._calib(self._tied(rg, fm, ur.quant_of(tdir)), fm, signed)
 
         e = self._retarget_fused(
             os.path.join(D, f"{key}.axmodel"), name, model, q, weights=w
@@ -420,6 +429,7 @@ class Generator:
         silu=None,
         post=None,
         qkv=None,
+        attn=None,
     ):
         """The two-pass RMSNorm as one program (``nrm<H>``), or with the
         residual Add before it (``anorm<H>``: ``x = a + b``, outputs ``x`` and
@@ -437,7 +447,12 @@ class Generator:
         RoPE after the norm (``nrmqk`` / ``slanormqk``), the RoPE parts
         calibrated as ``qk`` (``qk_ranges``, both sets); with ``fuse=6`` three
         linears, q_rot / k_rot rotated in the program (``nrmqkr`` /
-        ``slanormqkr``; their ranges are q's / k's)."""
+        ``slanormqkr``; their ranges are q's / k's). ``attn = (q, K, V,
+        masks)``: the attention before the linear computes ``z``
+        (``alanorm`` / ``alanorml``, ``fuse=7``), calibrated as ``attn`` was
+        (its samples and x sqrt(2) copies, the MatMul operands signed); the
+        attention's output and the linear's input are one tensor, at the union
+        of both ranges."""
         H = self.cfg.H
         inits = tpl.graph(f"nrm{H}", tpl.Dims.of(self.cfg))[4]
         rgs = []
@@ -572,8 +587,44 @@ class Generator:
                 name = name.replace("lanorm", "lanorml") + f"x{n2}"
             else:
                 raise ValueError(f"{name}: no template with a linear after the norm")
+        signed = ()
+        if attn is not None:
+            if not name.startswith("lanorm"):
+                raise ValueError(f"{name}: no template with the attention before it")
+            name = "a" + name
+            q_, K_, V_, masks = attn
+            cfg = self.cfg
+            qd, kv, S1 = cfg.nh * cfg.hd, cfg.kvd, cfg.S + 1
+            body = tpl.ATTN.replace("  y = Reshape(o, sho)", "  z = Reshape(o, sho)")
+            ainits = tpl.graph(f"attn{qd}", tpl.Dims.of(cfg))[4]
+            rg, am = self._stage(
+                body,
+                {"q": [1, qd], "k": [S1, kv], "v": [S1, kv], "mask": [1, S1]},
+                {"z": [1, qd]},
+                {
+                    "q": list(q_) + list(q_ * K2),
+                    "k": list(K_) + list(K_ * K2),
+                    "v": list(V_) + list(V_ * K2),
+                    "mask": list(masks) * 2,
+                },
+                ainits,
+            )
+            signed = signed_inputs(am)
+            u_ = self._union(*rgs, rg)
+            # Reshape passes the attention's output through: one calibration,
+            # the union of the attention's output and the linear's input range
+            u_["o"] = u_["z"] = self._union({"t": u_["o"]}, {"t": u_["z"]})["t"]
+            rgs = [u_]
         return self.merged(
-            C, D, key, name, rgs, ml, dict(u_absmax=float(np.abs(u).max())), w=weights
+            C,
+            D,
+            key,
+            name,
+            rgs,
+            ml,
+            dict(u_absmax=float(np.abs(u).max())),
+            w=weights,
+            signed=signed,
         )
 
     def qk(self, st, li, C, D, A, ml):
@@ -702,18 +753,21 @@ class Generator:
         offs = pf_model.lay.offsets(cfg.QKV)
         ml["qkv5"]["parts"] = {k: dict(col=offs[k], n=n) for k, n in cfg.QKV}
         self._rope(st, li, A, C, D, ml)
-        self._attn(li, A, C, D, ml)
+        aon2 = "aon2" in cfg.programs(st, w)
+        if not aon2:
+            self._attn(li, A, C, D, ml)
         r2 = lambda k: A[k].reshape(len(A[k]), -1).astype(F32)  # noqa: E731
         self.norm2(
             C,
             D,
-            "on2",
+            "aon2" if aon2 else "on2",
             ml,
             g2,
             a=x.reshape(len(x), -1),
             b=r2("op"),
             z=r2("att"),
             w=cfg.merged_weight("o_proj", li),
+            attn=self._attn_samples(A) if aon2 else None,
         )
         wg = cfg.merged_weight("gu", li)
         ml["gu"] = self.lin(st, li, "gu", f"{D}/gu.axmodel", wg, "m", ["gate", "up"])
@@ -923,14 +977,15 @@ class Generator:
                 ml,
                 dict(u_absmax=float(np.abs(uk).max())),
             )
-        self._attn(li, A, C, D, ml)
+        if "attn" in progs:
+            self._attn(li, A, C, D, ml)
         gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
         x, x1 = r2(A, "x"), r2(A, "x1")
-        if "on2g" in progs:
+        if "on2g" in progs or "aon2g" in progs:
             self.norm2(
                 C,
                 D,
-                "on2g",
+                "aon2g" if "aon2g" in progs else "on2g",
                 ml,
                 g2,
                 a=x,
@@ -942,6 +997,7 @@ class Generator:
                     r2(A, "m"),
                     [r2(A, "gate"), r2(A, "up")],
                 ),
+                attn=self._attn_samples(A) if "aon2g" in progs else None,
             )
         else:  # a split first-set layer
             self.norm2(
@@ -1146,6 +1202,11 @@ class Generator:
         self._attn_mlp(st, li, A, C, D, ml)
         man[w] = ml
 
+    def _attn_samples(self, A):
+        """The attention's recorded inputs ``(q, K, V, masks)``."""
+        masks = [self.cfg.mask_plan(int(p)) for p in A["p_attn"]]
+        return A["qr"].astype(F32), A["K"].astype(F32), A["V"].astype(F32), masks
+
     def _attn(self, li, A, C, D, ml):
         cfg = self.cfg
         q, K, V = A["qr"].astype(F32), A["K"].astype(F32), A["V"].astype(F32)
@@ -1248,6 +1309,7 @@ def main():
     for li in range(lo_l, hi_l + 1):
         layer = [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2]
         layer += [gen.layer_fused4, gen.layer_fused5, gen.layer_fused5]
+        layer += [gen.layer_fused5 if cfg.qk_norm else gen.layer_fused2]
         layer[cfg.fuse](st, li, man)
         json.dump(man, open(mpath, "w"), indent=1)
         ml = man[f"L{li}"]
@@ -1259,7 +1321,7 @@ def main():
         )
         n1, n2 = [("n1_rms", "n2_rms"), ("n1", "n2")][min(cfg.fuse, 1)]
         if cfg.fuse >= 2:
-            n1 = "on2" if "on2" in ml else "on2g"
+            n1 = next(k for k in ("on2", "on2g", "aon2g", "aon2") if k in ml)
             n2 = next(k for k in ("dnqk", "dnq", "dn") if k in ml)
         print(
             f"{st} L{li}: {len(ml)} programs, templates {tnames}, u max "

@@ -298,12 +298,14 @@ class Plan:
                 return (y5, oq[k] * 4)
 
             qr = self.rope(st, wh, li, o5)
-            att = self.chain(
-                st, wh, "attn", q=qr, k=self.K[li], v=self.V[li], mask=self.mask
-            )
-            for n, v in dict(z=att, a=x, g=self.gain[li][1]).items():
-                self.bind(st, wh, "on2", "I", n, v)
-            o = self.outputs(st, wh, "on2")
+            on2, att_in = "on2", dict(q=qr, k=self.K[li], v=self.V[li], mask=self.mask)
+            if "aon2" in cfg.programs(st, wh):  # fuse=7: the attention is in aon2
+                on2, feeds = "aon2", att_in
+            else:
+                feeds = dict(z=self.chain(st, wh, "attn", **att_in))
+            for n, v in dict(feeds, a=x, g=self.gain[li][1]).items():
+                self.bind(st, wh, on2, "I", n, v)
+            o = self.outputs(st, wh, on2)
             x1, m = o["x"], o["y"]
             gu = self.chain(st, wh, "gu", x=m)
             gate, up = (gu, og["gate_proj"] * 4), (gu, og["up_proj"] * 4)
@@ -447,16 +449,20 @@ class Plan:
                     **tabs(li),
                 )
                 q = self._qbuf(st, wh, "qk", li)
-            att = self.chain(
-                st, wh, "attn", q=q, k=self.K[li], v=self.V[li], mask=self.mask
-            )
+            att_in = dict(q=q, k=self.K[li], v=self.V[li], mask=self.mask)
             gn = self.gain[li + 1][0] if li + 1 < cfg.L else self.gf
             g2 = self.gain[li][1]
-            if "on2g" in progs:
+            if "aon2g" in progs:  # fuse=7: the attention is in aon2g
+                self._bind_ins(st, wh, "aon2g", **att_in, a=x, g=g2)
+                o = self.outputs(st, wh, "aon2g")
+                x1, gu = o["x"], o["y"]
+            elif "on2g" in progs:
+                att = self.chain(st, wh, "attn", **att_in)
                 self._bind_ins(st, wh, "on2g", z=att, a=x, g=g2)
                 o = self.outputs(st, wh, "on2g")
                 x1, gu = o["x"], o["y"]
             else:
+                att = self.chain(st, wh, "attn", **att_in)
                 self._bind_ins(st, wh, "on2", z=att, a=x, g=g2)
                 o = self.outputs(st, wh, "on2")
                 x1, m = o["x"], o["y"]
@@ -494,9 +500,11 @@ class Plan:
 
     def bind_set(self, st):
         cfg = self.cfg
-        if cfg.fuse >= 5:
+        # fuse=7 without a per-head q / k norm is layout 3 with aon2
+        big = cfg.fuse if cfg.qk_norm else min(cfg.fuse, 3)
+        if big >= 5:
             return self.bind_set_fused5(st)
-        if cfg.fuse >= 4:
+        if big >= 4:
             return self.bind_set_fused4(st)
         if cfg.fuse >= 2:
             return self.bind_set_fused2(st)
@@ -599,7 +607,7 @@ def _io_stub(k, n):
 
 
 #: merged programs that hold a linear (their float graphs carry its weights)
-MERGED_LINEAR = ("on2", "dn", "on2g", "dnq", "n1q", "dnqk", "n1qk")
+MERGED_LINEAR = ("on2", "dn", "on2g", "dnq", "n1q", "dnqk", "n1qk", "aon2g", "aon2")
 
 
 def _float_program(cfg, d, wh, k, ml, fused):
@@ -632,6 +640,11 @@ def _float_program(cfg, d, wh, k, ml, fused):
             {"w": ("down_proj", li), "qkv": ("qkv5", li + 1)},
         ),
         "n1qk": (f"nrmqk{rot}{cfg.H}", {"qkv": ("qkv5", li)}),
+        "aon2g": (
+            f"alanorml{qd}x{2 * cfg.I}",
+            {"w": ("o_proj", li), "w2": ("gu", li)},
+        ),
+        "aon2": (f"alanorm{qd}", {"w": ("o_proj", li)}),
     }[k]
     fg = tpl.float_graph(name, d)
     for wn, (key, lj) in ws.items():

@@ -88,9 +88,18 @@ LAYER_FUSED5 = ["attn", "on2g", "dnqk"]
 #: ``fuse=6``: the programs of ``fuse=5``; ``dnqk`` / ``n1qk`` hold three
 #: linears (q, k, v) and make rotate_half of q and k in the program (Split /
 #: Concat: data movement) instead of two more linears of rotated weights
+#: ``fuse=7``: the attention joins the program after it. Qwen3 (layout 6):
+#: ``aon2g`` = ``attn`` + ``on2g``; without a per-head q / k norm (layout 3):
+#: ``aon2`` = ``attn`` + ``on2``. The K / V rows are written by an earlier
+#: program, so the merged program reads the whole cache as ``attn`` did. A
+#: split first-set layer keeps ``attn`` and ``on2``.
+LAYER_FUSED7 = ["aon2g", "dnqk"]
+LAYER_FUSED7_NO_QK_NORM = ["qkv5", "rq", "rk", "aon2", "gu", "dn"]
 
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
+    if fuse >= 7:
+        return list(LAYER_FUSED7 if qk_norm else LAYER_FUSED7_NO_QK_NORM)
     if fuse >= 2:
         if not qk_norm and fuse >= 4:
             raise NotImplementedError(f"fuse={fuse} without a per-head q / k norm")
