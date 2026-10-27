@@ -854,7 +854,7 @@ compile, `load_compiled` and `run_compiled` against separate compiler and runner
 
 The same worker runs programs built for newer cDSPs. The artifact is the same container with the `tg_graph` ABI, and its
 magic names the arch (`TGHXV69\0`). `scripts/android/tinygrad_hexagon_bridge/onnx_remote/compile_v69.sh` is the compiler
-command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `e8c040985` at the time of writing), which captures any
+command. It drives the tinygrad fork's `examples/dsp_graph_onnx.py` (branch `bevformer-onnx-remote`, commit `fb11baa2a` at the time of writing), which captures any
 ONNX model's kernels without running them, since qemu can't run qfloat or HMX code. It then emits them with the v65 path's
 emitter and skel, extended for HMX: the skel votes HMX power, takes VTCM + the HMX context for each run and holds the HMX
 lock on its graph thread. Kernels and skel are built with the Hexagon SDK's `hexagon-clang`.
@@ -1201,3 +1201,38 @@ per-head call in the profile, which the full decoder's 254-call cap hides. Build
 keeps a value widened from fp16 in qf32, and a multiply of it by a constant was never renormalized. A MatMul -> scalar Mul ->
 head Transpose chain had the scale fused into the fp16 product's cast back, and came out with cos 0.007 on the phone (it is
 exact in hexagon-sim). Such a multiply now goes through the sf barrier helper, as products of two computed values already did.
+
+**HMX stalls and scalar kernels.** The decoder went from 36.5 to 29.6 ms. Most of the gain is in the generated HMX Gemms, where
+the single thread waited on memory or did scalar work between HMX operations. Timing-only builds found each stall in one run:
+the same build with one stage left out (no tile packing, no output conversion) gives wrong results, but its time is that
+stage's cost.
+
+| change | effect |
+|---|---|
+| One l2fetch at a time. An l2fetch issued while another is in flight replaces it, so the per-row prefetch boxes fetched little more than the last row. A row tile's whole A panel is now one box (the 64-bit form takes any panel), and the next row tile's panel is fetched right after it | decoder 36.5 -> 33.6 ms; the 2528-row value projection 0.5 -> 0.18 ms per call |
+| A packed two K tiles per shuffle from aligned 128-byte rows, its slot sets alternating by row tile | -0.8 ms |
+| Tile-pair output conversion as one halfword deal (`vdealvdd`) instead of two deals, two rotates and two predicated muxes; the flush loads four row pairs before storing | the 900-row projections 84 -> 66 us per call |
+| The attention's sums from the HMX: V^T's row of ones gives them as one more output row, at the cost of a second M tile in P V | -14 us per head |
+| P V's output tiles (raw-tile B) computed and converted in pairs | -6 us per head |
+| `__hmx_begin` once per call instead of before every output tile, and the raw output's VTCM flag a local instead of a static reloaded after every asm store | S^T 35 -> 29 us per head |
+| A scalar kernel weighs a vector's work per element when choosing threads. The decoder's reference-point updates (sigmoid / inverse sigmoid over 900 rows of a 10-wide tensor) ran on one or two threads | decoder 31.0 -> 29.6 ms |
+
+| model | before | now | vs onnxruntime on the plain export |
+|---|---:|---:|---|
+| decoder | 36.5 ms | 29.6 ms | max rel 1.42e-3 |
+| encoder, 1 layer | 17.5 ms | 15.5 ms | max rel 3.2e-4 |
+| encoder, 3 layers | 50.8 ms | 46.0 ms | max rel 1.2e-3 |
+
+Tried and dropped:
+- *Raw-tile A operands.* A threaded producer wrote the HMX tile order, so the Gemm copied tiles instead of packing them. The
+  producers cost what the packing saved (decoder 32.9 vs 32.6 ms, enc3 47.8 vs 47.2).
+- *A degree-3 exp2 polynomial.* Its error is 1.3e-4 with fp16 coefficients, under fp16's half ulp, and it saved 8 us per head.
+  But the decoder's class scores went past the 2e-3 tolerance (2.6e-3).
+- *Vectorizing the reference-point kernels.* With stride-10 lane gathers and 30-lane transcendental helpers they were slower
+  than scalar (0.5 vs 0.35 ms per call).
+
+What remains in the decoder:
+- the hand MSDA kernel, 5.1 ms;
+- the attention's exp, 3.0 ms;
+- fp32 -> fp16 casts in front of each projection, ~1.3 ms, and the attention's block transposes, ~1.7 ms. Both are
+  DDR-bound copies that only multi-output kernels could fuse away.
