@@ -739,6 +739,47 @@ def retarget_graph(
     return wr.with_segments(res, segs)
 
 
+def exact_add_offset(
+    q: Mapping[str, tuple[float, int]], a: str, b: str, out: str
+) -> int:
+    """An Add's offset word without Pulsar2's bias: the card computes
+    ``(qa * A + qb * B + off) >> n`` with the ratios ``A``, ``B`` rounded to
+    u16 ``Q(n)``; Pulsar2's ``off`` (``candidates``' ``add_offset``) takes the
+    unrounded ratios, which leaves ``zp_a * (A / 2^n - r_a) + zp_b * (B / 2^n -
+    r_b)`` output codes on every element (up to ~2 codes). This ``off =
+    zp_y * 2^n - zp_a * A - zp_b * B`` makes the sum exact at the zero points."""
+    (sa, za), (sb, zb), (sy, zy) = q[a], q[b], q[out]
+    ra, rb = sa / sy, sb / sy
+    n = 15 - add_shift(ra, rb)
+    return (zy * 2**n - za * round(ra * 2.0**n) - zb * round(rb * 2.0**n)) & 0xFFFFFFFF
+
+
+def exact_add_offsets(program, nodes, q) -> tuple[onnx.ModelProto, int]:
+    """``program`` (a native or retargeted U16 program at calibration ``q``,
+    ``nodes`` its ``graph_nodes``) with every Add's offset word replaced by
+    ``exact_add_offset``; the records are found by value (Pulsar2's offset)
+    as ``retarget`` finds them. Returns the program and the number of Adds
+    whose offset changed."""
+    ct, cn = {}, {}
+    for i, (op, ins, out, _) in enumerate(nodes):
+        if op != "Add":
+            continue
+        sub = {t: q[t] for t in (*ins, out)}
+        old = candidates("Add", sub, ins, out)["add_offset"]
+        if old != exact_add_offset(sub, *ins, out):
+            ct[f"n{i}|add_offset"] = old
+            cn[f"n{i}|add_offset"] = exact_add_offset(sub, *ins, out)
+
+    def allowed(tag, name, reg):
+        return reg in gs.ADD_OFFSET_REGS
+
+    model = gs.load_model(program)
+    params = next((i for i in model.graph.initializer if i.name == "npu_params"), None)
+    # the offset is never in npu_params: leave its words alone
+    fixed = [(0, len(params.raw_data))] if params is not None else None
+    return _rewrite(model, ct, cn, allowed, fixed=fixed), len(ct)
+
+
 def _template_weight(template, name) -> np.ndarray:
     """The template build's own weights, from the ``model.onnx`` beside its ``out/``."""
     path = os.path.join(

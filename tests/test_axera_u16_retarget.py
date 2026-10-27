@@ -600,3 +600,26 @@ def test_merged_retarget_keeps_the_template_program(group, t, n):
         ]
 
     assert strip(got) == strip(gs.load_model(template))
+
+
+def test_exact_add_offsets_change_only_the_offset_records():
+    """``exact_add_offsets`` on anorm1024 v0 (a native build): the residual
+    Add's four ``0x1ef0..0x1f20`` writes take ``exact_add_offset``; every other
+    record and ``npu_params`` stay the template's."""
+    d = _merged("anorm1024", 0)
+    template = _need(d)
+    q = ur.quant_of(d)
+    got, n = ur.exact_add_offsets(template, ur.graph_nodes(f"{d}/model.onnx"), q)
+    assert n == 1  # the eps Adds' offset is 0 either way
+    want = ur.exact_add_offset(q, "a", "b", "x")
+    old = gs.load_model(template)
+    changed = []
+    for sa, sb in zip(ur._segs(old), ur._segs(got)):
+        assert len(sa) == len(sb)
+        changed += [(gs._reg(y), gs._val(y)) for x, y in zip(sa, sb) if x != y]
+    assert changed == [(r, want) for r in gs.ADD_OFFSET_REGS]
+
+    def params(m):
+        return next(i.raw_data for i in m.graph.initializer if i.name == "npu_params")
+
+    assert params(got) == params(old)

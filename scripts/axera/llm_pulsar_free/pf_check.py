@@ -7,13 +7,16 @@ compared with it. A program is retargeted or emitted from templates, not
 compiled for its calibration, so this is the check that it computes what its
 float graph and calibration say, on the card, for every program of the set.
 
-The relative error is the RMS of (card - host) over the RMS of host. U16
-rounding of the host's inner tensors differs from the card's by about one
-step, so a correct program reads ~1e-4..1.3e-2 (the rest set; llama-160m's
-layer-1 ``on2`` is the 1.3e-2); a wrong record
-(scale, zero point, Add shift, weight table) reads 1e-1 or more. The first set
-(position 0, massive activations) reads up to ~3e-2 in every layout, layout 0
-included, so its default tolerance is 5e-2.
+The relative error is the RMS of (card - host) over the RMS of host. The
+host model evaluates each U16 Add as the card does (``pf_fake_quant.card_add``:
+fixed-point ratios and Pulsar2's offset word, which leave a bias of up to ~2
+output codes on every element; ``exact_offset`` for a set patched by
+``pf_add_offset.py``). U16 rounding of the host's other inner tensors differs
+from the card's by about one step, so a correct program reads ~1e-5..1.1e-2
+on both sets (the largest: the last layer's ``dn`` and the attention); a
+wrong record (scale, zero point, Add shift, weight table) reads 1e-1 or more.
+Without the card's Add (a float sum), llama-160m's layer-1 ``on2`` read 1.3e-2
+and Qwen3's first set up to 3.3e-2: that was the Add's bias, not the program.
 
 usage: MODEL=qwen3_0.6b pf_check.py [--steps 3] [--tol T] [--set rest]
        -> <out>/check_<set>.json; exit status 1 if any program is above --tol
@@ -46,15 +49,25 @@ def host_fn(cfg, root, wh, k, pk, e):
     """The host model of loaded program ``pk`` (``k``'s part for a split linear)."""
     li = None if wh == "post" else int(wh[1:])
     if e["kind"] == "fused":
-        ev = FusedEval(os.path.join(root, e["model"]), e["calibration"], e["signed"])
+        ev = FusedEval(
+            os.path.join(root, e["model"]),
+            e["calibration"],
+            e["signed"],
+            card_add=True,
+            exact_offset=e.get("add_offset") == "exact",
+        )
         return lambda f: ev(**f)
     if e["kind"] == "add":
-        ad = AddEval(e["calibration"])
+        ad = AddEval(
+            e["calibration"], True, exact_offset=e.get("add_offset") == "exact"
+        )
         return lambda f: ad(f["a"], f["b"])
     if e["kind"] == "split":
         sp = e["split"][pk.rsplit("_", 1)[1]]
         if pk.endswith("_add"):
-            ad = AddEval(sp["calibration"])
+            ad = AddEval(
+                sp["calibration"], True, exact_offset=e.get("add_offset") == "exact"
+            )
             return lambda f: ad(f["a"], f["b"])
         w = cfg.merged_weight(k, li, gptq=False)
         q, r = cfg.split_weights(w)
@@ -70,15 +83,11 @@ def host_fn(cfg, root, wh, k, pk, e):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--steps", type=int, default=3)
-    ap.add_argument(
-        "--tol", type=float, default=None, help="default 2e-2 (rest), 5e-2 (first)"
-    )
+    ap.add_argument("--tol", type=float, default=2e-2, help="default 2e-2 (both sets)")
     ap.add_argument("--set", default="rest", choices=("first", "rest"))
     a = ap.parse_args()
     import axcl_session as A
 
-    if a.tol is None:
-        a.tol = 5e-2 if a.set == "first" else 2e-2
     cfg = pf_model.load()
     ids = cfg.passage_ids(lay.EVAL_DOCS[0])
     p0 = cfg.first_pos if a.set == "first" else cfg.first_pos + a.steps

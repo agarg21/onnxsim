@@ -31,6 +31,7 @@ python pf_plan.py --fake --float-set      # wiring check against the float model
 GPTQ=1 python pf_plan.py --doc 0          # on the card -> <out>/plan_doc0.json
 GPTQ=1 python pf_plan.py --generate 48    # free-running greedy decode vs float -> <out>/gen.json
 # LLM_PF_FUSE=0..5 picks the program layout (Qwen3-0.6B default 5, llama-160m 3)
+python pf_add_offset.py <out> <out>_x     # optional: exact Add offset words (below)
 python pf_baseline_llm_build.py --build-dir <llm_build out>   # Pulsar2 llm_build on the same steps
 python pf_profile.py                      # per-program card time of the rest set
 ```
@@ -46,6 +47,7 @@ python pf_profile.py                      # per-program card time of the rest se
 | `pf_estimate.py` | the whole decode in fake-quant on the host |
 | `pf_plan.py` | the decode on the card: every program resident, one `PLAN` per token; `--generate N`: free-running greedy decode against the float model's |
 | `pf_gptq.py` | `linear_emit.gptq_weight` for every linear (CUDA torch) |
+| `pf_add_offset.py` | a copy of a program set with every Add's offset word exact (`u16_retarget.exact_add_offset`) |
 | `pf_baseline_llm_build.py`, `pf_profile.py` | the `llm_build` reference point; per-program card time |
 
 Calibration text: the prose of `README.md`, `docs/qat.md`, `docs/accuracy-drop.md` and
@@ -165,13 +167,16 @@ How the merged programs are made:
 **Per-program card check (`pf_check.py`).** After a few real steps it reads back every
 program's input and output buffers as the plan bound them, runs the program's host
 model on the card's own inputs (the float graph at the program's calibration, the s8
-linear), and compares. A wrong record (scale, zero point, Add shift, weight table)
-shows up as 1e-1 or more. Layout 5, rest set: all 198 outputs within 9e-3, most
-1e-3..3e-3 (llama-160m layout 3: within 1.3e-2, so the rest set's tolerance is 2e-2). First set (position 0, massive activations): up to 3.3e-2, the same as
-layout 3's first set (up to 2.2e-2 for `on2`, 1.2e-2 for `qk`), so the first set's
-tolerance is 5e-2. Rerun it after regenerating a set:
-`LLM_PF_OUT=... python pf_check.py [--set first]` (exit status 1 when a program is
-above tolerance).
+linear), and compares. The host model computes each U16 Add the way the card does
+(`pf_fake_quant.card_add`, see the Add's zero-point bias below). A wrong record (scale,
+zero point, Add shift, weight table) shows up as 1e-1 or more. On the shipped sets the
+check reads at most 8.7e-3 (Qwen3-0.6B layout 5, both sets; the last layer's `dn` and the
+attention are the largest) and 1.1e-2 (llama-160m layout 3, first set's last `dn`; rest
+set within 7.5e-4, median 4.5e-5). The tolerance is 2e-2 for both sets. With a float Add
+as the host model, the check read up to 1.3e-2 (llama-160m layer 1's `on2`) and 3.3e-2
+(Qwen3's first set); that was the Add's bias, not a wrong program. Rerun it after
+regenerating a set: `LLM_PF_OUT=... python pf_check.py [--set first]` (exit status 1 when
+a program is above tolerance).
 
 ### The plan
 
@@ -244,6 +249,8 @@ and after every run.
 | Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=4` (not taken) | 44/48, 3.46% (6.37%) | 42/48, 2.84% (4.41%) | card 77-78 ms |
 | Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=5` (default) | 43/48, 3.47% (6.00%) | 43/48, 2.77% (3.68%) | 0.08-0.09 (card 68-70 ms) |
 | Qwen3-0.6B | Pulsar2 `llm_build` | 45/48, 7.47% (9.73%) | 47/48, 7.27% (9.66%) | 0.29 |
+| Qwen3-0.6B | layout 5 + exact Add offsets (`pf_add_offset.py`) | 45/48, 2.85% (6.04%) | 44/48, 2.24% (3.56%) | card 70 ms |
+| llama-160m | layout 3 + exact Add offsets (`pf_add_offset.py`) | 45/47, 1.23% (1.75%) | 46/47, 1.14% (1.40%) | card 37 ms |
 
 Notes on the table:
 
@@ -282,9 +289,10 @@ Notes on the table:
   `rk` stay separate programs in every layout (`4` and `5` need `qkf`). Layout 3 against
   0: top-1 46/47 against 44/47 on adaquant (it no longer misses positions 30 and 46). Mean
   logit error 1.54% / 1.40% against 1.53% / 1.40%. Host estimates 45/47 and 46/47, 1.22%
-  and 1.16% (layout 0: 1.26% and 1.14%). `pf_check.py` on layout 3: rest set within
-  1.3e-2, first set within 1.8e-2. The 1.3e-2 is layer 1's `on2` normed output; layout
-  0's programs read at most 2.8e-3.
+  and 1.16% (layout 0: 1.26% and 1.14%). `pf_check.py` on layout 3 with a float Add as
+  the host model: rest set within 1.3e-2, first set within 1.8e-2. The 1.3e-2 was layer
+  1's `on2` normed output, from the Add's bias (below); layout 0's programs read at most
+  2.8e-3.
 - **Card time.** "card" is the runner's execution time of the step's plan. The rest of
   the wall time is the host side: tables and logits over the shared folder, and the plan
   file.
@@ -334,7 +342,7 @@ used: llama-160m layout 3, Qwen3-0.6B layout 5 with GPTQ.
 
 Qwen3-0.6B diverges only where the float model is near a tie (gaps 0.18 and 0.19).
 Both continuations then stay fluent ("... girl named Lila who lived in a village called
-Willowbrook").
+Willowbrook"). It is the same for the sets patched by `pf_add_offset.py` (below).
 
 llama-160m breaks at a newline. Both of its divergences come at the first token after a
 generated `\n`, and the float gap there is 1.87. The `\n` token makes a massive
@@ -361,6 +369,64 @@ GPTQ (`linear_emit.gptq_weight`, `docs/axera-width-and-linear-emit.md`) takes pa
 back.
 
 llama-160m's host estimate gives 45/47 and 46/47, 1.26% and 1.14%.
+
+### The Add's zero-point bias (`pf_add_offset.py`)
+
+llama-160m layer 1's `on2` read 1.3e-2 in `pf_check.py`; the other layers read at most
+3e-3. A dump of its card inputs and outputs over 47 steps shows why. Its residual sum `x`
+is 1.55 codes above the rounded float sum, on every channel and at every step (s.d. 0.02
+across steps). Layers 0, 2 and 5 are off by 0.27, -0.28 and -0.39 codes. Layer 1's
+normalized `y` makes this visible: the massive channels set the RMS, and the gain is
+small there, so the other channels' share of `y` is large.
+
+The card's U16 Add computes `(qa * A + qb * B + off) >> n`, rounded half up. The scale
+ratios `A`, `B` are u16 `Q(n)` (`n = 15 - k`, `u16_retarget.add_shift`). Pulsar2's offset
+word `off` takes the unrounded ratios, `int((zp_y - zp_a * r_a - zp_b * r_b) * 2^n)`, so
+every element is off by `zp_a * (A / 2^n - r_a) + zp_b * (B / 2^n - r_b)` codes. That
+formula gives 0.27, 1.55, -0.28 and -0.39 codes for layers 0, 1, 2 and 5, matching the
+dump to 0.01. Layer 1 is the worst case: its residual input's range is a little wider
+than the sum's (`r_a = 1.011`), so the shift is `k = 1` and the ratios have half the
+precision, and the zero points are large (57309). A model of this arithmetic
+(`pf_fake_quant.card_add`) gives the card's codes for 99.8-99.99% of the elements; the
+rounded float sum gives them for 0% (layer 1) to 73%. Native Pulsar2 builds have the same
+offset, so every retargeted program has it too. It is not a calibration or range-sharing
+error.
+
+The bias is the same on all channels of the residual stream and of the RoPE sums, and it
+costs accuracy. In the host estimate (`pf_estimate.py --card-add`), Qwen3-0.6B layout 5
+goes from 45/48 2.34% and 44/48 2.18% (float Adds) to 43/48 2.87% and 43/48 2.68%,
+close to the card's 43/48 3.47% and 43/48 2.77%. Only the bias matters: card ratios with
+an exact offset give 45/48 2.42% and 45/48 2.22%, and exact ratios with Pulsar2's offset
+give 43/48 3.04% and 43/48 2.77%. llama-160m goes from 1.22% / 1.16% to 1.30% / 1.25%
+(card: 1.32% / 1.24%).
+
+`u16_retarget.exact_add_offset` is the offset word that cancels the bias:
+`zp_y * 2^n - zp_a * A - zp_b * B`. `pf_add_offset.py` copies a generated set and
+rewrites each Add's four offset records (`0x1ef0..0x1f20`), found by Pulsar2's value.
+Nothing else changes, and the manifests mark the programs for `pf_check.py` and
+`pf_estimate.py`. Qwen3-0.6B: 179 programs and 286 Adds. Each program differs from
+Pulsar2's only in those records; in ten first-set `dnqk` programs a residual Add's exact
+offset is 0, so two writes are elided as Pulsar2 would elide them. llama-160m: 120
+programs and Adds.
+
+On the card (2026-10-27), with the same speed:
+
+| set | adaquant | activation-memory-planning | `pf_check.py` worst (rest / first) |
+| --- | --- | --- | --- |
+| Qwen3-0.6B layout 5 | 43/48, 3.47% (6.00%), mean 3.85% | 43/48, 2.77% (3.68%), mean 3.09% | 8.7e-3 / 8.6e-3 |
+| the same, exact Add offsets | 45/48, 2.85% (6.04%), mean 3.28% | 44/48, 2.24% (3.56%), mean 2.63% | 8.7e-3 / 8.4e-3 |
+| llama-160m layout 3 | 46/47, 1.32% (1.86%), mean 1.54% | 46/47, 1.24% (1.48%), mean 1.40% | 7.5e-4 / 1.1e-2 |
+| the same, exact Add offsets | 45/47, 1.23% (1.75%), mean 1.43% | 46/47, 1.14% (1.40%), mean 1.28% | 1.1e-3 / 1.1e-2 |
+
+The Qwen3 misses go from adaquant 0 / 3 / 10 / 13 / 17 to 3 / 10 / 13, and from 0 / 5 /
+10 / 13 / 28 to 7 / 10 / 13 / 28. llama-160m's added miss is position 30, where the
+float gap is 0.036. A calibration-side fix was tried as well. Each Add's output range was
+widened by up to 2% to a scale where the bias cancels. It does not reach the first
+set's residual Adds, whose `b` ratio is a few units at Q15 (the massive `x` range against
+a small update), and its host estimate was no better (45/48 3.03%, 44/48 2.53%).
+In those Adds the update can even round to `B = 0`: Qwen3's first set at layer 11 adds
+nothing of `down_proj`'s output to the residual on the card (`b` range 0.07 against
+`x` 15000).
 
 ## Checks
 
@@ -389,6 +455,10 @@ llama-160m's host estimate gives 45/47 and 46/47, 1.26% and 1.14%.
 
   `pf_estimate.py` reproduces the runs' host estimates exactly, and `pf_plan.py --fake` the
   float wiring check (llama-160m: median 1.1e-4).
+- **The card's Add** (`tests/test_axera_llm_pulsar_free.py`): `card_add` has
+  llama-160m layer 1's 1.55-code bias, and none with `exact_add_offset`.
+  `tests/test_axera_u16_retarget.py`: `exact_add_offsets` on a native `anorm` build
+  changes only the residual Add's four offset records.
 - **GPTQ.** `pf_gptq.py` uses master's `linear_emit.gptq_weight`. That function is a
   reimplementation of the GPTQ loop the card runs used, and about 5% of its codes differ
   by a rounding step. Its host estimate is 44/48 and 45/48, 2.30% and 2.31%, against

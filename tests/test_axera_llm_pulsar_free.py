@@ -12,6 +12,7 @@ import sys
 
 import numpy as np
 import pytest
+from onnx import parser
 from onnx.reference import ReferenceEvaluator
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -117,6 +118,53 @@ def test_fq_grid():
     a = np.array([-1.0, 0.0, 0.3, 2.0])
     np.testing.assert_allclose(fqm.fq(a, (0.5, 2)), [-1.0, 0.0, 0.5, 2.0])
     assert fqm.fq(np.array([1e9]), (1.0, 0), signed=True)[0] == 32767
+
+
+#: llama-160m layer 1's residual Add in ``on2`` (layout 3, rest set): on the card
+#: every element of its sum came out 1.55 codes above the rounded float sum
+L1_ADD = {
+    "a": (0.0013510935241356492, 57309),
+    "b": (0.00011911139154108241, 30468),
+    "y": (0.0013367648934945464, 57238),
+}
+
+
+def test_card_add_bias_and_exact_offset():
+    """The card's U16 Add (fixed-point ratios, Pulsar2's offset word from the
+    unrounded ratios) is off by ``add_bias`` codes on every element; with
+    ``u16_retarget.exact_add_offset`` the sum is the rounded float sum."""
+    import u16_retarget as ur
+
+    c = L1_ADD
+    assert fqm.add_bias(c["a"], c["b"], c["y"]) == pytest.approx(1.55, abs=0.01)
+    rng = np.random.default_rng(0)
+    a = fqm.fq(rng.normal(0, 3, (1, 768)), c["a"])
+    b = fqm.fq(rng.normal(0, 1, (1, 768)), c["b"])
+    ideal = fqm.fq(a + b, c["y"]) / c["y"][0]
+    biased = fqm.card_add(a, b, c["a"], c["b"], c["y"]) / c["y"][0]
+    exact = fqm.card_add(a, b, c["a"], c["b"], c["y"], exact_offset=True) / c["y"][0]
+    assert np.mean(biased - ideal) == pytest.approx(1.55, abs=0.05)
+    assert abs(np.mean(exact - ideal)) < 0.05
+    assert np.abs(exact - ideal).max() <= 1
+    # the exact offset word puts the zero points on the output's zero point
+    sa, za = c["a"]
+    sb, zb = c["b"]
+    sy, zy = c["y"]
+    n = 15 - ur.add_shift(sa / sy, sb / sy)
+    off = ur.exact_add_offset(c, "a", "b", "y")
+    off = off - (1 << 32) if off >= 1 << 31 else off
+    big_a, big_b = round(sa / sy * 2**n), round(sb / sy * 2**n)
+    assert za * big_a + zb * big_b + off == zy * 2**n
+    # AddEval and FusedEval take the same model
+    ad = fqm.AddEval(c, card_add=True)
+    np.testing.assert_allclose(ad(a, b), (biased * sy).astype(F32))
+    m = parser.parse_model(
+        '<ir_version: 9, opset_import: ["" : 17]> g (float[1,768] a, float[1,768] b)'
+        " => (float[1,768] y) { y = Add(a, b) }"
+    )
+    got = fqm.FusedEval(m, c, card_add=True, exact_offset=True)(a=a, b=b)
+    np.testing.assert_allclose(got, (exact * sy).astype(F32))
+    np.testing.assert_allclose(fqm.FusedEval(m, c)(a=a, b=b), (ideal * sy).astype(F32))
 
 
 def test_split_weights_sum_to_w():
