@@ -16,7 +16,9 @@ is emitted from or fed with.
   layer), ``1`` residual Add + two-pass norm and q / k RoPE + k norm merged
   (``LAYER_FUSED``, 9), ``2`` also ``o_proj`` / ``down_proj`` into the Add +
   norm after them (``LAYER_FUSED2``, 7), ``3`` also the SiLU before
-  ``down_proj`` (``LAYER_FUSED3``, 6).
+  ``down_proj`` (``LAYER_FUSED3``, 6), ``4`` also the linear after each norm
+  (``LAYER_FUSED4``, 4), ``5`` also the next layer's q / k / v linears and
+  RoPE into ``dn`` (``LAYER_FUSED5``, 3).
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -71,7 +73,7 @@ MODELS = {
         zero_pos0=False,
         share_linears=True,
         split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
-        fuse=3,
+        fuse=5,
     ),
 }
 #: share a linear between the sets when the first set's ranges are within this factor
@@ -181,11 +183,34 @@ class Config:
         pn["input"] = x
         return (pn["xn"].reshape(1, self.H) @ self.head_t).reshape(-1), pn
 
+    def kv_producer(self, st: str, li: int) -> tuple[str, str]:
+        """``(where, program)`` that computes layer ``li``'s K row (and, with
+        ``fuse=5``, its V row: ``yk`` and ``v``)."""
+        if self.fuse < 5:
+            return f"L{li}", self.k_program[0]
+        if li == 0:
+            return "L0", "n1qk"
+        if self.is_split(st, li - 1, "down_proj"):
+            return f"L{li}", "qk"
+        return f"L{li - 1}", "dnqk"
+
     def programs(self, st: str, wh: str) -> list[str]:
         """The programs of set ``st`` at ``wh`` (``L<i>`` or ``post``), in order."""
         if wh == "post":
             return list(self.post_programs)
         progs = list(self.layer_programs)
+        if self.fuse >= 4:
+            li = int(wh[1:])
+            five = self.fuse >= 5
+            split = self.is_split(st, li, "down_proj")
+            head = ["n1qk" if five else "n1q"] if li == 0 else []
+            if li > 0 and self.is_split(st, li - 1, "down_proj"):
+                head = ["qkv5", "qk"] if five else ["qkv5"]
+            dnq = "dnqk" if five else "dnq"
+            tail = ["on2g", dnq if li + 1 < self.L else "dn"]
+            if split:
+                tail = ["on2", "gu", "silu_f", "down_proj", "dn"]
+            return head + ([] if five else ["qk"]) + ["attn"] + tail
         if self.fuse >= 2:
             li = int(wh[1:])
             if li == 0:

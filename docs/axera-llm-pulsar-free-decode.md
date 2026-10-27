@@ -94,8 +94,8 @@ at most about 400 later.
 Every `axclrtEngineExecute` costs about 0.27 ms on this card whatever the program
 computes (a `[1, 1024]` Add takes as long as a two-pass norm), and the runtime has no
 asynchronous execute. Decode speed therefore follows the number of programs run per
-token. The table above is layout `0`. Layouts `1`..`3` run neighbouring programs as one
-(`pf_layout.LAYER_FUSED*`, Qwen3 only so far):
+token. The table above is layout `0`. Layouts `1`..`5` run neighbouring programs as one
+(`pf_layout.LAYER_FUSED*`; `4` and `5` need a per-head q / k norm):
 
 | `LLM_PF_FUSE` | merged programs (template) | per layer | per token |
 | --- | --- | --- | --- |
@@ -103,6 +103,8 @@ token. The table above is layout `0`. Layouts `1`..`3` run neighbouring programs
 | 1 | `n1` / `n2` = residual Add + two-pass norm (`anorm<H>`; layer 0 `nrm<H>`), `qk` = `rq` + `kc` + `rk` (`qkf<nh*hd>`); the final Add + norm `nf` | 9 | 254 |
 | 2 | `on2` = `o_proj` + `res1` + second norm, `dn` = `down_proj` + `res2` + the next layer's first norm (or the final norm) (`lanorm<k>`) | 7 | 198 |
 | 3 | `dn` also takes the fused SiLU (`slanorm<I>`) | 6 | 170 |
+| 4 | the linear after each norm joins it: `on2g` = `on2` + `gu` (`lanorml<k>x<n>`), `dnq` = `dn` + the next layer's `qkv5` (`slanorml<k>x<n>`); layer 0 `n1q` (`nrml<n>`) | 4 | 114 |
+| 5 (Qwen3 default) | the next layer's q / k / v and its RoPE join `dn`: `dnqk` (`slanormqk<I>`: five linears q, q_rot, k, k_rot, v, then `qkf`; outputs the residual, q, and the K / V rows); layer 0 `n1qk` (`nrmqk<H>`) | 3 | 86 |
 
 A merged program has several outputs where the residual stream goes on (`x` and the
 normalized `y`; `qk`'s `yq` and `yk`, which is bound to K row `p` as `rk`'s was). Only
@@ -135,6 +137,21 @@ How the merged programs are made:
   to 0, and an Add whose shift differs from the register's value needs its own write.
   `qkf`'s template `v1` (both RoPE Adds cancel, shift 11) keeps all five writes. It
   serves the targets whose q or k RoPE Add shifts below 15 (12 of 28 layers).
+- **Layout 5's K / V rows.** `dnqk` of layer `l` writes layer `l + 1`'s K and V rows; the
+  plan rebinds its `yk` and `v` outputs onto row `p` of that layer's caches every step
+  (`Config.kv_producer`), so the V row copy of the older layouts is gone too. A layer
+  after a split first-set layer keeps its own `qkv5` and `qk`. The rest set's `dnqk` is
+  calibrated on the rest set's samples; the first set's RoPE parts on both sets (at
+  position 0 sin = 0 makes `r * sn` a zero range).
+- **Several linears in one program** (`on2g`, `dnq`, `dnqk`: two to six). Each has its
+  table in `npu_params` (found from the template's own weights and calibration) and its
+  own core `zp_x` records, told apart by the template's zero points (refused when two
+  linears' inputs share one).
+- **Merged CORE jobs.** With q / k / v and the RoPE in one program, Pulsar2 runs 36 CORE
+  jobs for 33 compute nodes (`nrmqk`), three of them without any calibration record (data
+  movement around the linears), and in other builds runs two nodes in one job. The
+  assignment DP lets a job without records take no node, and a job take two nodes, up to
+  `MAX_MERGED` either way.
 - **A linear inside a fused program** (`lanorm`, `slanorm`) is a FullyConnected with no
   main-engine CORE job. Its `npu_params` table is `linear_emit.linear_params_u16`'s
   table byte for byte, two bytes into the fused program's `npu_params`. `retarget_graph`
@@ -144,9 +161,16 @@ How the merged programs are made:
   / `lanorm3072`, `slanorm3072` (or refused), and `lanorm2048` with weights the template
   never saw (`tests/test_axera_u16_retarget.py`).
 
-A per-program card check of the `LLM_PF_FUSE=1` set read back the `n1`, `n2` and `qk`
-outputs after a real step. Against the host fake-quant on the card's own inputs, they
-agree within 1e-4 to 1.2e-3 relative error at layers 0, 1, 5, 11, 18 and 27.
+**Per-program card check (`pf_check.py`).** After a few real steps it reads back every
+program's input and output buffers as the plan bound them, runs the program's host
+model on the card's own inputs (the float graph at the program's calibration, the s8
+linear), and compares. A wrong record (scale, zero point, Add shift, weight table)
+shows up as 1e-1 or more. Layout 5, rest set: all 198 outputs within 9e-3, most
+1e-3..3e-3. First set (position 0, massive activations): up to 3.3e-2, the same as
+layout 3's first set (up to 2.2e-2 for `on2`, 1.2e-2 for `qk`), so the first set's
+tolerance is 5e-2. Rerun it after regenerating a set:
+`LLM_PF_OUT=... python pf_check.py [--set first]` (exit status 1 when a program is
+above tolerance).
 
 ### The plan
 
@@ -210,7 +234,10 @@ and after every run.
 | Qwen3-0.6B | Pulsar-free, GPTQ from `pf_gptq.py` | 43/48, 3.29% (5.16%) | 44/48, 2.89% (4.27%) | 0.19 (card 162 ms) |
 | Qwen3-0.6B | the same, merged programs `LLM_PF_FUSE=1` | 44/48, 3.27% (5.25%) | 44/48, 2.94% (4.30%) | 0.14 (card 119 ms) |
 | Qwen3-0.6B | the same, `LLM_PF_FUSE=2` | 44/48, 3.28% (5.21%) | 44/48, 2.94% (4.39%) | 0.12-0.13 (card 103-106 ms) |
-| Qwen3-0.6B | the same, `LLM_PF_FUSE=3` (default) | 44/48, 3.25% (5.66%) | 44/48, 2.91% (4.42%) | 0.12 (card 96-97 ms) |
+| Qwen3-0.6B | the same, `LLM_PF_FUSE=3` | 44/48, 3.25% (5.66%) | 44/48, 2.91% (4.42%) | 0.12 (card 96-97 ms) |
+| Qwen3-0.6B | rebuilt (see below), `LLM_PF_FUSE=3` | 44/48, 3.37% (5.89%) | 43/48, 2.77% (3.53%) | card 94-95 ms |
+| Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=4` (not taken) | 44/48, 3.46% (6.37%) | 42/48, 2.84% (4.41%) | card 77-78 ms |
+| Qwen3-0.6B | rebuilt, `LLM_PF_FUSE=5` (default) | 43/48, 3.47% (6.00%) | 43/48, 2.77% (3.68%) | 0.08-0.09 (card 68-70 ms) |
 | Qwen3-0.6B | Pulsar2 `llm_build` | 45/48, 7.47% (9.73%) | 47/48, 7.27% (9.66%) | 0.29 |
 
 Notes on the table:
@@ -230,6 +257,20 @@ Notes on the table:
   0 / 13 / 28 / 34). The median error is unchanged. The p90 of `3` on adaquant (5.66%
   against 5.16%) comes from 2 of 48 steps. Its host estimate is 44/48 and 45/48, 2.34%
   and 2.34% (layout `0`: 2.30% and 2.31%).
+- **Rebuilt rows** (2026-10-27, later). The scratch templates, recorded activations and
+  GPTQ weights of the rows above were deleted from the scratch disk. They were rebuilt from
+  this directory's scripts (`pf_templates.py`, `pf_record.py`, `pf_gptq.py`), so these rows
+  are their own baseline: compare layout 5 with the rebuilt layout 3, run back to back,
+  not with the older rows. Layout 5 against 3: mean logit error 3.85% / 3.09% against
+  3.89% / 3.09%, the median and p90 within 0.1 points, top-1 43 against 44 on adaquant.
+  The misses are 0 / 3 / 10 / 13 / 17 against 0 / 3 / 13 / 32, where the float top-1 /
+  top-2 gaps are 0.021 / 0.068 / 0.084 / 0.116 / 0.047. Host estimates: 45/48 2.34%
+  and 44/48 2.18% for layout 5, against 44/48 2.50% and 44/48 2.30% for layout 3.
+  Layout 4 is not taken: it is worse on both passages (42/48, mean 3.25% against 3.09%).
+  Layout 5's first version calibrated the rest set's RoPE parts on both sets, as
+  layout 3's shared `qk` does: 43/48 3.42%, 43/48 2.78%. In `pf_profile.py`, layout 5
+  takes `dnqk` 908 us (the down and q / k / v linears, 10.4 MB), `on2g` 764 us,
+  `attn` 452 us and `lm_head` 8.3 ms per token. Resident: 198 programs.
 - **Card time.** "card" is the runner's execution time of the step's plan. The rest of
   the wall time is the host side: tables and logits over the shared folder, and the plan
   file.
@@ -272,7 +313,7 @@ llama-160m's host estimate gives 45/47 and 46/47, 1.26% and 1.14%.
 ## Checks
 
 - **Merged layouts** (`tests/test_axera_llm_pulsar_free.py`): the whole-plan wiring check
-  for `LLM_PF_FUSE=1..3` on the qwen3-like synthetic model. It includes the split
+  for `LLM_PF_FUSE=1..5` on the qwen3-like synthetic model, `1..3` on the llama ones. It includes the split
   first-set `down_proj`, several-output binding and `qk`'s K row. Also programs per layer,
   template names, FusedEval of each merged graph against `ReferenceEvaluator`, and the
   calibration ties. Regenerating layout `0` from the same templates is byte-identical to
@@ -311,12 +352,15 @@ llama-160m's host estimate gives 45/47 and 46/47, 1.26% and 1.14%.
 - **Not in the repository.** Templates, recorded activations and program sets stay local
   scratch. Qwen3-0.6B's program set is 827 MB, and its templates are 49 Pulsar2 builds
   (four per fused / Add shape, one per linear shape; llama-160m: 29).
-- **Merged layouts are Qwen3 only.** `LLM_PF_FUSE=1` without a per-head q / k norm keeps
-  `rq` / `rk` but is not run on the card; `2` and `3` need the norm (`qkf`). llama-160m
-  stays on layout `0`.
-- **Not merged yet.** `qkv5` + `qk` (the linear's output is sliced five ways) and `gu` +
-  the SiLU (two outputs of one linear). The rotated q / k columns are still duplicated in
-  `qkv5` (1024 x 7168, 0.66 ms).
+- **Merged layouts on the card: Qwen3 only.** Layouts `1`..`3` without a per-head q / k
+  norm keep `rq` / `rk` and pass the wiring check, but have not run on the card; `4` and
+  `5` need the norm (`qkf`). llama-160m stays on layout `0`.
+- **Not merged yet.** `gu` + the SiLU: in a program where the SiLU follows two linears,
+  Pulsar2 fuses Sigmoid and Mul into one job whose records are not decoded (the SiLU
+  sits in `dnqk` before `down_proj` instead). The attention stays its own program. The
+  rotated q / k columns are still duplicated (five linears per `dnqk`, 7168 columns). A
+  probe shows `Split` / `Concat` rotate halves in-program as data movement (no CORE job,
+  calibration equal to the input's), so the rotation could move into the program.
 - **Not ported from the scratch run.** The per-program card-vs-host diagnostics and the
   attention calibration-margin experiment (`m = 1.0 / 1.2 / 1.414` on recorded inputs) are
   left out; the margin in use is sqrt(2).

@@ -481,6 +481,9 @@ MERGED_EXACT = ("lanorm2048", "lanorm3072", "slanorm3072")
 #: no linear; some pairs differ from the native build in job order or IO slot
 #: numbering only (Pulsar2 rebuild noise), at least one pair is byte-equal
 MERGED = ("nrm1024", "anorm1024", "qkf2048") + MERGED_EXACT
+#: several linears and the q / k RoPE in one program (fuse=4 / fuse=5)
+MERGED += ("nrml7168", "lanorml2048x6144", "slanorml3072x7168")
+MERGED += ("nrmqk1024", "slanormqk3072")
 
 
 def _merged(name, i):
@@ -496,7 +499,7 @@ def test_merged_linear_program_equals_the_native_build_or_refuses(group, t, n):
     template, want = _need(td), gs.load_model(_need(nd))
     try:
         got = ur.retarget_graph(
-            template, f"{td}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+            template, f"{nd}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
         )
     except ValueError as e:
         assert any(r in str(e) for r in REFUSALS), e
@@ -504,7 +507,10 @@ def test_merged_linear_program_equals_the_native_build_or_refuses(group, t, n):
     assert ur.compare(got, want) == []
 
 
-@pytest.mark.parametrize("group", MERGED)
+#: nrmqk1024's four variants refuse each other's calibrations (Add-shift and
+#: zero-point coincidences of the variants themselves); real targets take v1,
+#: checked on the card by pf_check.py
+@pytest.mark.parametrize("group", [g for g in MERGED if g != "nrmqk1024"])
 def test_every_merged_group_has_a_working_template(group):
     ok = 0
     for t, n in itertools.permutations(range(4), 2):
@@ -513,7 +519,7 @@ def test_every_merged_group_has_a_working_template(group):
         try:
             got = ur.retarget_graph(
                 f"{td}/out/compiled.axmodel",
-                f"{td}/model.onnx",
+                f"{nd}/model.onnx",  # a variant may have weights of its own
                 ur.quant_of(td),
                 ur.quant_of(nd),
             )
@@ -551,3 +557,46 @@ def test_core_jobs_take_a_topological_order():
     got = ur._assign_core_jobs(main, comp, ur._graph_candidates(nodes, q), nodes)
     ops = [nodes[int(got[j][1:])][0] for j in sorted(got)]
     assert ops[-4:] == ["Add", "Sqrt", "Div", "Mul"]
+
+
+def _structure(model):
+    """Every segment's records without the calibration writes (A1 at or above
+    MIN_CALIB_REG) and the zero padding: what a retarget must leave alone."""
+    return [
+        [
+            r
+            for r in seg
+            if r != bytes(8) and not (r[0] == gs.A1 and gs._reg(r) >= ur.MIN_CALIB_REG)
+        ]
+        for seg in ur._segs(model)
+    ]
+
+
+@pytest.mark.parametrize(
+    "group,t,n",
+    [(g, t, n) for g in MERGED for t, n in itertools.permutations(range(4), 2)],
+)
+def test_merged_retarget_keeps_the_template_program(group, t, n):
+    """Where the retargeted program is not byte-equal to the native build of
+    its calibration (Pulsar2 picked another job order or buffer layout for
+    that calibration), it is still the template's own program: every record
+    but the calibration writes is the template's, in order, and the core's
+    ``0x03d0`` input zero points are the only other change."""
+    td, nd = _merged(group, t), _merged(group, n)
+    template = _need(td)
+    _need(nd)
+    try:
+        got = ur.retarget_graph(
+            template, f"{nd}/model.onnx", ur.quant_of(td), ur.quant_of(nd)
+        )
+    except ValueError as e:
+        assert any(r in str(e) for r in REFUSALS), e
+        return
+
+    def strip(model):
+        return [
+            [r for r in seg if not (r[0] == gs.A1 and gs._reg(r) == 0x03D0)]
+            for seg in _structure(model)
+        ]
+
+    assert strip(got) == strip(gs.load_model(template))

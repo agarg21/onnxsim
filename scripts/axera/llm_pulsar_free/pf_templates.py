@@ -29,12 +29,18 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
   ``[nkv, G, hd]``, token-major K / V ``[S + 1, nkv*hd]`` (the plan's cache
   layout), mask ``[1, S + 1]`` (Reshape / Transpose inside);
 * ``silu<n>``: ``y = gate * sigmoid(gate) * up``;
+* ``nrmqk<H>`` / ``slanormqk<I>`` (``fuse=5``): ``nrm`` / ``slanorm``, then
+  the five q / k / v linears from the norm's output and ``qkf`` (outputs
+  ``yq``, ``yk``, ``v``); a variant generator may come with its own weights
+  (``(gen, {initializer: weights})``);
 * merged programs (``pf_layout.LAYER_FUSED*``), several outputs where the
   residual stream continues: ``nrm<n>`` (the two-pass RMSNorm), ``anorm<n>``
   (residual Add + two-pass norm, outputs ``x`` and ``y``), ``qkf<nh*hd>``
   (q RoPE + k coarse norm + k RoPE, outputs ``yq`` and ``yk``),
   ``lanorm<k>`` (a ``[1, k] @ [k, H]`` FullyConnected + ``anorm``),
-  ``slanorm<k>`` (fused SiLU + ``lanorm``).
+  ``slanorm<k>`` (fused SiLU + ``lanorm``); ``nrml<n>``, ``lanorml<k>x<n>``,
+  ``slanorml<k>x<n>``: the same with a second linear after the norm
+  (``y = yn @ w2``, ``[1, H] @ [H, n]``; ``fuse=4``).
 
 usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [NAME...]
 (no NAME: every template the model needs that is not built yet; serial builds)
@@ -381,12 +387,29 @@ def graph(name: str, d: Dims):
     """``(op types, body, inputs {name: shape}, output shape, initializers,
     variant generators)`` of a fused template ``name``."""
     m = re.fullmatch(
-        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm)(\d+)(t?)",
+        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm"
+        r"|nrml|lanorml|slanorml|nrmqk|slanormqk)(\d+)(?:x(\d+))?(t?)",
         name,
     )
     if not m:
         raise ValueError(f"{name}: not a fused template name")
-    kind, n, alt = m.group(1), int(m.group(2)), m.group(3)
+    kind, n, alt = m.group(1), int(m.group(2)), m.group(4)
+    n2 = int(m.group(3)) if m.group(3) else None
+    if kind in ("nrml", "lanorml", "slanorml"):
+        # a second linear after the norm: ``y = yn @ w2`` (``[1, H] @ [H, n2]``)
+        base = kind[:-1]
+        if base == "nrm":
+            n, n2 = d.H, n  # nrml<n2>: the norm of [1, H], then H -> n2
+        ops, body, ins, outs, inits, gens = graph(f"{base}{n}", d)
+        body = body.replace("  y = Mul(d, g)", "  yn = Mul(d, g)")
+        body += "  y = MatMul(yn, w2)\n"
+        inits = {**inits, "w2": template_weight(d.H, n2, 2)}
+        if isinstance(outs, dict):
+            outs = {**outs, "y": [1, n2]}
+        else:
+            outs = [1, n2]
+        ops = list(dict.fromkeys(["FullyConnected", "MatMul", *ops]))
+        return ops, body, ins, outs, inits, gens
     eps = {"eps": np.array([d.eps], F)}
     heads = {
         "shh": np.array([n // d.hd, d.hd], np.int64),
@@ -432,6 +455,57 @@ def graph(name: str, d: Dims):
         inits = {"w": w, "eps": eps["eps"], "eps0": eps["eps"]}
         ops = ["FullyConnected", "MatMul", "Sigmoid"] + NORM_OPS
         return ops, SILU_LINEAR_ADDNORM, ins, {"x": [1, H], "y": [1, H]}, inits, gens
+    if kind in ("nrmqk", "slanormqk"):
+        # the norm (nrm<H>, or slanorm<I>), then five linears q, q_rot, k, k_rot,
+        # v from its output and the qkf RoPE: outputs (x,) yq, yk, v
+        base = "nrm" if kind == "nrmqk" else "slanorm"
+        ops, body, ins, outs, inits, gens = graph(f"{base}{n}", d)
+        _, qbody, qins, qouts, qinits, _ = graph(f"qkf{d.nh * d.hd}", d)
+        nq, nk = d.nh * d.hd, d.nkv * d.hd
+        body = body.replace("  y = Mul(d, g)", "  yn = Mul(d, g)")
+        for a, b in NORM_QK_RENAME.items():  # qkf's sin table is ``sq``
+            body = body.replace(f"  {a} = ", f"  {b} = ").replace(f"({a})", f"({b})")
+        body += "".join(
+            f"  {t} = MatMul(yn, w{t})\n" for t in ("q", "qr", "k", "kr", "v")
+        )
+        body += qbody
+        ins = {**ins, **{t: qins[t] for t in ("cq", "sq", "ck", "sk")}}
+        outs = {**({"x": outs["x"]} if isinstance(outs, dict) else {}), **qouts}
+        outs["v"] = [1, nk]
+        widths = {"q": nq, "qr": nq, "k": nk, "kr": nk, "v": nk}
+        variants = ((0.0, 0.0), (0.95, 0.98), (1.0, 0.0), (0.0, 0.9))
+        out_gens = []
+        for i, (kq, kk) in enumerate(variants):
+            ws = {
+                f"w{t}": template_weight(d.H, m, 3 + j)
+                for j, (t, m) in enumerate(widths.items())
+            }
+            noise = np.random.default_rng(20 + i)
+            for t, kx in (("q", kq), ("k", kk)):
+                if (
+                    kx
+                ):  # the rotated part cancels the plain part: that RoPE Add shifts < 15
+                    w = ws[f"w{t}"]
+                    ws[f"w{t}r"] = (
+                        -kx * w + 0.05 * noise.uniform(-0.1, 0.1, w.shape)
+                    ).astype(F)
+
+            def gen(r, g0=gens[i % len(gens)], kq=kq, kk=kk):
+                feeds = g0(r)
+                for t, m, kx in (("q", nq, kq), ("k", nk, kk)):
+                    c = r.uniform(-0.6, 1.0, (1, m)).astype(F)
+                    sn = (
+                        c * r.uniform(0.9, 1.1, (1, m))
+                        if kx
+                        else r.uniform(-1.0, 0.8, (1, m))
+                    )
+                    feeds[f"c{t}"], feeds[f"s{t}"] = c, sn.astype(F)
+                return feeds
+
+            out_gens.append((gen, ws))
+        inits = {**inits, **qinits, **out_gens[0][1]}
+        ops = list(dict.fromkeys(["FullyConnected", "MatMul", *ops, *qops_of(d)]))
+        return ops, body, ins, outs, inits, out_gens
     if kind == "qkf":
         if n != d.nh * d.hd:
             raise ValueError(f"{name}: the model's q width is {d.nh * d.hd}")
@@ -504,6 +578,14 @@ def graph(name: str, d: Dims):
     return ops, ATTN, ins, [1, n], shapes, gens
 
 
+#: the norm's tensors renamed in ``nrmqk`` / ``slanormqk`` (clashing with qkf's)
+NORM_QK_RENAME = {"sq": "sqn"}
+
+
+def qops_of(d: Dims) -> list[str]:
+    return graph(f"qkf{d.nh * d.hd}", d)[0]
+
+
 def model_of(body: str, ins: dict, out, inits: dict) -> onnx.ModelProto:
     """``out``: the output shape of a one-output graph (output ``y``), or
     ``{name: shape}`` for several outputs."""
@@ -551,6 +633,15 @@ def needed(cfg) -> list[str]:
             names += [f"lanorm{qd}", f"lanorm{inter}"]
         if cfg.fuse >= 3:
             names += [f"slanorm{inter}"]
+        qkv = sum(n for _, n in cfg.QKV)
+        if cfg.fuse == 4:
+            names += [
+                f"nrml{qkv}",
+                f"lanorml{qd}x{2 * inter}",
+                f"slanorml{inter}x{qkv}",
+            ]
+        if cfg.fuse >= 5:
+            names += [f"lanorml{qd}x{2 * inter}", f"nrmqk{H}", f"slanormqk{inter}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]
@@ -635,7 +726,11 @@ def build_fused(root: str, name: str, d: Dims) -> None:
         if os.path.exists(os.path.join(W, "result.json")):
             continue
         os.makedirs(W, exist_ok=True)
-        onnx.save(model_of(body, ins, out, inits), os.path.join(W, "model.onnx"))
+        vinits = inits
+        if isinstance(gen, tuple):  # a variant with weights of its own
+            gen, extra = gen
+            vinits = {**inits, **extra}
+        onnx.save(model_of(body, ins, out, vinits), os.path.join(W, "model.onnx"))
         r = np.random.default_rng(300 + i)
         draws = [gen(r) for _ in range(18)]
         ok, err = _pulsar2_build(W, ins, {n: [x[n] for x in draws] for n in ins}, ops)
