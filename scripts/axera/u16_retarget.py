@@ -546,8 +546,8 @@ def _check_add_shift_writes(main, nodes, assign, cn) -> None:
             if want != state and not writes:
                 raise ValueError(
                     f"the target's {node} Add needs {ADD_SHIFT:#06x} = {want} (the "
-                    f"register holds {state}) but the template elided that write; "
-                    "use a template whose Adds shift differently"
+                    f"register holds {state}): an elided Add-shift write in the "
+                    "template; use a template whose Adds shift differently"
                 )
             state = want
         elif writes:
@@ -584,9 +584,7 @@ def retarget_graph(
     consts = {i.name for i in m.graph.initializer}
     # a MatMul by a constant is a FullyConnected: no main-engine CORE job of its
     # own; its weights / requantization are a table in npu_params (_linear_table)
-    fc = [
-        i for i, n in enumerate(nodes) if n[0] == "MatMul" and n[1][1] in consts
-    ]
+    fc = [i for i, n in enumerate(nodes) if n[0] == "MatMul" and n[1][1] in consts]
     if len(fc) > 1:
         raise ValueError("more than one constant-weight MatMul")
     for i in fc:

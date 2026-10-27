@@ -11,9 +11,12 @@ is emitted from or fed with.
   ``llm_pulsar_free_out/<MODEL>`` under the current directory);
 * ``GPTQ=1``: linear programs are emitted from ``<out>/gptq/*.npz``
   (``pf_gptq.py``) instead of round-to-nearest;
-* ``LLM_PF_FUSE``: the program layout, ``0`` one program per step
-  (``pf_layout.LAYER``) or ``1`` merged (``pf_layout.LAYER_FUSED``); default
-  the model's ``fuse``.
+* ``LLM_PF_FUSE``: the program layout (``pf_layout``), default the model's
+  ``fuse``: ``0`` one program per step (``LAYER``, 15 executes per Qwen3
+  layer), ``1`` residual Add + two-pass norm and q / k RoPE + k norm merged
+  (``LAYER_FUSED``, 9), ``2`` also ``o_proj`` / ``down_proj`` into the Add +
+  norm after them (``LAYER_FUSED2``, 7), ``3`` also the SiLU before
+  ``down_proj`` (``LAYER_FUSED3``, 6).
 
 Calibration sets: ``first`` is position ``first_pos`` with many different
 tokens (the position whose activations are massive), ``rest`` the positions
@@ -68,7 +71,7 @@ MODELS = {
         zero_pos0=False,
         share_linears=True,
         split_first=dict(layers=[0, 1, 2], keys=["gu", "down_proj"]),
-        fuse=1,
+        fuse=3,
     ),
 }
 #: share a linear between the sets when the first set's ranges are within this factor
@@ -188,7 +191,9 @@ class Config:
             if li == 0:
                 progs.insert(0, "n1")
             if self.is_split(st, li, "down_proj"):
-                progs.insert(progs.index("dn"), "down_proj")
+                split = ["silu_f", "down_proj"] if self.fuse >= 3 else ["down_proj"]
+                i = progs.index("dn")
+                progs[i:i] = split
         return progs
 
     # ---- program inputs and weights ---------------------------------------------------

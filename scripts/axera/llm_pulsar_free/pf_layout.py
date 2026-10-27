@@ -70,13 +70,15 @@ POST_FUSED = ["nf", "lm_head"]
 #: has no Add before it). A split first-set ``down_proj`` (~16-bit weights as
 #: two s8 linears) stays a linear program, its ``dn`` the Add + norm alone.
 LAYER_FUSED2 = ["qkv5", "qk", "attn", "on2", "gu", "silu_f", "dn"]
+#: ``fuse=3``: ``dn`` also holds the fused SiLU (``silu_f``) before ``down_proj``
+LAYER_FUSED3 = ["qkv5", "qk", "attn", "on2", "gu", "dn"]
 
 
 def layer_programs(qk_norm: bool, fuse: int = 0) -> list[str]:
     if fuse >= 2:
         if not qk_norm:
             raise NotImplementedError("fuse=2 without a per-head q / k norm")
-        return list(LAYER_FUSED2)
+        return list(LAYER_FUSED3 if fuse >= 3 else LAYER_FUSED2)
     if fuse:
         progs = list(LAYER_FUSED)
         if not qk_norm:

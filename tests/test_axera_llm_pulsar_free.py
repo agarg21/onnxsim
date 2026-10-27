@@ -79,18 +79,27 @@ DIMS = tpl.Dims(H=32, I=64, nh=4, nkv=2, hd=16, eps=1e-6, vocab=64)
         "hcrms64",
         "attn64",
         "silu64",
+        "nrm32",
+        "anorm32",
+        "qkf64",
+        "lanorm64",
+        "slanorm64",
     ],
 )
 def test_fused_eval_float_matches_reference(name):
-    """With no calibration FusedEval is the float graph; with one it rounds
-    every tensor to its U16 grid (close to float, not equal)."""
+    """With no calibration FusedEval is the float graph (every output of a
+    merged program, in graph order); with one it rounds every tensor to its
+    U16 grid (close to float, not equal)."""
     _, _, ins, _, _, gens = tpl.graph(name, DIMS)
     m = tpl.float_graph(name, DIMS)
     feeds = gens[0](np.random.default_rng(0))
-    want = ReferenceEvaluator(m).run(None, feeds)[0]
-    np.testing.assert_allclose(
-        fqm.FusedEval(m, {})(**feeds), want, rtol=1e-4, atol=1e-5
-    )
+    wants = ReferenceEvaluator(m).run(None, feeds)
+    gots = fqm.FusedEval(m, {})(**feeds)
+    gots = gots if isinstance(gots, tuple) else (gots,)
+    assert len(gots) == len(wants) == len(m.graph.output)
+    for got, want in zip(gots, wants):
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-5)
+    want = wants[-1]
     res = ReferenceEvaluator(m).run(None, feeds, intermediate=True)
     cal = {}
     for k, v in res.items():
@@ -100,6 +109,7 @@ def test_fused_eval_float_matches_reference(name):
             s = (hi - lo) / 65535 or 1.0
             cal[k] = (s, int(np.rint(-lo / s)))
     got = fqm.FusedEval(m, cal)(**feeds)
+    got = got[-1] if isinstance(got, tuple) else got
     assert lay.rel_err(got, want) < 1e-2
 
 
@@ -142,7 +152,7 @@ def test_fake_ax_plan_lines(tmp_path):
     np.testing.assert_array_equal(out[8:], [4, 6, 8, 10])
 
 
-def _config(name, out):
+def _config(name, out, fuse=0):
     model = ld.make_synthetic(name)
     if (
         model.qk_norm
@@ -153,17 +163,23 @@ def _config(name, out):
             first_pos=0,
             share_linears=True,
             split_first=dict(layers=[0], keys=["gu", "down_proj"]),
+            fuse=fuse,
         )
-    return pf_model.Config(model, out=out, first_pos=1)
+    return pf_model.Config(model, out=out, first_pos=1, fuse=fuse)
 
 
-@pytest.mark.parametrize("name", ["qwen3_like", "llama_gqa", "llama_mha"])
-def test_plan_wiring_matches_float_model(name, tmp_path):
+WIRING = [("qwen3_like", 0), ("llama_gqa", 0), ("llama_mha", 0)]
+WIRING += [("qwen3_like", f) for f in (1, 2, 3)]
+
+
+@pytest.mark.parametrize("name,fuse", WIRING)
+def test_plan_wiring_matches_float_model(name, fuse, tmp_path):
     """The plan (buffers, binds, merged-linear slices, K row rebinding, V row
-    copies, the two program sets, sharing and split linears) with float
-    programs reproduces the float model step by step; so does the host chain
+    copies, the two program sets, sharing and split linears; with ``fuse``
+    the merged programs and their several outputs) with float programs
+    reproduces the float model step by step; so does the host chain
     pf_estimate.Chain with every program exact."""
-    cfg = _config(name, str(tmp_path))
+    cfg = _config(name, str(tmp_path), fuse)
     root = str(tmp_path / "float_set")
     pf_plan.write_float_set(cfg, root)
     plan = pf_plan.Plan(lay.FakeAX(str(tmp_path / "fake")), cfg, fake=True, root=root)
@@ -195,3 +211,50 @@ def test_template_names():
     assert "add128" in names and "k64n32" in names  # split gu Add; down_proj
     assert tpl.template_dir("r", "k32n64").endswith(os.path.join("linear", "k32n64"))
     assert tpl.template_dir("r", "add32").endswith(os.path.join("single", "add32"))
+
+
+@pytest.mark.parametrize("fuse,runs", [(0, 15), (1, 9), (2, 7), (3, 6)])
+def test_programs_per_layer(fuse, runs):
+    """Executes per layer of the rest set; layer 0 also runs the first norm,
+    and a split first-set ``down_proj`` keeps its own programs."""
+    cfg = _config("qwen3_like", ".", fuse)
+    assert len(cfg.programs("rest", "L1")) == runs
+    if fuse >= 2:
+        assert cfg.programs("rest", "L0")[0] == "n1"
+        assert "n1" not in cfg.programs("rest", "L1")
+        first = cfg.programs("first", "L0")
+        assert first.index("down_proj") == first.index("dn") - 1
+        assert "silu_f" in first
+        assert ("silu_f" in cfg.programs("rest", "L0")) == (fuse == 2)
+        assert cfg.programs("rest", "post") == ["lm_head"]
+
+
+def test_merged_template_names():
+    for fuse, want in ((1, {"nrm32", "anorm32", "qkf64"}), (3, {"slanorm64"})):
+        names = set(tpl.needed(_config("qwen3_like", ".", fuse)))
+        assert want <= names and "crms32" not in names
+    assert {"lanorm64"} <= set(tpl.needed(_config("qwen3_like", ".", 2)))
+
+
+def test_signed_inputs_skip_a_constant_weight():
+    """A MatMul by a constant is a FullyConnected: its input stays unsigned."""
+    import pf_generate
+
+    assert pf_generate.signed_inputs(tpl.float_graph("lanorm64", DIMS)) == set()
+    assert pf_generate.signed_inputs(tpl.float_graph("attn64", DIMS)) >= {"qh", "kt"}
+
+
+def test_tied_ranges_follow_the_template():
+    """Tensors at one template calibration share one range in the target;
+    a tie that would widen a range past TIE_MAX refuses the template."""
+    import pf_generate
+
+    g = pf_generate.Generator.__new__(pf_generate.Generator)
+    m = tpl.float_graph("nrm32", DIMS)
+    rg = {"u": [-2.0, 3.0], "d": [-1.0, 1.5], "x": [-50.0, 60.0]}
+    tq = {"u": (1e-4, 30000), "d": (1e-4, 30000), "x": (2e-3, 31000)}
+    out = g._tied(rg, m, tq)
+    assert out["u"] == out["d"] == [-2.0, 3.0]
+    tq["x"] = (1e-4, 30000)
+    with pytest.raises(ValueError, match="widen"):
+        g._tied(rg, m, tq)

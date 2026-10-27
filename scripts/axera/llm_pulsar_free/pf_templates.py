@@ -28,7 +28,13 @@ graph, so ``FusedEval`` / ``float_graph`` evaluate exactly what the card runs):
 * ``attn<n>``: the whole layer's attention, ``q [1, nh*hd]`` as
   ``[nkv, G, hd]``, token-major K / V ``[S + 1, nkv*hd]`` (the plan's cache
   layout), mask ``[1, S + 1]`` (Reshape / Transpose inside);
-* ``silu<n>``: ``y = gate * sigmoid(gate) * up``.
+* ``silu<n>``: ``y = gate * sigmoid(gate) * up``;
+* merged programs (``pf_layout.LAYER_FUSED*``), several outputs where the
+  residual stream continues: ``nrm<n>`` (the two-pass RMSNorm), ``anorm<n>``
+  (residual Add + two-pass norm, outputs ``x`` and ``y``), ``qkf<nh*hd>``
+  (q RoPE + k coarse norm + k RoPE, outputs ``yq`` and ``yk``),
+  ``lanorm<k>`` (a ``[1, k] @ [k, H]`` FullyConnected + ``anorm``),
+  ``slanorm<k>`` (fused SiLU + ``lanorm``).
 
 usage: MODEL=llama160m pf_templates.py [--root DIR] [--list] [NAME...]
 (no NAME: every template the model needs that is not built yet; serial builds)
@@ -162,6 +168,10 @@ ADDNORM = "  x = Add(a, b)\n" + NORM2
 #: second operand, then the two-pass norm: ``o_proj`` + ``res1`` + the second
 #: norm, or ``down_proj`` + ``res2`` + the next layer's first norm
 LINEAR_ADDNORM = "  b = MatMul(z, w)\n" + ADDNORM
+#: ``fuse=3``: the fused SiLU before ``down_proj`` too
+SILU_LINEAR_ADDNORM = (
+    "  sg = Sigmoid(gate)\n  sl = Mul(gate, sg)\n  z = Mul(sl, up)\n" + LINEAR_ADDNORM
+)
 #: Qwen3's q and k RoPE programs and the coarse k norm as one program: q's
 #: ``qkrope``; k's per-head coarse norm ``uk = k / r0``, ``ur = k_rot / r0``
 #: (``rot`` permutes within a head, so k_rot's head RMS is k's); k's ``qkrope``
@@ -299,7 +309,28 @@ def _lanorm_gen(k, n, w, zs, aoff, bk, g):
         sb = float(np.abs(b).std())
         return {
             "z": z,
-            "a": (-bk * b + r.standard_normal((1, n)) * sb * (1.5 - bk) + aoff * sb).astype(F),
+            "a": (
+                -bk * b + r.standard_normal((1, n)) * sb * (1.5 - bk) + aoff * sb
+            ).astype(F),
+            "g": r.uniform(g[0], g[1], (1, n)).astype(F),
+        }
+
+    return gen
+
+
+def _slanorm_gen(k, n, w, gs_, us, aoff, bk, g):
+    def gen(r):
+        gate = (r.standard_normal((1, k)) * gs_ - 0.2).astype(F)
+        up = (r.standard_normal((1, k)) * us + 0.05).astype(F)
+        z = gate / (1 + np.exp(-gate)) * up
+        b = z @ w
+        sb = float(np.abs(b).std())
+        return {
+            "gate": gate,
+            "up": up,
+            "a": (
+                -bk * b + r.standard_normal((1, n)) * sb * (1.5 - bk) + aoff * sb
+            ).astype(F),
             "g": r.uniform(g[0], g[1], (1, n)).astype(F),
         }
 
@@ -350,7 +381,8 @@ def graph(name: str, d: Dims):
     """``(op types, body, inputs {name: shape}, output shape, initializers,
     variant generators)`` of a fused template ``name``."""
     m = re.fullmatch(
-        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm)(\d+)(t?)", name
+        r"(crms|rms|hcrms|rope|qkrope|silu|attn|nrm|anorm|qkf|lanorm|slanorm)(\d+)(t?)",
+        name,
     )
     if not m:
         raise ValueError(f"{name}: not a fused template name")
@@ -390,6 +422,16 @@ def graph(name: str, d: Dims):
         inits = {"w": w, "eps": eps["eps"], "eps0": eps["eps"]}
         ops = ["FullyConnected", "MatMul"] + NORM_OPS
         return ops, LINEAR_ADDNORM, ins, {"x": [1, H], "y": [1, H]}, inits, gens
+    if kind == "slanorm":
+        H = d.H
+        w = template_weight(n, H)
+        p = ((1.0, 1.0, 0.2, 0.0, NORM_G[0]), (2.0, 0.7, 0.1, 0.9, NORM_G[1]))
+        p += ((0.8, 1.5, 1.0, 0.3, NORM_G[3]), (1.5, 2.0, -0.2, 0.95, NORM_G[1]))
+        gens = [_slanorm_gen(n, H, w, *a) for a in p]
+        ins = {"gate": [1, n], "up": [1, n], "a": [1, H], "g": [1, H]}
+        inits = {"w": w, "eps": eps["eps"], "eps0": eps["eps"]}
+        ops = ["FullyConnected", "MatMul", "Sigmoid"] + NORM_OPS
+        return ops, SILU_LINEAR_ADDNORM, ins, {"x": [1, H], "y": [1, H]}, inits, gens
     if kind == "qkf":
         if n != d.nh * d.hd:
             raise ValueError(f"{name}: the model's q width is {d.nh * d.hd}")
@@ -507,6 +549,8 @@ def needed(cfg) -> list[str]:
         names += [f"qkf{qd}"] if cfg.qk_norm else [f"rope{qd}", f"rope{kvd}"]
         if cfg.fuse >= 2:
             names += [f"lanorm{qd}", f"lanorm{inter}"]
+        if cfg.fuse >= 3:
+            names += [f"slanorm{inter}"]
     elif cfg.qk_norm:
         names = [f"crms{H}", f"rms{H}", f"silu{inter}", f"attn{qd}", f"add{H}"]
         names += [f"qkrope{qd}", f"qkrope{kvd}", f"qkrope{qd}t", f"qkrope{kvd}t"]

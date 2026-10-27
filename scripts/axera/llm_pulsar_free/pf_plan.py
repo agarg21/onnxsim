@@ -283,21 +283,20 @@ class Plan:
             o = self.outputs(st, wh, "on2")
             x1, m = o["x"], o["y"]
             gu = self.chain(st, wh, "gu", x=m)
-            act = self.chain(
-                st,
-                wh,
-                "silu_f",
-                gate=(gu, og["gate_proj"] * 4),
-                up=(gu, og["up_proj"] * 4),
-            )
+            gate, up = (gu, og["gate_proj"] * 4), (gu, og["up_proj"] * 4)
             gn = self.gain[li + 1][0] if li + 1 < cfg.L else self.gf
-            if "down_proj" in cfg.programs(st, wh):
+            progs = cfg.programs(st, wh)
+            if "silu_f" in progs:
+                act = self.chain(st, wh, "silu_f", gate=gate, up=up)
+            if "down_proj" in progs:
                 dn = self.chain(st, wh, "down_proj", x=act)
                 feeds = dict(a=x1, b=dn, g=gn)
-            else:
+            elif "silu_f" in progs:
                 feeds = dict(z=act, a=x1, g=gn)
+            else:  # fuse=3: the SiLU is in dn
+                feeds = dict(gate=gate, up=up, a=x1, g=gn)
             for n, v in feeds.items():
-                self.bind(st, wh, "dn", "I", n, v)
+                self.bind(st, wh, "dn", "I", n, *(v if isinstance(v, tuple) else (v,)))
             o = self.outputs(st, wh, "dn")
             x, a = o["x"], o["y"]
             io[li] = dict(y5=y5)
@@ -457,7 +456,8 @@ def write_float_set(cfg: pf_model.Config, root: str) -> None:
                     fg = None
                     if k in ("on2", "dn") and "down_proj" not in ml:
                         lk = "o_proj" if k == "on2" else "down_proj"
-                        fg = tpl.float_graph(f"lanorm{widths[lk][0]}", d)
+                        lt = "slanorm" if k == "dn" and cfg.fuse >= 3 else "lanorm"
+                        fg = tpl.float_graph(f"{lt}{widths[lk][0]}", d)
                         w = cfg.merged_weight(lk, li)
                         wi = next(i for i in fg.graph.initializer if i.name == "w")
                         wi.CopyFrom(onnx.numpy_helper.from_array(w, "w"))

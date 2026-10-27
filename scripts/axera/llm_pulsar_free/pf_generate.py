@@ -23,10 +23,24 @@ range x2 (merged: the union of the parts). Each program is retargeted from
 the first template variant that accepts the target
 (``u16_retarget.retarget_graph`` / ``retarget``, ``linear_emit.emit_linear_u16``).
 
+Merged layouts (``cfg.fuse`` >= 1, ``pf_layout.LAYER_FUSED*``): adjacent
+programs run as one (every execute costs ~0.27 ms on the card whatever it
+computes). ``n1`` / ``n2`` / ``nf`` (residual Add + two-pass norm,
+``anorm<H>``; layer 0's ``n1`` the norm alone, ``nrm<H>``), ``qk`` (``rq`` +
+``kc`` + ``rk``, ``qkf<nh*hd>``); ``fuse=2``: ``on2`` / ``dn``, the linear
+before the Add joins it (``lanorm<k>``: the weight table is
+``linear_emit``'s, written into the fused build's ``npu_params``);
+``fuse=3``: ``dn`` also holds the fused SiLU (``slanorm<I>``). Each part of a
+merged program is calibrated exactly as its own program was (``_stage``: the
+ranges of that part's tensors over that part's samples), the program gets the
+union; tensors a template calibrates alike are tied (``_tied``: Pulsar2
+elides a write of the value a register already holds, so the template's
+records cannot carry two values there).
+
 With ``share_linears`` (Qwen3) the ``rest`` set's linear serves both sets
 when the first set's ranges are within ``SHARE_MAX`` (calibrated on the
 union); run ``rest`` before ``first``. With ``first_pos == 0`` the first set
-also shares the rest's ``rq`` / ``rk`` / ``kc`` (sin = 0 at position 0
+also shares the rest's ``rq`` / ``rk`` / ``kc`` / ``qk`` (sin = 0 at position 0
 degenerates their own calibration), which are then calibrated on both sets.
 
 Writes ``<out>/<set>/L<l>/<program>.axmodel``, ``<out>/cal/<set>/...`` (the
@@ -389,14 +403,17 @@ class Generator:
         ml[key] = e
         return e
 
-    def norm2(self, C, D, key, ml, g, x=None, a=None, b=None, z=None, w=None):
+    def norm2(
+        self, C, D, key, ml, g, x=None, a=None, b=None, z=None, w=None, silu=None
+    ):
         """The two-pass RMSNorm as one program (``nrm<H>``), or with the
         residual Add before it (``anorm<H>``: ``x = a + b``, outputs ``x`` and
         ``y``). Each part is calibrated as its own program was: the Add on
         ``a`` / ``b`` + x2 copies, the coarse pass on ``x`` + x2, the second
         pass on the coarse pass's ``u`` in fake-quant + x2. With a linear
         before it (``lanorm<k>``: ``b = z @ w``), its input and output at the
-        real range x2, as a linear program's."""
+        real range x2, as a linear program's; with ``silu = (gate, up)`` the
+        fused SiLU computes ``z`` (``slanorm<k>``), calibrated as ``silu_f``."""
         H = self.cfg.H
         inits = tpl.graph(f"nrm{H}", tpl.Dims.of(self.cfg))[4]
         rgs = []
@@ -438,6 +455,18 @@ class Generator:
         name = f"anorm{H}" if a is not None else f"nrm{H}"
         if z is not None:
             name = f"lanorm{z.shape[-1]}"
+        if silu is not None:
+            gate, up = silu
+            n = gate.shape[-1]
+            rg, _ = self._stage(
+                "  sg = Sigmoid(gate)\n  sl = Mul(gate, sg)\n  z = Mul(sl, up)\n",
+                {"gate": [1, n], "up": [1, n]},
+                {"z": [1, n]},
+                {"gate": list(gate) + list(gate * K2), "up": list(up) + list(up * K2)},
+                {},
+            )
+            rgs.append(rg)
+            name = f"slanorm{n}"
         return self.merged(
             C, D, key, name, rgs, ml, dict(u_absmax=float(np.abs(u).max())), w=w
         )
@@ -584,15 +613,30 @@ class Generator:
         og = pf_model.lay.offsets(cfg.GU)
         ml["gu"]["parts"] = {k: dict(col=og[k], n=n) for k, n in cfg.GU}
         gate, up = A["gate"].astype(F32), A["up"].astype(F32)
-        ml["silu_f"] = self.fused(
-            f"{C}/silu_f",
-            f"{D}/silu_f.axmodel",
-            f"silu{cfg.I}",
-            {"gate": list(gate) + list(gate * K2), "up": list(up) + list(up * K2)},
-        )
+        split = cfg.is_split(st, li, "down_proj")
+        if cfg.fuse < 3 or split:
+            ml["silu_f"] = self.fused(
+                f"{C}/silu_f",
+                f"{D}/silu_f.axmodel",
+                f"silu{cfg.I}",
+                {"gate": list(gate) + list(gate * K2), "up": list(up) + list(up * K2)},
+            )
         gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
         x1, dn = r2("x1"), r2("down")
-        if cfg.is_split(st, li, "down_proj"):
+        if not split and cfg.fuse >= 3:
+            self.norm2(
+                C,
+                D,
+                "dn",
+                ml,
+                gn,
+                a=x1,
+                b=dn,
+                z=r2("act"),
+                w=cfg.merged_weight("down_proj", li),
+                silu=(r2("gate"), r2("up")),
+            )
+        elif split:
             ml["down_proj"] = self.lin(
                 st,
                 li,
@@ -846,7 +890,9 @@ def main():
     man = json.load(open(mpath)) if os.path.exists(mpath) else {}
     t0 = time.time()
     for li in range(lo_l, hi_l + 1):
-        [gen.layer, gen.layer_fused, gen.layer_fused2][cfg.fuse](st, li, man)
+        [gen.layer, gen.layer_fused, gen.layer_fused2, gen.layer_fused2][cfg.fuse](
+            st, li, man
+        )
         json.dump(man, open(mpath, "w"), indent=1)
         ml = man[f"L{li}"]
         tnames = sorted(
@@ -855,7 +901,9 @@ def main():
                 for e in ml.values()
             }
         )
-        n1, n2 = [("n1_rms", "n2_rms"), ("n1", "n2"), ("on2", "dn")][cfg.fuse]
+        n1, n2 = [("n1_rms", "n2_rms"), ("n1", "n2")][min(cfg.fuse, 1)]
+        if cfg.fuse >= 2:
+            n1, n2 = "on2", "dn"
         print(
             f"{st} L{li}: {len(ml)} programs, templates {tnames}, u max "
             f"{ml[n1]['u_absmax']:.1f}/{ml[n2]['u_absmax']:.1f}, "
@@ -863,7 +911,7 @@ def main():
             flush=True,
         )
     if hi_l == cfg.L - 1:
-        [gen.post, gen.post_fused, gen.post_fused2][cfg.fuse](st, man)
+        [gen.post, gen.post_fused, gen.post_fused2, gen.post_fused2][cfg.fuse](st, man)
         json.dump(man, open(mpath, "w"), indent=1)
         print(f"{st} post done, {time.time() - t0:.0f}s", flush=True)
 

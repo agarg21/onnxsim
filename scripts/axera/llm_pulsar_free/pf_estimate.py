@@ -169,8 +169,10 @@ class Chain:
         og = lay.offsets(cfg.GU)
         gate = gu[:, og["gate_proj"] : og["gate_proj"] + cfg.I]
         up = gu[:, og["up_proj"] : og["up_proj"] + cfg.I]
-        act = f("silu_f")(gate=gate, up=up)
         gn = cfg.gains(li + 1)[0] if li + 1 < cfg.L else cfg.ln_f
+        if (f"L{li}", "silu_f") not in self.f:  # fuse=3: the SiLU is in dn
+            return f("dn")(gate=gate, up=up, a=x1, g=gn)
+        act = f("silu_f")(gate=gate, up=up)
         if (f"L{li}", "down_proj") in self.f:
             return f("dn")(a=x1, b=f("down_proj")(act), g=gn)
         return f("dn")(z=act, a=x1, g=gn)
